@@ -1,6 +1,7 @@
 #include "scene/Scene.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtx/matrix_decompose.hpp>
@@ -22,10 +23,15 @@ Transform Transform::fromMatrix(const Mat4& m) {
   return t;
 }
 
+std::uint64_t nextTopologyVersion() {
+  static std::atomic<std::uint64_t> counter{1};
+  return ++counter;
+}
+
 void SceneObject::rebuildSpatial() {
   bvh.build(mesh);
   dirtyLeaves.clear();
-  ++topologyVersion;
+  topologyVersion = nextTopologyVersion();
 }
 
 SceneObject& Scene::add(std::string name, Mesh mesh) {
@@ -44,6 +50,7 @@ SceneObject& Scene::add(std::string name, Mesh mesh, Bvh bvh) {
   obj->name = uniqueName(name);
   obj->mesh = std::move(mesh);
   obj->bvh = std::move(bvh);
+  obj->topologyVersion = nextTopologyVersion();
   objects_.push_back(std::move(obj));
   return *objects_.back();
 }

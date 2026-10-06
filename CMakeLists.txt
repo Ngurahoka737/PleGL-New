@@ -37,6 +37,9 @@ add_library(plegl_engine STATIC
   src/engine/sculpt/Sculptor.cpp
   src/engine/sculpt/StrokeSampler.cpp
   src/engine/sculpt/Undo.cpp
+  src/engine/remesh/VoxelGrid.cpp
+  src/engine/remesh/SurfaceNets.cpp
+  src/engine/remesh/VoxelRemesh.cpp
 )
 target_include_directories(plegl_engine PUBLIC src/engine)
 target_link_libraries(plegl_engine PUBLIC glm::glm PRIVATE plegl_warnings)
@@ -71,6 +74,7 @@ if(PLEGL_BUILD_TESTS)
     tests/test_bvh.cpp
     tests/test_scene.cpp
     tests/test_sculpt.cpp
+    tests/test_remesh.cpp
   )
   target_link_libraries(plegl_tests PRIVATE plegl_engine doctest::doctest plegl_warnings)
   add_test(NAME plegl_tests COMMAND plegl_tests)
