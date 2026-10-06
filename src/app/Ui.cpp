@@ -122,11 +122,58 @@ void App::drawUi() {
     ImGui::RadioButton("Object", &m, 0);
     ImGui::SameLine();
     ImGui::RadioButton("Sculpt", &m, 1);
-    mode = static_cast<Mode>(m);
+    if (!strokeActive()) mode = static_cast<Mode>(m);
 
     if (mode == Mode::Sculpt) {
-      sectionHeader("Brushes");
-      ImGui::TextWrapped("Draw and Smooth arrive in Phase 1. Press Tab to return to Object mode.");
+      sectionHeader("Brush");
+      int b = static_cast<int>(sculpt.brush);
+      ImGui::RadioButton("Draw (D)", &b, 0);
+      ImGui::SameLine();
+      ImGui::RadioButton("Smooth (S)", &b, 1);
+      sculpt.brush = static_cast<BrushKind>(b);
+
+      ImGui::SetNextItemWidth(-1);
+      ImGui::SliderFloat("##radius", &sculpt.radiusPx, 2.0f, 1000.0f, "radius %.0f px", ImGuiSliderFlags_Logarithmic);
+      float& strength = sculpt.brush == BrushKind::Smooth ? sculpt.smoothStrength : sculpt.drawStrength;
+      ImGui::SetNextItemWidth(-1);
+      ImGui::SliderFloat("##strength", &strength, 0.0f, 1.0f, "strength %.2f");
+      if (sculpt.brush == BrushKind::Draw) {
+        int inv = sculpt.invert ? 1 : 0;
+        ImGui::RadioButton("Add", &inv, 0);
+        ImGui::SameLine();
+        ImGui::RadioButton("Subtract", &inv, 1);
+        sculpt.invert = inv != 0;
+      }
+      static const char* kFalloffs[] = {"Smooth falloff", "Sharp falloff", "Linear falloff", "Constant falloff"};
+      int f = static_cast<int>(sculpt.falloff);
+      ImGui::SetNextItemWidth(-1);
+      if (ImGui::Combo("##falloff", &f, kFalloffs, 4)) sculpt.falloff = static_cast<Falloff>(f);
+      ImGui::SetNextItemWidth(-1);
+      ImGui::SliderFloat("##spacing", &sculpt.spacing, 0.02f, 1.0f, "spacing %.2f");
+
+      sectionHeader("Pen pressure");
+      static const char* kPressure[] = {"Strength", "Radius", "Both", "Off"};
+      int pm = static_cast<int>(sculpt.pressure);
+      ImGui::SetNextItemWidth(-1);
+      if (ImGui::Combo("##pressure", &pm, kPressure, 4)) sculpt.pressure = static_cast<PressureMap>(pm);
+
+      sectionHeader("Symmetry");
+      ImGui::Checkbox("Mirror X (X)", &sculpt.symmetryX);
+
+      sectionHeader("History");
+      ImGui::BeginDisabled(!undoStack.canUndo() || strokeActive());
+      if (ImGui::Button("Undo")) undo();
+      ImGui::EndDisabled();
+      ImGui::SameLine();
+      ImGui::BeginDisabled(!undoStack.canRedo() || strokeActive());
+      if (ImGui::Button("Redo")) redo();
+      ImGui::EndDisabled();
+      ImGui::SameLine();
+      ImGui::TextDisabled("%.0f MB", static_cast<double>(undoStack.bytes()) / (1024.0 * 1024.0));
+
+      ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+      ImGui::TextWrapped("Shift+drag: Smooth. Ctrl+drag: invert Draw. [ ]: radius, hold F and move: radius.");
+      ImGui::PopStyleColor();
     } else {
       sectionHeader("Transform");
       int g = static_cast<int>(gizmo);
@@ -255,6 +302,9 @@ void App::drawUi() {
     sectionHeader("Performance");
     ImGui::Text("%.0f FPS  (%.2f ms)", stats.fps, stats.frameMs);
     ImGui::Text("Hover raycast  %.1f us", stats.raycastUs);
+    ImGui::Text("Last dab  %.2f ms", stats.dabMs);
+    ImGui::Text("Input to dab  %.2f ms", stats.inputToDabMs);
+    ImGui::Text("Input to frame  %.1f ms", stats.inputToFrameMs);
     const RenderStats& rs = renderStats();
     ImGui::Text("Uploads  %d full, %d partial", rs.fullUploads, rs.partialUploads);
     ImGui::Text("Worker threads  %zu", workerCount());

@@ -2,7 +2,7 @@
 
 Software digital sculpting 3D untuk desktop yang fokus pada satu hal: sculpting yang cepat, stabil, dan mudah dipelajari.
 
-Status: **Phase 0 (Engine Foundation)**. Mesh bisa dibuat, diimpor, dirender, dipilih dengan raycast, dan ditransformasi. Brush pertama (Draw dan Smooth) datang di Phase 1.
+Status: **Phase 1 (First Sculpt)**. Brush Draw dan Smooth, tekanan pen, undo/redo, dan simetri X sudah jalan di atas engine Phase 0 (mesh, BVH, renderer, import/export OBJ).
 
 ## Stack
 
@@ -58,11 +58,18 @@ cmake --build --preset engine-only
 | Pan | Alt + drag tengah |
 | Zoom | Alt + drag kanan, atau scroll |
 | Pilih objek | Klik kiri |
-| Move / Rotate / Scale | G / R / S |
-| Duplicate | Shift + D |
-| Delete | X atau Delete |
+| Move / Rotate / Scale (Object mode) | G / R / S |
+| Duplicate (Object mode) | Shift + D |
+| Delete (Object mode) | X atau Delete |
 | Frame objek terpilih | Home |
 | Object / Sculpt mode | Tab |
+| Sculpt (di Sculpt mode) | Drag kiri |
+| Smooth sementara | Shift + drag kiri |
+| Balik arah Draw (Add/Subtract) | Ctrl + drag kiri |
+| Pilih brush Draw / Smooth | D / S |
+| Radius brush | [ dan ], atau tahan F lalu geser mouse ke samping |
+| Simetri X on/off | X (di Sculpt mode) |
+| Undo / Redo | Ctrl + Z / Ctrl + Shift + Z atau Ctrl + Y |
 | Import / Export OBJ | Ctrl + O / Ctrl + E |
 | Uji update GPU parsial | B (menonjolkan permukaan di bawah cursor) |
 
@@ -77,6 +84,7 @@ src/engine/   Library engine tanpa UI (diuji headless)
   spatial/    BVH (node daun = unit kerja engine), raycast, query bola
   io/         Import dan export OBJ
   scene/      Objek, transform, picking
+  sculpt/     Brush, stroke sampler, sculptor (dab, simetri), undo per daun BVH
 src/app/      Aplikasi: SDL3, renderer OpenGL, kamera, UI
 tests/        Unit test (doctest)
 bench/        Benchmark engine pada mesh 50K sampai 1M vertex

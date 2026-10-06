@@ -33,6 +33,10 @@ add_library(plegl_engine STATIC
   src/engine/io/Obj.cpp
   src/engine/spatial/Bvh.cpp
   src/engine/scene/Scene.cpp
+  src/engine/sculpt/Brush.cpp
+  src/engine/sculpt/Sculptor.cpp
+  src/engine/sculpt/StrokeSampler.cpp
+  src/engine/sculpt/Undo.cpp
 )
 target_include_directories(plegl_engine PUBLIC src/engine)
 target_link_libraries(plegl_engine PUBLIC glm::glm PRIVATE plegl_warnings)
@@ -66,6 +70,7 @@ if(PLEGL_BUILD_TESTS)
     tests/test_obj.cpp
     tests/test_bvh.cpp
     tests/test_scene.cpp
+    tests/test_sculpt.cpp
   )
   target_link_libraries(plegl_tests PRIVATE plegl_engine doctest::doctest plegl_warnings)
   add_test(NAME plegl_tests COMMAND plegl_tests)
