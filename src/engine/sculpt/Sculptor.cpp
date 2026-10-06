@@ -9,8 +9,14 @@
 namespace plegl {
 
 void Sculptor::beginStroke(SceneObject& object, const Brush& brush, const StrokeOptions& options, std::string label) {
-  object_ = &object;
+  start(object, options, std::move(label));
   brush_ = &brush;
+}
+
+void Sculptor::start(SceneObject& object, const StrokeOptions& options, std::string label) {
+  object_ = &object;
+  brush_ = nullptr;
+  grabVerts_.clear();
   options_ = options;
   undo_ = SculptUndo{};
   undo_.label = std::move(label);
@@ -36,24 +42,33 @@ void Sculptor::snapshot(Index leaf) {
   undo_.before.push_back(std::move(s));
 }
 
-Vec3 Sculptor::areaNormal(const Vec3& center, float radius, std::span<const Index> leaves) const {
+bool Sculptor::computeArea(Dab& dab, std::span<const Index> leaves) const {
   const Mesh& m = object_->mesh;
-  const float r2 = radius * radius;
-  Vec3 sum{0.0f};
+  const float r2 = dab.radius * dab.radius;
+  Vec3 normalSum{0.0f}, centerSum{0.0f};
+  float weightSum = 0.0f;
   for (Index li : leaves) {
     const BvhLeaf& leaf = object_->bvh.leaves()[li];
     for (Index v = leaf.vertBegin; v < leaf.vertEnd; ++v) {
-      const Vec3 d = m.positions[v] - center;
+      const Vec3 d = m.positions[v] - dab.center;
       const float dist2 = glm::dot(d, d);
-      if (dist2 < r2) sum += m.normals[v] * falloffWeight(options_.falloff, std::sqrt(dist2) / radius);
+      if (dist2 >= r2) continue;
+      // Constant falloff would give rim vertices full say; a smooth weight keeps the plane stable.
+      const float w = falloffWeight(Falloff::Smooth, std::sqrt(dist2) / dab.radius) + 1e-3f;
+      normalSum += m.normals[v] * w;
+      centerSum += m.positions[v] * w;
+      weightSum += w;
     }
   }
-  const float len = glm::length(sum);
-  return len > 1e-12f ? sum / len : Vec3{0.0f};
+  const float len = glm::length(normalSum);
+  if (weightSum <= 0.0f || len <= 1e-12f) return false;
+  dab.areaNormal = normalSum / len;
+  dab.areaCenter = centerSum / weightSum;
+  return true;
 }
 
 bool Sculptor::dab(const Vec3& center, float radius, float strength) {
-  if (!object_ || radius <= 0.0f) return false;
+  if (!object_ || !brush_ || radius <= 0.0f) return false;
   Timer total;
   lastDab_ = {};
   Dab d;
@@ -82,10 +97,7 @@ bool Sculptor::applyOne(const Dab& dabIn) {
   leaves_.clear();
   bvh.querySphere(dab.center, dab.radius, leaves_);
   if (leaves_.empty()) return false;
-  if (brush_->needsAreaNormal()) {
-    dab.areaNormal = areaNormal(dab.center, dab.radius, leaves_);
-    if (dab.areaNormal == Vec3{0.0f}) return false;  // No vertex inside the dab.
-  }
+  if (brush_->needsArea() && !computeArea(dab, leaves_)) return false;  // No vertex inside the dab.
   for (Index l : leaves_) snapshot(l);
 
   Timer t;
@@ -139,15 +151,7 @@ bool Sculptor::applyOne(const Dab& dabIn) {
       dirtyLeaves_.push_back(lastOwner);
     }
   }
-  parallelFor(0, normalVerts_.size(), 2048, [&](std::size_t b, std::size_t e) {
-    for (std::size_t i = b; i < e; ++i) {
-      const Index v = normalVerts_[i];
-      Vec3 n{0.0f};
-      m.forEachOutgoing(v, [&](Index h) { n += m.faceAreaNormal(m.heFace[h]); });
-      const float len = glm::length(n);
-      if (len > 1e-20f) m.normals[v] = n / len;
-    }
-  });
+  recomputeNormals(normalVerts_);
   lastDab_.normalsMs += t.ms();
   lastDab_.vertices += static_cast<int>(normalVerts_.size());
   lastDab_.leaves += static_cast<int>(leaves_.size());
@@ -157,6 +161,118 @@ bool Sculptor::applyOne(const Dab& dabIn) {
   dirtyLeaves_.erase(std::unique(dirtyLeaves_.begin(), dirtyLeaves_.end()), dirtyLeaves_.end());
   for (Index l : dirtyLeaves_) object_->markLeafDirty(l);
   return true;
+}
+
+void Sculptor::recomputeNormals(std::span<const Index> verts) {
+  Mesh& m = object_->mesh;
+  parallelFor(0, verts.size(), 2048, [&](std::size_t b, std::size_t e) {
+    for (std::size_t i = b; i < e; ++i) {
+      const Index v = verts[i];
+      Vec3 n{0.0f};
+      m.forEachOutgoing(v, [&](Index h) { n += m.faceAreaNormal(m.heFace[h]); });
+      const float len = glm::length(n);
+      if (len > 1e-20f) m.normals[v] = n / len;
+    }
+  });
+}
+
+bool Sculptor::beginGrab(SceneObject& object, const StrokeOptions& options, const Vec3& center, float radius,
+                         std::string label) {
+  if (radius <= 0.0f) return false;
+  start(object, options, std::move(label));
+  Mesh& m = object.mesh;
+  const Bvh& bvh = object.bvh;
+  const float strength = std::clamp(options.strength, 0.0f, 1.0f);
+
+  // Collect weights per vertex; a vertex can sit in both spheres when they overlap at the seam.
+  std::unordered_map<Index, std::size_t> slot;
+  auto capture = [&](const Vec3& c, bool mirror) {
+    leaves_.clear();
+    bvh.querySphere(c, radius, leaves_);
+    const float r2 = radius * radius;
+    for (Index li : leaves_) {
+      const BvhLeaf& leaf = bvh.leaves()[li];
+      for (Index v = leaf.vertBegin; v < leaf.vertEnd; ++v) {
+        const Vec3 d = m.positions[v] - c;
+        const float dist2 = glm::dot(d, d);
+        if (dist2 >= r2) continue;
+        const float w = strength * falloffWeight(options.falloff, std::sqrt(dist2) / radius);
+        if (w <= 0.0f) continue;
+        auto [it, inserted] = slot.try_emplace(v, grabVerts_.size());
+        if (inserted) grabVerts_.push_back({v, m.positions[v], 0.0f, 0.0f});
+        (mirror ? grabVerts_[it->second].mirrorWeight : grabVerts_[it->second].weight) += w;
+      }
+    }
+  };
+  capture(center, false);
+  if (options.symmetryX && std::abs(center.x) > radius * 0.05f) capture({-center.x, center.y, center.z}, true);
+  if (grabVerts_.empty()) {
+    object_ = nullptr;
+    return false;
+  }
+
+  // Faces around captured vertices are the only ones that change shape: their vertices need new
+  // normals and their leaves new bounds. Topology is fixed during a stroke, so compute this once.
+  if (++stamp_ == 0) {
+    std::fill(vertexStamp_.begin(), vertexStamp_.end(), 0);
+    stamp_ = 1;
+  }
+  std::vector<Index> faces;
+  for (const GrabVertex& g : grabVerts_) {
+    m.forEachOutgoing(g.v, [&](Index h) {
+      const Index f = m.heFace[h];
+      if (f != kInvalid) faces.push_back(f);
+    });
+  }
+  std::sort(faces.begin(), faces.end());
+  faces.erase(std::unique(faces.begin(), faces.end()), faces.end());
+  grabNormalVerts_.clear();
+  grabRefitLeaves_.clear();
+  for (Index f : faces) {
+    grabRefitLeaves_.push_back(bvh.leafOfFace(f));
+    m.forEachFaceVertex(f, [&](Index v) {
+      if (vertexStamp_[v] != stamp_) {
+        vertexStamp_[v] = stamp_;
+        grabNormalVerts_.push_back(v);
+      }
+    });
+  }
+  std::sort(grabRefitLeaves_.begin(), grabRefitLeaves_.end());
+  grabRefitLeaves_.erase(std::unique(grabRefitLeaves_.begin(), grabRefitLeaves_.end()), grabRefitLeaves_.end());
+  std::sort(grabNormalVerts_.begin(), grabNormalVerts_.end());
+  grabDirtyLeaves_.clear();
+  for (Index v : grabNormalVerts_) {
+    const Index owner = bvh.leafOfVertex(v);
+    if (owner != kInvalid && (grabDirtyLeaves_.empty() || grabDirtyLeaves_.back() != owner))
+      grabDirtyLeaves_.push_back(owner);
+  }
+  for (Index l : grabDirtyLeaves_) snapshot(l);
+  return true;
+}
+
+void Sculptor::grab(const Vec3& offset) {
+  if (!object_ || grabVerts_.empty()) return;
+  Timer total;
+  lastDab_ = {};
+  Mesh& m = object_->mesh;
+  const Vec3 mirrored{-offset.x, offset.y, offset.z};
+  Timer t;
+  parallelFor(0, grabVerts_.size(), 4096, [&](std::size_t b, std::size_t e) {
+    for (std::size_t i = b; i < e; ++i) {
+      const GrabVertex& g = grabVerts_[i];
+      m.positions[g.v] = g.start + offset * g.weight + mirrored * g.mirrorWeight;
+    }
+  });
+  lastDab_.brushMs = t.ms();
+  t.reset();
+  recomputeNormals(grabNormalVerts_);
+  lastDab_.normalsMs = t.ms();
+  object_->bvh.refitLeaves(m, grabRefitLeaves_);
+  for (Index l : grabDirtyLeaves_) object_->markLeafDirty(l);
+  lastDab_.vertices = static_cast<int>(grabNormalVerts_.size());
+  lastDab_.leaves = static_cast<int>(grabRefitLeaves_.size());
+  lastDab_.totalMs = total.ms();
+  ++dabCount_;
 }
 
 std::optional<SculptUndo> Sculptor::endStroke() {

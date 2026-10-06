@@ -142,3 +142,18 @@ TEST_CASE("BVH raycast handles axis-aligned rays through split planes") {
     CHECK(hit.t == doctest::Approx(2.0f).epsilon(1e-3));
   }
 }
+
+TEST_CASE("rays through shared edges hit the near side") {
+  // A quad sphere has edges exactly on the z = 0 plane. Rays inside that plane used to slip
+  // between the two triangles of an edge and report the far side of the sphere.
+  Mesh m = makeQuadSphere(48);
+  Bvh bvh;
+  bvh.build(m);
+  for (int i = 0; i < 64; ++i) {
+    const float a = static_cast<float>(i) * 0.0981f;
+    const Vec3 dir{std::cos(a), std::sin(a), 0.0f};
+    RayHit hit;
+    REQUIRE(bvh.raycast(m, Ray{dir * 3.0f, -dir}, hit));
+    CHECK(glm::dot(hit.position, dir) > 0.99f);
+  }
+}

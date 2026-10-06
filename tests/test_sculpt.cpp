@@ -240,3 +240,163 @@ TEST_CASE("undo stack drops the oldest entries over budget") {
   CHECK(stack.bytes() <= 1000);
   CHECK(stack.size() == 4);
 }
+
+namespace {
+
+// Runs a short stroke of `dabs` dabs at one spot and checks the shared brush contract: nothing
+// outside the sphere moved, no vertex moved more than kMaxDabMove radius per dab, and normals
+// and bounds are up to date.
+Mesh strokeAt(SceneObject& obj, const Brush& brush, Vec3 dir, float radius, int dabs, bool invert = false) {
+  const Mesh before = obj.mesh;
+  Sculptor sculptor;
+  StrokeOptions opts;
+  opts.invert = invert;
+  sculptor.beginStroke(obj, brush, opts, brush.name());
+  const Vec3 c = surfacePoint(obj, dir);
+  for (int i = 0; i < dabs; ++i) REQUIRE(sculptor.dab(c, radius, 1.0f));
+  REQUIRE(sculptor.endStroke());
+  for (Index v = 0; v < obj.mesh.vertexCount(); ++v) {
+    if (glm::length(before.positions[v] - c) >= radius) CHECK(obj.mesh.positions[v] == before.positions[v]);
+    CHECK(glm::length(obj.mesh.positions[v] - before.positions[v]) <= radius * kMaxDabMove * dabs + 1e-6f);
+  }
+  test::requireValid(obj.mesh);
+  requireNormalsMatchFullRecompute(obj.mesh);
+  requireBoundsContainPositions(obj);
+  return before;
+}
+
+float radiusAlong(const SceneObject& obj, Vec3 dir) {
+  dir = glm::normalize(dir);
+  RayHit hit;
+  REQUIRE(obj.bvh.raycast(obj.mesh, Ray{dir * 3.0f, -dir}, hit));
+  return glm::length(hit.position);
+}
+
+}  // namespace
+
+TEST_CASE("clay adds volume and inverted clay carves") {
+  Scene scene;
+  SceneObject& a = scene.add("A", makeQuadSphere(48));
+  SceneObject& b = scene.add("B", makeQuadSphere(48));
+  ClayBrush clay;
+  strokeAt(a, clay, {0, 1, 0}, 0.3f, 6);
+  strokeAt(b, clay, {0, 1, 0}, 0.3f, 6, true);
+  CHECK(radiusAlong(a, {0, 1, 0}) > 1.005f);
+  CHECK(radiusAlong(b, {0, 1, 0}) < 0.995f);
+}
+
+TEST_CASE("inflate swells along vertex normals") {
+  Scene scene;
+  SceneObject& obj = scene.add("Sphere", makeQuadSphere(48));
+  InflateBrush inflate;
+  const Mesh before = strokeAt(obj, inflate, {1, 0, 0}, 0.3f, 4);
+  // On a sphere the normal is radial, so inflated vertices stay on their own ray from the centre.
+  int moved = 0;
+  for (Index v = 0; v < obj.mesh.vertexCount(); ++v) {
+    const Vec3 p0 = before.positions[v], p1 = obj.mesh.positions[v];
+    if (p0 == p1) continue;
+    ++moved;
+    CHECK(glm::length(p1) > glm::length(p0));
+    CHECK(glm::dot(glm::normalize(p0), glm::normalize(p1)) > 0.9999f);
+  }
+  CHECK(moved > 10);
+}
+
+TEST_CASE("flatten pulls the area onto its plane") {
+  Scene scene;
+  SceneObject& obj = scene.add("Sphere", makeQuadSphere(64));
+  FlattenBrush flatten;
+  const Vec3 c = surfacePoint(obj, {0, 0, 1});
+  const float radius = 0.4f;
+  auto spread = [&](const Mesh& m) {  // Height range of the vertices well inside the brush.
+    float lo = 1e9f, hi = -1e9f;
+    for (Index v = 0; v < m.vertexCount(); ++v) {
+      if (glm::length(m.positions[v] - c) > radius * 0.5f) continue;
+      lo = std::min(lo, m.positions[v].z);
+      hi = std::max(hi, m.positions[v].z);
+    }
+    return hi - lo;
+  };
+  const float before = spread(obj.mesh);
+  strokeAt(obj, flatten, {0, 0, 1}, radius, 20);
+  CHECK(spread(obj.mesh) < before * 0.5f);
+}
+
+TEST_CASE("crease cuts a groove and pinches toward the centre") {
+  Scene scene;
+  SceneObject& obj = scene.add("Sphere", makeQuadSphere(64));
+  CreaseBrush crease;
+  const Vec3 c = surfacePoint(obj, {0, 1, 0});
+  const Mesh before = strokeAt(obj, crease, {0, 1, 0}, 0.3f, 5);
+  CHECK(radiusAlong(obj, {0, 1, 0}) < 0.99f);
+  // Vertices halfway out moved toward the centre in the tangent plane (pinch).
+  int pinched = 0, checked = 0;
+  for (Index v = 0; v < obj.mesh.vertexCount(); ++v) {
+    const Vec3 p0 = before.positions[v];
+    const float d = glm::length(Vec2(p0.x - c.x, p0.z - c.z));
+    if (d < 0.1f || d > 0.2f || p0.y < 0) continue;
+    ++checked;
+    const Vec3 p1 = obj.mesh.positions[v];
+    if (glm::length(Vec2(p1.x - c.x, p1.z - c.z)) < d) ++pinched;
+  }
+  REQUIRE(checked > 10);
+  CHECK(pinched == checked);
+}
+
+TEST_CASE("grab moves the captured region with the cursor and undoes exactly") {
+  Scene scene;
+  SceneObject& obj = scene.add("Sphere", makeQuadSphere(48));
+  const Mesh original = obj.mesh;
+  Sculptor sculptor;
+  UndoStack stack;
+  const Vec3 c = surfacePoint(obj, {0, 1, 0});
+  const float radius = 0.3f;
+  REQUIRE(sculptor.beginGrab(obj, {.strength = 1.0f}, c, radius, "Grab"));
+  sculptor.grab({0.0f, 0.2f, 0.0f});
+  sculptor.grab({0.0f, 0.5f, 0.1f});  // Offsets are absolute from the start, not cumulative.
+  stack.push(*sculptor.endStroke());
+
+  for (Index v = 0; v < obj.mesh.vertexCount(); ++v) {
+    const Vec3 p0 = original.positions[v], p1 = obj.mesh.positions[v];
+    const float d = glm::length(p0 - c);
+    if (d >= radius) {
+      CHECK(p1 == p0);
+    } else {
+      const float w = falloffWeight(Falloff::Smooth, d / radius);
+      CHECK(glm::length(p1 - (p0 + Vec3{0.0f, 0.5f, 0.1f} * w)) < 1e-5f);
+    }
+  }
+  float top = 0.0f;
+  for (const Vec3& p : obj.mesh.positions) top = std::max(top, p.y);
+  CHECK(top == doctest::Approx(1.5f).epsilon(0.001));
+  test::requireValid(obj.mesh);
+  requireNormalsMatchFullRecompute(obj.mesh);
+  requireBoundsContainPositions(obj);
+
+  CHECK(stack.undo(scene) == "Grab");
+  CHECK(obj.mesh.positions == original.positions);
+  CHECK(obj.mesh.normals == original.normals);
+  requireBoundsContainPositions(obj);
+}
+
+TEST_CASE("grab with x symmetry mirrors the pull") {
+  Scene scene;
+  SceneObject& obj = scene.add("Sphere", makeQuadSphere(48));
+  Sculptor sculptor;
+  const Vec3 c = surfacePoint(obj, {1, 0.3f, 0});
+  REQUIRE(sculptor.beginGrab(obj, {.strength = 1.0f, .symmetryX = true}, c, 0.3f, "Grab"));
+  sculptor.grab({0.4f, 0.1f, 0.0f});
+  sculptor.endStroke();
+  CHECK(radiusAlong(obj, {1, 0.3f, 0}) > 1.3f);
+  CHECK(radiusAlong(obj, {-1, 0.3f, 0}) == doctest::Approx(radiusAlong(obj, {1, 0.3f, 0})).epsilon(0.002));
+  requireNormalsMatchFullRecompute(obj.mesh);
+  requireBoundsContainPositions(obj);
+}
+
+TEST_CASE("grab off the mesh starts nothing") {
+  Scene scene;
+  SceneObject& obj = scene.add("Sphere", makeQuadSphere(16));
+  Sculptor sculptor;
+  CHECK_FALSE(sculptor.beginGrab(obj, {}, {5, 5, 5}, 0.2f, "Grab"));
+  CHECK_FALSE(sculptor.active());
+}
