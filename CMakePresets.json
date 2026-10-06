@@ -1,0 +1,44 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "release",
+      "displayName": "Release (Ninja)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/release",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
+      "name": "debug",
+      "displayName": "Debug (Ninja)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/debug",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    {
+      "name": "msvc",
+      "displayName": "Visual Studio (newest installed, x64)",
+      "binaryDir": "${sourceDir}/build/msvc",
+      "architecture": "x64",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+    },
+    {
+      "name": "engine-only",
+      "displayName": "Engine, tests and bench only (no window)",
+      "inherits": "release",
+      "binaryDir": "${sourceDir}/build/engine",
+      "cacheVariables": { "PLEGL_BUILD_APP": "OFF" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "release", "configurePreset": "release" },
+    { "name": "debug", "configurePreset": "debug" },
+    { "name": "msvc", "configurePreset": "msvc", "configuration": "Release" },
+    { "name": "engine-only", "configurePreset": "engine-only" }
+  ],
+  "testPresets": [
+    { "name": "release", "configurePreset": "release", "output": { "outputOnFailure": true } },
+    { "name": "msvc", "configurePreset": "msvc", "configuration": "Release", "output": { "outputOnFailure": true } },
+    { "name": "engine-only", "configurePreset": "engine-only", "output": { "outputOnFailure": true } }
+  ]
+}
