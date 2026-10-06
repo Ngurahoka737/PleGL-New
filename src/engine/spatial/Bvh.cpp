@@ -159,6 +159,11 @@ Index Bvh::leafOfVertex(Index v) const {
   return static_cast<Index>(it - leaves_.begin());
 }
 
+std::size_t Bvh::memoryBytes() const {
+  return nodes_.size() * sizeof(BvhNode) + leaves_.size() * sizeof(BvhLeaf) +
+         (leafNode_.size() + parent_.size()) * sizeof(Index);
+}
+
 Index Bvh::leafOfFace(Index f) const {
   auto it = std::upper_bound(leaves_.begin(), leaves_.end(), f,
                              [](Index value, const BvhLeaf& leaf) { return value < leaf.faceEnd; });

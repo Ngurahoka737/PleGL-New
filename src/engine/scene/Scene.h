@@ -20,6 +20,10 @@ struct Transform {
   static Transform fromMatrix(const Mat4& m);
 };
 
+// Process-wide counter, so a topology version is never reused for a different mesh (undo entries
+// are matched by object id and version).
+std::uint64_t nextTopologyVersion();
+
 struct SceneObject {
   std::uint32_t id = 0;
   std::string name;

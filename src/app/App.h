@@ -61,6 +61,10 @@ struct SculptSettings {
   float spacing = 0.1f;        // Dab spacing as a fraction of the radius.
 };
 
+struct RemeshSettings {
+  float voxelSize = 0.01f;  // In object units; about the edge length of the result.
+};
+
 struct FrameStats {
   double frameMs = 0.0;
   double fps = 0.0;
@@ -84,6 +88,8 @@ class App {
   ViewSettings view;
   PrimitiveSettings primitives;
   SculptSettings sculpt;
+  RemeshSettings remesh;
+  std::string lastRemeshInfo;
   UndoStack undoStack;
   Mode mode = Mode::Object;
   GizmoOp gizmo = GizmoOp::Translate;
@@ -97,6 +103,9 @@ class App {
 
   void addPrimitive(const std::string& name, Mesh mesh);
   void newScene();
+  // Voxel remesh of the selected object on a worker thread (Ctrl+R).
+  void requestRemesh();
+  bool remeshing() const { return remeshObjectId_ != 0; }
   void requestImport();
   void requestExport();
   void deleteSelected();
@@ -149,6 +158,7 @@ class App {
   std::mutex asyncMutex_;
   std::deque<std::function<void()>> asyncResults_;
   std::vector<std::jthread> workers_;
+  std::uint32_t remeshObjectId_ = 0;  // Object being remeshed, 0 when idle.
   int pendingImports_ = 0;
 
   std::uint64_t lastFrameNs_ = 0;

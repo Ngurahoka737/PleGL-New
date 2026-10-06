@@ -65,6 +65,7 @@ class Bvh {
   Index leafOfFace(Index f) const;
 
   std::span<const BvhLeaf> leaves() const { return leaves_; }
+  std::size_t memoryBytes() const;
   std::span<const BvhNode> nodes() const { return nodes_; }
   bool empty() const { return nodes_.empty(); }
   Aabb bounds() const { return nodes_.empty() ? Aabb{} : nodes_[0].bounds; }
