@@ -130,3 +130,15 @@ TEST_CASE("BVH refit tracks moved vertices") {
   REQUIRE(bvh.raycast(m, ray, hit));
   CHECK(glm::length(hit.position) > 1.5f);
 }
+
+TEST_CASE("BVH raycast handles axis-aligned rays through split planes") {
+  Mesh m = makeQuadSphere(32);
+  Bvh bvh;
+  bvh.build(m, {.maxLeafFaces = 64});
+  const Vec3 dirs[] = {{0, 0, 1}, {0, 1, 0}, {1, 0, 0}, {0, 0, -1}, {0, -1, 0}, {-1, 0, 0}};
+  for (const Vec3& d : dirs) {
+    RayHit hit;
+    REQUIRE(bvh.raycast(m, Ray{d * 3.0f, -d}, hit));
+    CHECK(hit.t == doctest::Approx(2.0f).epsilon(1e-3));
+  }
+}
