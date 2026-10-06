@@ -126,18 +126,23 @@ void App::drawUi() {
 
     if (mode == Mode::Sculpt) {
       sectionHeader("Brush");
-      int b = static_cast<int>(sculpt.brush);
-      ImGui::RadioButton("Draw (D)", &b, 0);
-      ImGui::SameLine();
-      ImGui::RadioButton("Smooth (S)", &b, 1);
-      sculpt.brush = static_cast<BrushKind>(b);
+      // Two columns of brush buttons; the active one is highlighted.
+      const float bw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+      for (int i = 0; i < kBrushCount; ++i) {
+        if (i % 2 == 1) ImGui::SameLine();
+        const bool active = static_cast<int>(sculpt.brush) == i;
+        if (active) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+        if (ImGui::Button(kBrushNames[i], ImVec2(bw, 0))) sculpt.brush = static_cast<BrushKind>(i);
+        if (active) ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Shortcut: %s", kBrushKeys[i]);
+      }
 
       ImGui::SetNextItemWidth(-1);
       ImGui::SliderFloat("##radius", &sculpt.radiusPx, 2.0f, 1000.0f, "radius %.0f px", ImGuiSliderFlags_Logarithmic);
-      float& strength = sculpt.brush == BrushKind::Smooth ? sculpt.smoothStrength : sculpt.drawStrength;
+      float& strength = sculpt.strength[static_cast<int>(sculpt.brush)];
       ImGui::SetNextItemWidth(-1);
       ImGui::SliderFloat("##strength", &strength, 0.0f, 1.0f, "strength %.2f");
-      if (sculpt.brush == BrushKind::Draw) {
+      if (sculpt.brush != BrushKind::Smooth && sculpt.brush != BrushKind::Grab) {
         int inv = sculpt.invert ? 1 : 0;
         ImGui::RadioButton("Add", &inv, 0);
         ImGui::SameLine();
@@ -148,8 +153,10 @@ void App::drawUi() {
       int f = static_cast<int>(sculpt.falloff);
       ImGui::SetNextItemWidth(-1);
       if (ImGui::Combo("##falloff", &f, kFalloffs, 4)) sculpt.falloff = static_cast<Falloff>(f);
-      ImGui::SetNextItemWidth(-1);
-      ImGui::SliderFloat("##spacing", &sculpt.spacing, 0.02f, 1.0f, "spacing %.2f");
+      if (sculpt.brush != BrushKind::Grab) {
+        ImGui::SetNextItemWidth(-1);
+        ImGui::SliderFloat("##spacing", &sculpt.spacing, 0.02f, 1.0f, "spacing %.2f");
+      }
 
       sectionHeader("Pen pressure");
       static const char* kPressure[] = {"Strength", "Radius", "Both", "Off"};
@@ -172,7 +179,7 @@ void App::drawUi() {
       ImGui::TextDisabled("%.0f MB", static_cast<double>(undoStack.bytes()) / (1024.0 * 1024.0));
 
       ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-      ImGui::TextWrapped("Shift+drag: Smooth. Ctrl+drag: invert Draw. [ ]: radius, hold F and move: radius.");
+      ImGui::TextWrapped("Shift+drag: Smooth. Ctrl+drag: invert. [ ]: radius, hold F and move: radius.");
       ImGui::PopStyleColor();
     } else {
       sectionHeader("Transform");
