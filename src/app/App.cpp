@@ -106,15 +106,20 @@ bool App::init(std::string* error) {
   if (!renderer_.init(error)) return false;
   rendererReady_ = true;
 
+  initRecovery();
   addPrimitive("Sphere", makeQuadSphere(primitives.quadSphereResolution));
   frameScene();
   statusMessage = "Ready. Alt + left drag to orbit.";
   lastFrameNs_ = SDL_GetTicksNS();
+  lastAutosaveNs_ = lastFrameNs_;
+  savedFingerprint_ = autosavedFingerprint_ = sceneFingerprint();
+  updateWindowTitle();
   return true;
 }
 
 void App::shutdown() {
-  workers_.clear();  // Joins background imports.
+  workers_.clear();  // Joins background imports and saves.
+  finishRecovery();  // A clean exit: nothing to recover next time.
   if (rendererReady_) renderer_.shutdown();
   if (ImGui::GetCurrentContext()) {
     ImGui_ImplOpenGL3_Shutdown();
@@ -140,6 +145,8 @@ void App::run() {
       handleEvent(e);
     }
     processAsyncResults();
+    autosaveTick();
+    updateWindowTitle();
 
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplSDL3_NewFrame();
@@ -203,10 +210,13 @@ void App::handleEvent(const SDL_Event& e) {
   const ImGuiIO& io = ImGui::GetIO();
   switch (e.type) {
     case SDL_EVENT_QUIT:
-      running_ = false;
+      requestQuit();
       break;
     case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
-      if (e.window.windowID == SDL_GetWindowID(window_)) running_ = false;
+      if (e.window.windowID == SDL_GetWindowID(window_)) requestQuit();
+      break;
+    case SDL_EVENT_DROP_FILE:
+      if (e.drop.data) openFile(std::filesystem::path(reinterpret_cast<const char8_t*>(e.drop.data)));
       break;
 
     case SDL_EVENT_MOUSE_MOTION: {
@@ -302,9 +312,11 @@ void App::handleShortcut(const SDL_KeyboardEvent& key) {
   if (ctrl) {
     if (key.key == SDLK_Z && !shift) undo();
     if ((key.key == SDLK_Z && shift) || key.key == SDLK_Y) redo();
-    if (key.key == SDLK_O) requestImport();
+    if (key.key == SDLK_S) requestSaveProject(shift);
+    if (key.key == SDLK_O) requestOpenProject();
+    if (key.key == SDLK_I) requestImport();
     if (key.key == SDLK_E) requestExport();
-    if (key.key == SDLK_N) newScene();
+    if (key.key == SDLK_N) requestNewScene();
     if (key.key == SDLK_R) requestRemesh();
     return;
   }
@@ -404,6 +416,8 @@ void App::newScene() {
   undoStack.clear();
   selectedId = 0;
   hover_.reset();
+  projectPath_.clear();
+  savedFingerprint_ = autosavedFingerprint_ = sceneFingerprint();
   statusMessage = "New scene";
 }
 
@@ -576,6 +590,7 @@ void App::applySamples(std::uint64_t timestampNs) {
 
 void App::endStroke() {
   if (auto entry = sculptor_.endStroke()) {
+    ++editCounter_;
     const int dabs = sculptor_.dabCount();
     undoStack.push(std::move(*entry));
     statusMessage = std::string(kBrushNames[static_cast<int>(strokeBrush_)]) + " stroke, " + std::to_string(dabs) +
@@ -599,12 +614,14 @@ const Brush* App::brushFor(BrushKind kind) const {
 void App::undo() {
   if (sculptor_.active()) return;
   const std::string label = undoStack.undo(scene);
+  if (!label.empty()) ++editCounter_;
   statusMessage = label.empty() ? "Nothing to undo" : "Undo " + label;
 }
 
 void App::redo() {
   if (sculptor_.active()) return;
   const std::string label = undoStack.redo(scene);
+  if (!label.empty()) ++editCounter_;
   statusMessage = label.empty() ? "Nothing to redo" : "Redo " + label;
 }
 

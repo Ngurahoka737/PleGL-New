@@ -17,6 +17,7 @@
 #include "scene/Scene.h"
 #include "sculpt/Sculptor.h"
 #include "sculpt/StrokeSampler.h"
+#include "io/Project.h"
 #include "sculpt/Undo.h"
 
 namespace plegl {
@@ -66,6 +67,13 @@ struct RemeshSettings {
   bool optimizeQuads = true;  // Valence optimisation and relaxation after the voxel remesh.
 };
 
+struct ProjectSettings {
+  float autosaveMinutes = 5.0f;  // 0 turns autosave off.
+};
+
+// What to do once the user has answered "save changes?".
+enum class PendingAction { None, Quit, NewScene, OpenProject };
+
 struct FrameStats {
   double frameMs = 0.0;
   double fps = 0.0;
@@ -90,6 +98,7 @@ class App {
   PrimitiveSettings primitives;
   SculptSettings sculpt;
   RemeshSettings remesh;
+  ProjectSettings projectSettings;
   std::string lastRemeshInfo;
   UndoStack undoStack;
   Mode mode = Mode::Object;
@@ -109,6 +118,19 @@ class App {
   bool remeshing() const { return remeshObjectId_ != 0; }
   void requestImport();
   void requestExport();
+  // Project files (.psculpt). New, Open and Quit ask about unsaved changes first.
+  void requestNewScene();
+  void requestOpenProject();
+  void requestSaveProject(bool saveAs);
+  void requestQuit();
+  void openProject(const std::filesystem::path& path);
+  // Opens a project or imports a mesh, by extension.
+  void openFile(const std::filesystem::path& path);
+  bool hasUnsavedChanges() const { return sceneFingerprint() != savedFingerprint_; }
+  const std::filesystem::path& projectPath() const { return projectPath_; }
+  // Settings stored in project files: brush, camera, symmetry, viewport, remesh, selection.
+  std::string settingsText() const;
+  void applySettings(const std::string& text);
   void deleteSelected();
   void duplicateSelected();
   void frameScene();
@@ -136,6 +158,18 @@ class App {
   void applySamples(std::uint64_t timestampNs);
   float currentPressure() const;
   void exportFile(const std::filesystem::path& path);
+  void drawProjectDialogs();
+  void runPendingAction();
+  // Serializes on the main thread and writes on a worker. `then` runs on the main thread after a
+  // successful write.
+  void saveProjectTo(const std::filesystem::path& path, std::function<void()> then = {});
+  void applyProject(Project project, std::vector<Bvh> bvhs, const std::filesystem::path& path, bool recovered);
+  void loadProjectAsync(const std::filesystem::path& path, bool recovered);
+  void autosaveTick();
+  void updateWindowTitle();
+  std::uint64_t sceneFingerprint() const;
+  void initRecovery();
+  void finishRecovery();
 
   SDL_Window* window_ = nullptr;
   SDL_GLContext gl_ = nullptr;
@@ -163,6 +197,20 @@ class App {
   int pendingImports_ = 0;
 
   std::uint64_t lastFrameNs_ = 0;
+
+  // Project files, autosave and crash recovery.
+  std::filesystem::path projectPath_;     // Empty until saved or opened.
+  std::uint64_t editCounter_ = 0;         // Bumped by strokes and undo/redo (mesh edits).
+  std::uint64_t savedFingerprint_ = 0;    // sceneFingerprint() when last saved or opened.
+  std::uint64_t autosavedFingerprint_ = 0;
+  std::uint64_t lastAutosaveNs_ = 0;
+  bool autosaveRunning_ = false;
+  bool savingProject_ = false;
+  std::filesystem::path dataDir_;         // Per-user folder for autosave and the session lock.
+  bool offerRecovery_ = false;            // Previous session ended without a clean exit.
+  PendingAction pendingAction_ = PendingAction::None;
+  bool askSaveChanges_ = false;
+  std::string windowTitle_;
 
   // Sculpting.
   Sculptor sculptor_;
