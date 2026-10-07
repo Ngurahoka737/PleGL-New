@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iterator>
 
 #include "core/Parallel.h"
 #include "core/Timer.h"
@@ -32,6 +33,7 @@ void Sculptor::start(SceneObject& object, const StrokeOptions& options, std::str
   undo_.objectId = object.id;
   undo_.topologyVersion = object.topologyVersion;
   snapshotIndex_.clear();
+  strokeRefit_.clear();
   if (vertexStamp_.size() != object.mesh.positions.size()) {
     vertexStamp_.assign(object.mesh.positions.size(), 0);
     stamp_ = 0;
@@ -239,6 +241,11 @@ bool Sculptor::applyOne(const Dab& dabIn, const DabTopology& topology) {
   lastDab_.leaves += static_cast<int>(leaves_.size());
 
   bvh.refitLeaves(m, leaves_);
+  strokeRefit_.insert(strokeRefit_.end(), leaves_.begin(), leaves_.end());
+  if (strokeRefit_.size() > 2 * bvh.leaves().size() + 4096) {  // Long strokes revisit leaves.
+    std::sort(strokeRefit_.begin(), strokeRefit_.end());
+    strokeRefit_.erase(std::unique(strokeRefit_.begin(), strokeRefit_.end()), strokeRefit_.end());
+  }
   std::sort(dirtyLeaves_.begin(), dirtyLeaves_.end());
   dirtyLeaves_.erase(std::unique(dirtyLeaves_.begin(), dirtyLeaves_.end()), dirtyLeaves_.end());
   for (Index l : dirtyLeaves_) object_->markLeafDirty(l);
@@ -330,6 +337,7 @@ bool Sculptor::beginGrab(SceneObject& object, const StrokeOptions& options, cons
       grabDirtyLeaves_.push_back(owner);
   }
   for (Index l : grabDirtyLeaves_) snapshot(l);
+  strokeRefit_ = grabRefitLeaves_;
   return true;
 }
 
@@ -436,11 +444,13 @@ std::optional<StrokeUndo> Sculptor::endStroke() {
   std::vector<LeafState> before;
   before.reserve(undo_.before.size());
   undo_.after.reserve(undo_.before.size());
+  kept_.clear();
   for (LeafState& b : undo_.before) {
     const BvhLeaf& l = obj->bvh.leaves()[b.leaf];
     if (std::equal(b.positions.begin(), b.positions.end(), m.positions.begin() + l.vertBegin) &&
         std::equal(b.normals.begin(), b.normals.end(), m.normals.begin() + l.vertBegin))
       continue;
+    kept_.push_back(b.leaf);
     LeafState a;
     a.leaf = b.leaf;
     a.positions.assign(m.positions.begin() + l.vertBegin, m.positions.begin() + l.vertEnd);
@@ -450,6 +460,13 @@ std::optional<StrokeUndo> Sculptor::endStroke() {
   }
   if (before.empty()) return std::nullopt;
   undo_.before = std::move(before);
+  // Leaves refit without a snapshot that survived: their bounds must follow the vertices of the
+  // others back and forth, or a raycast may miss them after undo.
+  std::sort(strokeRefit_.begin(), strokeRefit_.end());
+  strokeRefit_.erase(std::unique(strokeRefit_.begin(), strokeRefit_.end()), strokeRefit_.end());
+  std::sort(kept_.begin(), kept_.end());
+  std::set_difference(strokeRefit_.begin(), strokeRefit_.end(), kept_.begin(), kept_.end(),
+                      std::back_inserter(undo_.refit));
   return StrokeUndo{std::move(undo_)};
 }
 

@@ -119,6 +119,8 @@ class Sculptor {
   };
   std::vector<GrabVertex> grabVerts_;
   std::vector<Index> grabNormalVerts_, grabRefitLeaves_, grabDirtyLeaves_;
+  std::vector<Index> strokeRefit_;  // Every leaf refit during the stroke, for undo.
+  std::vector<Index> kept_;
   DabTiming lastDab_;
   int dabCount_ = 0;
   std::unique_ptr<DyntopoSession> dyntopo_;

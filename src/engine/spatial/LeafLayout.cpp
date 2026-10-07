@@ -37,11 +37,12 @@ std::size_t sliceBytes(const std::vector<T>& v) {
 }
 
 // Sizes `w` to n elements, reserving at least the capacity of `like` so the arrays that ping-pong
-// between a mesh and the workspace keep the mesh's headroom.
+// between a mesh and the workspace keep the mesh's headroom. Arrays far larger than that (left by
+// a bigger object sharing the workspace) are given up, or the smaller mesh would keep them.
 template <class T>
 void fit(std::vector<T>& w, const std::vector<T>& like, Index n) {
   const std::size_t want = std::max(like.capacity(), static_cast<std::size_t>(n));
-  if (w.capacity() < want) {
+  if (w.capacity() < want || w.capacity() > 2 * want + 65536) {
     std::vector<T>().swap(w);  // Reallocate without copying contents that are about to be overwritten.
     w.reserve(want);
   }

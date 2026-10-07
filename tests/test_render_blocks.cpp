@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <map>
 #include <random>
 #include <set>
@@ -280,4 +281,55 @@ TEST_CASE("leaves a dab does not mark keep their indices, and every changed vert
   }
   CHECK(topoDabs > 6);
   sculptor.endStroke();
+}
+
+TEST_CASE("refining and then merging under a moving brush keeps every drawn edge current") {
+  // A merge rewrites where the edges coming into the removed vertex end. After earlier splits
+  // those edges are often drawn by a leaf that holds neither their face nor the merged vertex.
+  int topoDabs = 0;
+  for (int seed = 1; seed <= 6; ++seed) {
+    INFO("seed " << seed);
+    Scene scene;
+    SceneObject& obj = scene.add("A", makeQuadSphere(16));
+    DrawBrush draw;
+    Sculptor sculptor;
+    StrokeOptions options;
+    options.dyntopo = true;
+    options.dyntopoOptions.timeBudgetMs = 0.0;
+    sculptor.beginStroke(obj, draw, options, "Draw");
+    CpuIndexBuffer gpuTris, gpuEdges;
+    gpuTris.upload(LeafIndexKind::Triangles, obj);
+    gpuEdges.upload(LeafIndexKind::Edges, obj);
+    float t = 1.3f * static_cast<float>(seed);
+    for (int i = 0; i < 160; ++i) {
+      INFO("dab " << i);
+      // A zigzag over the same area, with the detail drifting finer and coarser as in Relative mode.
+      t += 0.05f;
+      const Vec3 c = surfacePoint(obj, {-0.6f + 0.25f * std::sin(t * 1.7f), 0.8f, 0.2f + 0.25f * std::sin(t * 0.9f)});
+      const float detail = 0.04f + 0.025f * std::sin(t * 0.6f);
+      const auto trisBefore = perLeaf(LeafIndexKind::Triangles, obj);
+      const auto edgesBefore = perLeaf(LeafIndexKind::Edges, obj);
+      obj.clearDirty();
+      sculptor.dab(c, 0.2f, 0.5f, DabTopology{detail, faceNear(obj, c, 0.2f)});
+      topoDabs += sculptor.lastDab().splits + sculptor.lastDab().collapses > 0;
+      const std::set<Index> topo(obj.topoDirtyLeaves.begin(), obj.topoDirtyLeaves.end());
+      const auto trisAfter = perLeaf(LeafIndexKind::Triangles, obj);
+      const auto edgesAfter = perLeaf(LeafIndexKind::Edges, obj);
+      int stale = 0;
+      for (std::size_t l = 0; l < trisBefore.size(); ++l) {
+        if (topo.count(static_cast<Index>(l))) continue;
+        stale += trisAfter[l] != trisBefore[l];
+        stale += edgesAfter[l] != edgesBefore[l];
+      }
+      REQUIRE(stale == 0);
+      gpuTris.sync(LeafIndexKind::Triangles, obj, obj.topoDirtyLeaves);
+      gpuEdges.sync(LeafIndexKind::Edges, obj, obj.topoDirtyLeaves);
+      if (i % 20 == 19) {  // The whole-mesh comparison is slow; the per-leaf check above is not.
+        REQUIRE(edgeSet(gpuEdges.drawn()) == liveEdges(obj.mesh));
+        REQUIRE(triangleSet(gpuTris.drawn()) == liveTriangles(obj.mesh));
+      }
+    }
+    sculptor.endStroke();
+  }
+  CHECK(topoDabs > 300);
 }

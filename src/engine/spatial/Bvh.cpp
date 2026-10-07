@@ -119,18 +119,15 @@ void Bvh::build(Mesh& mesh, const Params& params) {
 
 Aabb Bvh::leafBounds(const Mesh& mesh, const BvhLeaf& leaf) const {
   Aabb b;
-  if (leaf.flags == 0) {
-    for (Index f = leaf.faceBegin; f < leaf.faceEnd; ++f) {
-      mesh.forEachFaceVertex(f, [&](Index v) { b.expand(mesh.positions[v]); });
-    }
-    return b;
-  }
-  // Leaves touched by dynamic topology: skip removed faces and include owned vertices, which may
-  // no longer be used by any face of the leaf.
+  // Removed faces are skipped even in leaves dynamic topology never flagged: an edit it did not
+  // hear about (which consolidate() then repairs) must not send the walk off the arrays.
   for (Index f = leaf.faceBegin; f < leaf.faceEnd; ++f) {
     if (mesh.faceHe[f] == kInvalid) continue;
     mesh.forEachFaceVertex(f, [&](Index v) { b.expand(mesh.positions[v]); });
   }
+  if (leaf.flags == 0) return b;
+  // Leaves touched by dynamic topology also include owned vertices, which may no longer be used
+  // by any face of the leaf.
   for (Index v = leaf.vertBegin; v < leaf.vertEnd; ++v)
     if (mesh.vertHe[v] != kInvalid) b.expand(mesh.positions[v]);
   return b;

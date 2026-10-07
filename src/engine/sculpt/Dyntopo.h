@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <unordered_set>
 #include <vector>
 
 #include "core/Timer.h"
@@ -126,6 +127,7 @@ class DyntopoSession {
   std::vector<Index> leaves_;
   std::vector<std::vector<Edge>> perLeafSplits_, perLeafCollapses_;
   std::vector<Edge> splits_, collapses_;
+  std::unordered_set<Index> blocked_;  // Half-edges of edges splitAll dropped this pass.
   std::vector<Index> ring_;
   Index faceLeaf_ = kInvalid;  // Leaf of the last face marked, which is already in topoDirtyLeaves.
   Index heLeaf_ = kInvalid;    // The same for half-edges.

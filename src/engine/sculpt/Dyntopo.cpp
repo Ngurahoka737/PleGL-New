@@ -52,15 +52,17 @@ bool walkFan(const Mesh& m, Index v, Fn&& fn) {
   }
 }
 
-// Area normal of face f (sum of corner cross products) with vertices a and b moved to p.
+// Area normal of face f (sum of corner cross products) with vertices a and b moved to p. The
+// corners are taken relative to p, which lies on the face, so the sum stays accurate on a mesh
+// far from its origin.
 Vec3 movedNormal(const Mesh& m, Index f, Index a, Index b, const Vec3& p) {
   Vec3 n{0.0f};
   const Index start = m.faceHe[f];
   Index h = start;
   do {
     const Index u = m.heVert[h], w = m.heVert[m.heNext[h]];
-    const Vec3& pu = (u == a || u == b) ? p : m.positions[u];
-    const Vec3& pw = (w == a || w == b) ? p : m.positions[w];
+    const Vec3 pu = (u == a || u == b) ? Vec3{0.0f} : m.positions[u] - p;
+    const Vec3 pw = (w == a || w == b) ? Vec3{0.0f} : m.positions[w] - p;
     n += glm::cross(pu, pw);
     h = m.heNext[h];
   } while (h != start);
@@ -149,10 +151,18 @@ void DyntopoSession::Observer::beforeWrite(ElementKind kind, Index index) {
     session->markFace(index);
   } else if (kind == ElementKind::HalfEdge) {
     // The face's triangles change, and so does the edge list of the leaf holding the half-edge,
-    // which after earlier splits is not always the leaf of its face.
-    const Index f = session->m_.heFace[index];
-    if (f != kInvalid) session->markFace(f);
+    // which after earlier splits is not always the leaf of its face. The line drawn for the
+    // previous half-edge ends where this one starts, and the twin decides which of the pair draws
+    // the line, so their leaves are marked too. Edits touch everything before writing anything,
+    // so the links read here are still the old ones.
+    const Mesh& m = session->m_;
+    const Index f = m.heFace[index];
     session->markHalfEdge(index);
+    if (f == kInvalid) return;
+    session->markFace(f);
+    session->markHalfEdge(m.hePrev(index));
+    const Index tw = m.heTwin[index];
+    if (tw != kInvalid) session->markHalfEdge(tw);
   }
 }
 
@@ -239,7 +249,9 @@ const DyntopoPass& DyntopoSession::pass(const Vec3& center, float radius, const 
   gather(center, radius, lmax2, lmin2, topo.hintFace);
   if (opt_.refine != DyntopoRefine::CollapseOnly) splitAll(center, radius, lmax2);
   if (opt_.refine != DyntopoRefine::SplitOnly) {
-    std::sort(collapses_.begin(), collapses_.end(), [](const Edge& x, const Edge& y) { return x.len2 < y.len2; });
+    // Ties broken by half-edge, so every standard library edits the same way.
+    std::sort(collapses_.begin(), collapses_.end(),
+              [](const Edge& x, const Edge& y) { return x.len2 < y.len2 || (x.len2 == y.len2 && x.h < y.h); });
     for (const Edge& e : collapses_) {
       if (faulted_ || pass_.collapses >= opt_.maxCollapses || overBudget()) break;
       collapseOne(e, lmax2, lmin2);
@@ -315,12 +327,22 @@ void DyntopoSession::gather(const Vec3& c, float r, float lmax2, float lmin2, In
 void DyntopoSession::splitAll(const Vec3& c, float r, float lmax2) {
   if (outOfRoom_) return;
   const float r2 = r * r;
-  auto shorter = [](const Edge& x, const Edge& y) { return x.len2 < y.len2; };
+  // Longest first; ties broken by half-edge, so every standard library pops in the same order.
+  auto shorter = [](const Edge& x, const Edge& y) { return x.len2 < y.len2 || (x.len2 == y.len2 && x.h > y.h); };
   auto push = [&](const Edge& e) {
     splits_.push_back(e);
     std::push_heap(splits_.begin(), splits_.end(), shorter);
   };
   std::make_heap(splits_.begin(), splits_.end(), shorter);
+  // Edges dropped this pass because their triangle may not be cut. Frozen faces stay frozen for
+  // the whole pass, so an edge that defers to one of these is dropped too, instead of being
+  // pushed back after it again and again.
+  blocked_.clear();
+  auto isBlocked = [&](Index x) {
+    if (blocked_.count(x)) return true;
+    const Index tx = m_.heTwin[x];
+    return tx != kInvalid && blocked_.count(tx) > 0;
+  };
   // Every split pops an edge, and so does every deferral to a longer edge; a quad that refuses
   // both diagonals could otherwise defer the same edge forever.
   std::size_t pops = 0;
@@ -382,14 +404,18 @@ void DyntopoSession::splitAll(const Vec3& c, float r, float lmax2) {
       if (longest == kInvalid) continue;
       const Index lt = m_.heTwin[longest];
       int size = 0;
-      if (lt != kInvalid && (m_.heFace[lt] == m_.heFace[longest] || frozen(m_.heFace[lt], size))) {
+      if ((lt != kInvalid && (m_.heFace[lt] == m_.heFace[longest] || frozen(m_.heFace[lt], size))) ||
+          isBlocked(longest)) {
         blocked = true;
         continue;
       }
       push({longest2, longest, m_.heVert[longest], m_.heTarget(longest)});
       deferred = true;
     }
-    if (blocked) continue;
+    if (blocked) {
+      blocked_.insert(h);
+      continue;
+    }
     if (deferred) {
       push(e);
       continue;
@@ -480,7 +506,11 @@ bool DyntopoSession::collapseOne(const Edge& e, float lmax2, float lmin2) {
     if (!shortEnough) return false;
   }
   // No face around the edge may flip or collapse to nothing. Triangles on the edge disappear.
-  const Vec3 fallback = m_.normals.empty() ? Vec3{0.0f} : m_.normals[a] + m_.normals[b];
+  // Each face is checked against its own normal before this collapse, and against the surface
+  // normal at both ends, which earlier collapses in the same pass do not move: without the
+  // second test a face can tip a little further with every collapse until it lies folded over.
+  const Vec3 surface = m_.normals.empty() ? Vec3{0.0f} : m_.normals[a] + m_.normals[b];
+  const float surfaceLen = glm::length(surface);
   for (Index f : ring_) {
     const bool both = faceHasBoth(m_, f, a, b);
     int size = 0;
@@ -490,11 +520,9 @@ bool DyntopoSession::collapseOne(const Edge& e, float lmax2, float lmin2) {
     const Vec3 n1 = movedNormal(m_, f, a, b, p);
     const float l0 = glm::length(n0), l1 = glm::length(n1);
     if (l1 <= 1e-4f * lmax2) return false;
-    if (l0 > 1e-12f) {
-      if (glm::dot(n0, n1) <= 0.2f * l0 * l1) return false;
-    } else if (!(glm::dot(n1, fallback) > 0.0f)) {
-      return false;
-    }
+    if (l0 > 1e-12f && glm::dot(n0, n1) <= 0.5f * l0 * l1) return false;
+    if (surfaceLen > 1e-12f && glm::dot(n1, surface) <= 0.2f * l1 * surfaceLen) return false;
+    if (l0 <= 1e-12f && surfaceLen <= 1e-12f) return false;
   }
 
   if (!ed_.collapseEdge(keep == a ? h : t, p)) return false;
@@ -508,11 +536,16 @@ bool DyntopoSession::collapseOne(const Edge& e, float lmax2, float lmin2) {
 
 void DyntopoSession::touchRing(Index v, bool refit) {
   pass_.changedVerts.push_back(v);
+  // Every corner of every face around v: on a quad the far corner is no neighbour of v, but its
+  // normal still changes with the face's.
   if (!walkFan(m_, v, [&](Index o) {
-        pass_.changedVerts.push_back(m_.heTarget(o));
-        if (refit) pass_.refitLeaves.push_back(bvh_.leafOfFace(m_.heFace[o]));
+        const Index f = m_.heFace[o];
+        m_.forEachFaceVertex(f, [&](Index w) { pass_.changedVerts.push_back(w); });
+        if (refit) pass_.refitLeaves.push_back(bvh_.leafOfFace(f));
       }))
     faulted_ = true;
+  // v moved, and the leaf that owns it bounds it even when none of its faces use v any more.
+  if (refit) pass_.refitLeaves.push_back(bvh_.leafOfVertex(v));
 }
 
 void DyntopoSession::finishPass() {

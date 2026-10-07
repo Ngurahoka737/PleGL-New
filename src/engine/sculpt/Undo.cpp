@@ -9,7 +9,7 @@ std::size_t SculptUndo::bytes() const {
   for (const auto* list : {&before, &after})
     for (const LeafState& s : *list)
       n += (s.positions.size() + s.normals.size()) * sizeof(Vec3) + s.mask.size() * sizeof(float);
-  return n;
+  return n + refit.size() * sizeof(Index);
 }
 
 std::size_t MeshState::bytes() const {
@@ -70,7 +70,7 @@ bool UndoStack::apply(Scene& scene, const SculptUndo& entry, const std::vector<L
   if (!obj || obj->topologyVersion != entry.topologyVersion) return false;
   Mesh& m = obj->mesh;
   std::vector<Index> leaves;
-  leaves.reserve(states.size());
+  leaves.reserve(states.size() + entry.refit.size());
   std::size_t maskLeaves = 0;
   for (const LeafState& s : states) maskLeaves += s.mask.empty() ? 0 : 1;
   // A mask operation can touch every leaf; one full mask upload is cheaper than many small ones.
@@ -88,8 +88,10 @@ bool UndoStack::apply(Scene& scene, const SculptUndo& entry, const std::vector<L
     if (!s.mask.empty() && !maskAll) obj->markMaskDirty(s.leaf);
   }
   if (maskAll) obj->markMaskDirtyAll();
-  // Every leaf whose faces moved has its own snapshot, so refitting these is enough.
-  if (!leaves.empty()) obj->bvh.refitLeaves(m, leaves);
+  if (!leaves.empty()) {
+    for (Index l : entry.refit) leaves.push_back(l);
+    obj->bvh.refitLeaves(m, leaves);
+  }
   return true;
 }
 

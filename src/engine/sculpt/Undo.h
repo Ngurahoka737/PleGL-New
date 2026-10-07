@@ -20,6 +20,9 @@ struct SculptUndo {
   std::uint64_t topologyVersion = 0;  // The entry only applies to this exact vertex order.
   std::vector<LeafState> before;
   std::vector<LeafState> after;
+  // Leaves whose bounds the stroke changed although none of their own vertices did (their faces
+  // use vertices of other leaves). They are refit along with the leaves above.
+  std::vector<Index> refit;
   std::size_t bytes() const;
 };
 

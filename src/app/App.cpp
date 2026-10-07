@@ -543,6 +543,9 @@ float App::currentPressure() const {
 }
 
 void App::beginStroke(float x, float y, std::uint64_t timestampNs) {
+  // A press without a matching release (focus lost mid-stroke) must not drop the open stroke's
+  // undo entry: end it properly first.
+  if (sculptor_.active()) endStroke();
   if (!hover_ || ImGui::GetIO().WantCaptureMouse) return;
   SceneObject* obj = scene.find(hover_->objectId);
   if (!obj) return;

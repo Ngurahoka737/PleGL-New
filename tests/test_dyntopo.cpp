@@ -21,6 +21,10 @@ namespace {
 
 constexpr float kPi = 3.14159265358979f;
 
+// Uniform in [0, 1) from the raw engine output. The standard distributions differ between
+// standard libraries; this gives every platform the same sequence.
+float unit(std::mt19937& rng) { return static_cast<float>(rng() >> 8) * (1.0f / 16777216.0f); }
+
 StrokeOptions dyntopoStroke(DyntopoRefine refine = DyntopoRefine::SplitCollapse) {
   StrokeOptions o;
   o.dyntopo = true;
@@ -895,10 +899,10 @@ TEST_CASE("random strokes, masks and undo keep the mesh valid and history exact"
   MaskBrush mask;
   const std::vector<const Brush*> brushes{&draw, &clay, &smooth, &inflate, &flatten, &crease};
   const DyntopoRefine refines[] = {DyntopoRefine::SplitCollapse, DyntopoRefine::SplitOnly, DyntopoRefine::CollapseOnly};
-  for (unsigned seed : {1u, 2u, 3u}) {
+  for (unsigned seed = 1; seed <= 20; ++seed) {
     INFO("seed " << seed);
     std::mt19937 rng(seed);
-    std::uniform_real_distribution<float> uni(0.0f, 1.0f);
+    auto uni = [&](std::mt19937& g) { return unit(g); };
     Scene scene;
     Mesh mesh = makeIcosphere(3);
     mesh.ensureMask();  // So undoing the first mask stroke has a mask to return to.
@@ -961,4 +965,153 @@ TEST_CASE("random strokes, masks and undo keep the mesh valid and history exact"
     }
     requireCompact(obj);
   }
+}
+
+TEST_CASE("a triangle whose longest edge may not be cut does not stall the rest of the brush") {
+  // T2 (Q S R) would be cut across QR, its longest edge. QR's other triangle T1 (P Q R) would be
+  // cut across PQ, which borders a pentagon that is never touched, so neither may be cut. A
+  // separate triangle under the same brush must still be refined.
+  std::vector<Vec3> p{{0, 0, 0},      {4, 0, 0},       {2, 3, 0},       {4.5f, 2.5f, 0},    {-1, -2, 0},
+                      {2, -3, 0},     {5, -2, 0},      {4.6f, 2.6f, 0.1f}, {6.0f, 2.6f, 0.1f}, {4.6f, 4.0f, 0.1f}};
+  const std::vector<Index> idx{0, 1, 2, 1, 3, 2, 1, 0, 4, 5, 6, 7, 8, 9};
+  const std::vector<Index> sizes{3, 3, 5, 3};
+  BuildReport report;
+  Mesh mesh = buildMesh(std::move(p), idx, sizes, &report);
+  REQUIRE(report.ok());
+  Scene scene;
+  SceneObject& obj = scene.add("A", std::move(mesh));
+  DrawBrush draw;
+  Sculptor sculptor;
+  const Vec3 c{4.5f, 2.5f, 0.0f};
+  const float r = 0.3f, detail = 1.0f;
+  const std::vector<Vec3> dabs(3, c);
+  REQUIRE(stroke(sculptor, obj, draw, dyntopoStroke(DyntopoRefine::SplitOnly), dabs, r, 0.0f, detail));
+  CHECK(sculptor.lastStrokeTopology().splits > 0);
+  // Every edge of the separate triangle the brush reaches is now short enough; the rest is whole.
+  int longInReach = 0, flatFaces = 0;
+  forEachEdge(obj.mesh, [&](const Vec3& a, const Vec3& b, bool) {
+    if (a.z > 0.05f && b.z > 0.05f && segmentDist(c, a, b) <= r) longInReach += glm::length(a - b) > detail;
+  });
+  for (Index f = 0; f < obj.mesh.faceCount(); ++f) flatFaces += obj.mesh.faceCentroid(f).z < 0.05f;
+  CHECK(longInReach == 0);
+  CHECK(flatFaces == 3);
+}
+
+TEST_CASE("coarsening a bumpy surface never folds a face over") {
+  // Each collapse may only tip a face so far from its previous normal; without a fixed reference
+  // a face could tip a little further with every collapse until it lay upside down.
+  Scene scene;
+  Mesh mesh = makeIcosphere(5);
+  std::mt19937 rng(7);
+  for (Vec3& q : mesh.positions) q *= 1.0f + 0.01f * (2.0f * unit(rng) - 1.0f);
+  mesh.computeNormals();
+  SceneObject& obj = scene.add("Ico", std::move(mesh));
+  SmoothBrush smooth;  // At strength 0 only the topology changes.
+  Sculptor sculptor;
+  int collapses = 0;
+  for (int s = 0; s < 4; ++s) {
+    INFO("stroke " << s);
+    std::vector<Vec3> dabs;
+    for (int i = 0; i < 12; ++i)
+      dabs.push_back(surfacePoint(obj, {2.0f * unit(rng) - 1.0f, 2.0f * unit(rng) - 1.0f, 2.0f * unit(rng) - 1.0f}));
+    REQUIRE(stroke(sculptor, obj, smooth, dyntopoStroke(), dabs, 0.3f, 0.0f, 0.15f));
+    collapses += sculptor.lastStrokeTopology().collapses;
+    int inward = 0;
+    for (Index f = 0; f < obj.mesh.faceCount(); ++f)
+      inward += glm::dot(obj.mesh.faceAreaNormal(f), obj.mesh.faceCentroid(f)) <= 0.0f;
+    CHECK(inward == 0);
+  }
+  CHECK(collapses > 1000);
+}
+
+TEST_CASE("a merged vertex stays inside the bounds of the leaf that owns it") {
+  // The owner of the vertex a collapse moves may hold none of the faces around it any more (they
+  // were split into tail leaves), yet its bounds must still cover it, or a brush skips it.
+  int passes = 0;
+  for (unsigned seed = 1; seed <= 16; ++seed) {
+    INFO("seed " << seed);
+    std::mt19937 rng(seed);
+    Mesh mesh = (seed % 2) ? makeCube(6) : makeIcosphere(4);
+    Bvh bvh;
+    bvh.build(mesh, {.maxLeafFaces = 32 + static_cast<int>(rng() % 100)});
+    Scene scene;
+    SceneObject& obj = scene.add("A", std::move(mesh), std::move(bvh));
+    DyntopoOptions options;
+    options.timeBudgetMs = 0.0;
+    LayoutWorkspace ws;
+    for (int s = 0; s < 4; ++s) {
+      DyntopoSession session(obj, options);
+      const float r = 0.1f + 0.3f * unit(rng);
+      const float fine = 0.03f + 0.05f * unit(rng), coarse = r * (1.0f + unit(rng));
+      Vec3 c = obj.mesh.faceCentroid(static_cast<Index>(rng() % static_cast<unsigned>(obj.mesh.faceCount())));
+      for (int d = 0; d < 12; ++d) {
+        Bvh::ClosestHit hit;
+        const Index hint = obj.bvh.closestPoint(obj.mesh, c, r, hit) ? hit.face : kInvalid;
+        if (hint != kInvalid) c = hit.position;
+        const DyntopoPass& pass = session.pass(c, r, DabTopology{d < 6 ? fine : coarse, hint});
+        obj.bvh.refitLeaves(obj.mesh, pass.refitLeaves);  // What the sculptor does before the brush.
+        requireDynamic(obj);
+        ++passes;
+        c += Vec3{unit(rng) - 0.5f, unit(rng) - 0.5f, unit(rng) - 0.5f} * r * 0.5f;
+      }
+      if (session.changedTopology()) {
+        std::vector<Index> claimed(session.recorder().claimedLeaves().begin(), session.recorder().claimedLeaves().end());
+        session.recorder().takeClaims();
+        consolidate(obj.mesh, obj.bvh, claimed, ws);
+        obj.mesh.computeNormals();
+      } else {
+        obj.bvh.endDynamic();
+      }
+    }
+  }
+  CHECK(passes == 16 * 4 * 12);
+}
+
+TEST_CASE("merging on quads refreshes the normals of their far corners") {
+  // A collapse changes every face around the merged vertex, and on a quad that includes a corner
+  // that is not its neighbour. With the detail larger than the brush, the brush's own normal
+  // update does not reach those corners.
+  Scene scene;
+  Mesh mesh = makeQuadSphere(48);
+  std::mt19937 rng(3);
+  for (Vec3& q : mesh.positions) q *= 1.0f + 0.01f * (2.0f * unit(rng) - 1.0f);
+  mesh.computeNormals();
+  mesh.ensureMask();
+  for (Index v = 0; v < mesh.vertexCount(); ++v) mesh.mask[v] = 0.45f * std::clamp(mesh.positions[v].y, 0.0f, 1.0f);
+  SceneObject& obj = scene.add("A", std::move(mesh));
+  SmoothBrush smooth;
+  Sculptor sculptor;
+  int collapses = 0;
+  for (int s = 0; s < 3; ++s) {
+    INFO("stroke " << s);
+    std::vector<Vec3> dabs;
+    Vec3 dir{2.0f * unit(rng) - 1.0f, 0.6f, 2.0f * unit(rng) - 1.0f};
+    for (int i = 0; i < 40; ++i) {
+      dabs.push_back(surfacePoint(obj, dir));
+      dir += Vec3{unit(rng) - 0.5f, unit(rng) - 0.5f, unit(rng) - 0.5f} * 0.05f;
+    }
+    // stroke() checks every normal against a full recompute at the end.
+    REQUIRE(stroke(sculptor, obj, smooth, dyntopoStroke(DyntopoRefine::CollapseOnly), dabs, 0.02f, 0.0f, 0.1f));
+    collapses += sculptor.lastStrokeTopology().collapses;
+  }
+  CHECK(collapses > 50);
+}
+
+TEST_CASE("a workspace shared with a bigger object does not hand its arrays to a smaller one") {
+  Scene scene;
+  SceneObject& a = scene.add("Big", makeIcosphere(3));
+  a.mesh.reserveHeadroom(2'000'000, 4'000'000, 12'000'000);  // As a big sculpt's arrays would be.
+  SceneObject& b = scene.add("Small", makeIcosphere(3));
+  auto workspace = std::make_shared<LayoutWorkspace>();
+  Sculptor sculptor;
+  sculptor.setLayoutWorkspace(workspace);
+  DrawBrush draw;
+  const std::vector<Vec3> dabs(4, Vec3{0.0f, 1.0f, 0.0f});
+  REQUIRE(stroke(sculptor, a, draw, dyntopoStroke(), dabs, 0.3f, 0.5f, 0.03f));
+  const std::size_t smallCapacity = b.mesh.positions.capacity();
+  REQUIRE(stroke(sculptor, b, draw, dyntopoStroke(), dabs, 0.3f, 0.5f, 0.03f));
+  CHECK(sculptor.lastStrokeTopology().splits > 0);
+  // Its own headroom for the stroke, and no more.
+  CHECK(b.mesh.positions.capacity() < 2 * std::max<std::size_t>(smallCapacity, 65536) + 65536 * 2);
+  CHECK(b.mesh.heNext.capacity() < 2'000'000);
 }
