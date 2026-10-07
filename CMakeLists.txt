@@ -34,6 +34,7 @@ add_library(plegl_engine STATIC
   src/engine/io/Obj.cpp
   src/engine/io/Project.cpp
   src/engine/spatial/Bvh.cpp
+  src/engine/spatial/LeafLayout.cpp
   src/engine/scene/Scene.cpp
   src/engine/sculpt/Brush.cpp
   src/engine/sculpt/MaskOps.cpp
@@ -80,6 +81,7 @@ if(PLEGL_BUILD_TESTS)
     tests/test_mask.cpp
     tests/test_project.cpp
     tests/test_bvh.cpp
+    tests/test_leaflayout.cpp
     tests/test_scene.cpp
     tests/test_sculpt.cpp
     tests/test_remesh.cpp

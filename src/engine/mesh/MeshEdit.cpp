@@ -50,6 +50,13 @@ bool MeshEditor::rotateEdge(Index h) {
   if (valence(a) <= 3 || valence(b) <= 3) return false;
   if (connected(c, d)) return false;
 
+  if (obs_) {
+    for (Index e : {hp, tn, h, tp, hn, t}) touchH(e);
+    touchV(a);
+    touchV(b);
+    touchF(F);
+    touchF(G);
+  }
   // F = [a, b, c, ...] becomes [d, c, ..., a]; G = [b, a, d, ...] becomes [c, d, ..., b].
   m_.heNext[hp] = tn;
   m_.heNext[tn] = h;
@@ -71,6 +78,8 @@ bool MeshEditor::rotateEdge(Index h) {
 Index MeshEditor::splitEdge(Index h, float t) {
   const Index tw = m_.heTwin[h];
   const Index a = m_.heVert[h], b = m_.heTarget(h);
+  touchH(h);
+  touchH(tw);
   const Index v = static_cast<Index>(m_.positions.size());
   m_.positions.push_back(glm::mix(m_.positions[a], m_.positions[b], t));
   if (!m_.normals.empty()) {
@@ -111,6 +120,12 @@ Index MeshEditor::splitFace(Index ha, Index hb) {
   const Index u = m_.heVert[ha], w = m_.heVert[hb];
   if (connected(u, w)) return kInvalid;
   const Index pa = m_.hePrev(ha), pb = m_.hePrev(hb);
+  if (obs_) {
+    touchH(pa);
+    touchH(pb);
+    for (Index e = hb; e != ha; e = m_.heNext[e]) touchH(e);  // These move to the new face.
+    touchF(f);
+  }
   const Index g = static_cast<Index>(m_.faceHe.size());
   m_.faceHe.push_back(hb);
   const Index d1 = static_cast<Index>(m_.heNext.size());  // u -> w, closes the new face g.
@@ -156,6 +171,23 @@ bool MeshEditor::collapseEdge(Index h, const Vec3& position) {
 
   collectOutgoing(a, scratchA_);
   collectOutgoing(b, scratchB_);
+  if (obs_) {
+    for (Index s : {h, t}) {
+      const Index sn = m_.heNext[s], sp = m_.hePrev(s);
+      touchF(m_.heFace[s]);
+      touchH(s);
+      touchH(sp);
+      if (m_.heNext[sn] == sp) {  // Triangle: all three die and the outer twins are relinked.
+        touchH(sn);
+        touchH(m_.heTwin[sn]);
+        touchH(m_.heTwin[sp]);
+        touchV(m_.heVert[sp]);
+      }
+    }
+    for (Index e : scratchB_) touchH(e);
+    touchV(a);
+    touchV(b);
+  }
   for (Index s : {h, t}) {
     const Index F = m_.heFace[s];
     const Index sn = m_.heNext[s], sp = m_.hePrev(s);
@@ -208,6 +240,12 @@ bool MeshEditor::collapseDiagonal(Index h) {
   if (!linkOk || connected(v0, v2)) return false;
 
   collectOutgoing(v2, scratchB_);
+  if (obs_) {
+    for (Index e : {e0, e1, e2, e3, t0, t1, t2, t3}) touchH(e);
+    for (Index e : scratchB_) touchH(e);
+    for (Index v : {v0, v1, v2, v3}) touchV(v);
+    touchF(F);
+  }
   // The quad's opposite edges pair up: v1-v0 with v1-v2, and v3-v0 with v3-v2.
   m_.heTwin[t0] = t1;
   m_.heTwin[t1] = t0;

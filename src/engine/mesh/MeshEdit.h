@@ -1,10 +1,22 @@
 #pragma once
 
+#include <cstdint>
 #include <vector>
 
 #include "mesh/Mesh.h"
 
 namespace plegl {
+
+enum class ElementKind : std::uint8_t { Vertex, Face, HalfEdge };
+
+// Told about every element an edit is about to change, before anything is written, so it can
+// snapshot what it needs (dynamic topology undo records whole BVH leaves this way). Elements
+// appended by the edit are not reported. Vertex reports cover positions and mask too.
+class EditObserver {
+ public:
+  virtual ~EditObserver() = default;
+  virtual void beforeWrite(ElementKind kind, Index index) = 0;
+};
 
 // Local topology edits on a half-edge mesh: the building blocks for remeshing and, later,
 // dynamic topology.
@@ -20,6 +32,9 @@ namespace plegl {
 class MeshEditor {
  public:
   explicit MeshEditor(Mesh& mesh);
+
+  // nullptr (the default) reports nothing.
+  void setObserver(EditObserver* observer) { obs_ = observer; }
 
   Mesh& mesh() { return m_; }
   bool faceAlive(Index f) const { return m_.faceHe[f] != kInvalid; }
@@ -62,10 +77,20 @@ class MeshEditor {
 
  private:
   void killHalfEdge(Index h);
+  void touchV(Index v) {
+    if (obs_) obs_->beforeWrite(ElementKind::Vertex, v);
+  }
+  void touchF(Index f) {
+    if (obs_) obs_->beforeWrite(ElementKind::Face, f);
+  }
+  void touchH(Index h) {
+    if (obs_ && h != kInvalid) obs_->beforeWrite(ElementKind::HalfEdge, h);
+  }
   void collectOutgoing(Index v, std::vector<Index>& out) const;
   bool closedFan(Index v) const;
 
   Mesh& m_;
+  EditObserver* obs_ = nullptr;
   std::vector<char> deadVertex_;
   mutable std::vector<Index> scratchA_, scratchB_;
 };

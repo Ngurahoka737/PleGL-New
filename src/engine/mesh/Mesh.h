@@ -8,6 +8,10 @@
 
 namespace plegl {
 
+// Position written to vertices removed during a dynamic topology stroke. It is finite, so brush
+// distance tests (dist2 >= r2) reject it without creating inf or NaN, but far from any surface.
+inline constexpr Vec3 kDeadPosition{1e18f, 1e18f, 1e18f};
+
 // Polygon mesh stored as an index-based half-edge structure with struct-of-arrays attributes.
 //
 // Topology arrays hold 32-bit indices only, so a mesh can be copied, serialized or handed to
@@ -52,6 +56,12 @@ class Mesh {
   }
   // True if any vertex has a non-zero mask value.
   bool anyMasked() const;
+
+  // Reserves capacity for at least this many vertices, faces and half-edges in every array, so
+  // appending up to that point never reallocates (dynamic topology edits run inside a dab).
+  void reserveHeadroom(Index vertices, Index faces, Index halfEdges);
+  // True if `vertices`, `faces` and `halfEdges` more elements fit without reallocating.
+  bool hasHeadroom(Index vertices, Index faces, Index halfEdges) const;
 
   // Calls fn(h) for every outgoing half-edge of v. Each incident face is visited exactly once.
   template <class Fn>
@@ -115,6 +125,10 @@ struct ValidationResult {
 
 // Checks every topological invariant. Intended for debug builds and tests.
 ValidationResult validate(const Mesh& mesh);
+// Like validate(), but skips elements removed by MeshEditor that compact() has not dropped yet:
+// faces with faceHe == kInvalid, half-edges with heFace == kInvalid and vertices without faces.
+// Live elements may only reference live elements.
+ValidationResult validateLive(const Mesh& mesh);
 
 // ---------------------------------------------------------------------------------------------
 
