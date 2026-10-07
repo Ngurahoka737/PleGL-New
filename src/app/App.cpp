@@ -620,8 +620,8 @@ void App::endStroke() {
   if (auto entry = sculptor_.endStroke()) {
     ++editCounter_;
     const int dabs = sculptor_.dabCount();
-    statusMessage = entry->label + " stroke, " + std::to_string(dabs) +
-                    (strokeBrush_ == BrushKind::Grab ? " moves" : " dabs");
+    const std::string label = std::visit([](const auto& e) { return e.label; }, *entry);
+    statusMessage = label + " stroke, " + std::to_string(dabs) + (strokeBrush_ == BrushKind::Grab ? " moves" : " dabs");
     undoStack.push(std::move(*entry));
   }
 }
