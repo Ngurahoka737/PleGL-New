@@ -71,11 +71,18 @@ void App::drawUi() {
   if (ImGui::BeginMainMenuBar()) {
     menuH = ImGui::GetWindowSize().y;
     if (ImGui::BeginMenu("File")) {
-      if (ImGui::MenuItem("New Scene", "Ctrl+N")) newScene();
-      if (ImGui::MenuItem("Import OBJ...", "Ctrl+O")) requestImport();
+      if (ImGui::MenuItem("New Scene", "Ctrl+N")) requestNewScene();
+      if (ImGui::MenuItem("Open Project...", "Ctrl+O")) requestOpenProject();
+      if (ImGui::MenuItem("Save Project", "Ctrl+S")) requestSaveProject(false);
+      if (ImGui::MenuItem("Save Project As...", "Ctrl+Shift+S")) requestSaveProject(true);
+      ImGui::Separator();
+      if (ImGui::MenuItem("Import OBJ...", "Ctrl+I")) requestImport();
       if (ImGui::MenuItem("Export Selected OBJ...", "Ctrl+E", false, scene.find(selectedId) != nullptr)) requestExport();
       ImGui::Separator();
-      if (ImGui::MenuItem("Quit")) quit();
+      ImGui::SetNextItemWidth(120.0f * scale);
+      ImGui::SliderFloat("Autosave (min)", &projectSettings.autosaveMinutes, 0.0f, 30.0f, projectSettings.autosaveMinutes > 0 ? "%.0f" : "off");
+      ImGui::Separator();
+      if (ImGui::MenuItem("Quit")) requestQuit();
       ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Add")) {
@@ -374,6 +381,7 @@ void App::drawUi() {
   }
   ImGui::End();
 
+  drawProjectDialogs();
   if (showDemo) ImGui::ShowDemoWindow(&showDemo);
 
   // The viewport is whatever the panels leave.

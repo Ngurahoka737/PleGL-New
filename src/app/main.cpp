@@ -12,8 +12,8 @@ int main(int argc, char** argv) {
     app.shutdown();
     return 1;
   }
-  // Files passed on the command line (or dropped on the executable) are imported at start.
-  for (int i = 1; i < argc; ++i) app.importFile(std::filesystem::path(reinterpret_cast<const char8_t*>(argv[i])));
+  // Files passed on the command line (or dropped on the executable): projects open, meshes import.
+  for (int i = 1; i < argc; ++i) app.openFile(std::filesystem::path(reinterpret_cast<const char8_t*>(argv[i])));
   app.run();
   app.shutdown();
   return 0;
