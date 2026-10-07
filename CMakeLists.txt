@@ -29,6 +29,7 @@ endif()
 add_library(plegl_engine STATIC
   src/engine/core/Parallel.cpp
   src/engine/mesh/Mesh.cpp
+  src/engine/mesh/MeshEdit.cpp
   src/engine/mesh/Primitives.cpp
   src/engine/io/Obj.cpp
   src/engine/spatial/Bvh.cpp
@@ -40,6 +41,7 @@ add_library(plegl_engine STATIC
   src/engine/remesh/VoxelGrid.cpp
   src/engine/remesh/SurfaceNets.cpp
   src/engine/remesh/VoxelRemesh.cpp
+  src/engine/remesh/QuadRemesh.cpp
 )
 target_include_directories(plegl_engine PUBLIC src/engine)
 target_link_libraries(plegl_engine PUBLIC glm::glm PRIVATE plegl_warnings)
@@ -69,6 +71,7 @@ if(PLEGL_BUILD_TESTS)
   add_executable(plegl_tests
     tests/test_main.cpp
     tests/test_mesh.cpp
+    tests/test_meshedit.cpp
     tests/test_primitives.cpp
     tests/test_obj.cpp
     tests/test_bvh.cpp
