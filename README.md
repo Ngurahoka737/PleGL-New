@@ -2,7 +2,7 @@
 
 Software digital sculpting 3D untuk desktop yang fokus pada satu hal: sculpting yang cepat, stabil, dan mudah dipelajari.
 
-Status: **Phase 4 (Quad Remesher)**. Tujuh brush (Draw, Clay, Smooth, Grab, Inflate, Flatten, Crease), empat jenis falloff, tekanan pen, undo/redo, simetri X, dan quad remesh (voxel remesh lalu optimasi valence 4, relaksasi, dan proyeksi ke permukaan asli) sudah jalan di atas engine Phase 0 (mesh, BVH, renderer, import/export OBJ).
+Status: **Phase 4 (Quad Remesher)**. Tujuh brush (Draw, Clay, Smooth, Grab, Inflate, Flatten, Crease), empat jenis falloff, tekanan pen, undo/redo, simetri X, dan quad remesh (voxel remesh lalu optimasi valence 4 sampai sekitar 99%, relaksasi, dan proyeksi ke permukaan asli) sudah jalan di atas engine Phase 0 (mesh, BVH, renderer, import/export OBJ).
 
 ## Stack
 

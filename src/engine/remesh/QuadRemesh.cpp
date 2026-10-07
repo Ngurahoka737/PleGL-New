@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 
 #include "core/Parallel.h"
 #include "core/Timer.h"
@@ -20,6 +21,7 @@ constexpr float kDiamondDiagonal = 1.5f;  // Valence-driven collapses only on qu
 constexpr float kMinCornerSin = -0.1f;
 constexpr float kRelaxRate = 0.6f;
 constexpr float kProjectDistance = 1.0f;  // Search radius for projection, in target edges.
+constexpr int kGatherRings = 3;           // How far drift passes look for other irregular vertices.
 
 int irregularity(int valence) { return (valence - 4) * (valence - 4); }
 
@@ -34,16 +36,35 @@ bool quadOk(const std::array<Vec3, 4>& p, const Vec3& n) {
   return true;
 }
 
+std::uint32_t hashMix(std::uint32_t i, std::uint32_t seed) {
+  std::uint32_t r = (i + 1u) * 2654435761u ^ seed * 0x9E3779B9u;
+  r ^= r >> 15;
+  r *= 0x2C1B3C6Du;
+  r ^= r >> 12;
+  return r;
+}
+
+// Topology passes over a quad mesh, scored by valence irregularity sum((valence - 4)^2).
+//
+// Improve passes only take moves that lower the score. They get stuck with scattered 3-5 pairs
+// (the quad mesh version of a lattice dislocation): moving a pair one step costs nothing, and
+// only two pairs that meet can cancel. Drift passes therefore also take moves that keep the
+// score, preferring ones that bring irregular vertices closer to other irregular vertices, so
+// pairs wander towards each other and the next improve pass cancels them.
 class Optimizer {
  public:
+  enum class Mode { Improve, Drift };
+
   Optimizer(Mesh& mesh, float h) : ed_(mesh), m_(mesh), h_(h), val_(mesh.vertexCount()) {
     parallelFor(0, val_.size(), 4096, [&](std::size_t b, std::size_t e) {
       for (std::size_t v = b; v < e; ++v) val_[v] = m_.valence(static_cast<Index>(v));
     });
+    stamp_.assign(val_.size(), 0);
   }
 
-  // Removes slivers and quads whose collapse makes the surrounding valences more regular.
-  int collapsePass() {
+  // Collapses slivers, and quads whose diagonal collapse lowers (or in drift mode keeps, while
+  // gathering irregular vertices) the irregularity of their corners.
+  int collapsePass(Mode mode, std::uint32_t seed = 0) {
     int done = 0;
     const Index nf = m_.faceCount();
     for (Index f = 0; f < nf; ++f) {
@@ -58,21 +79,42 @@ class Optimizer {
         v[i] = m_.heVert[e[i]];
         val[i] = val_[v[i]];
       }
-      const float d0 = glm::length(m_.positions[v[0]] - m_.positions[v[2]]);
-      const float d1 = glm::length(m_.positions[v[1]] - m_.positions[v[3]]);
+      const float diag[2] = {glm::length(m_.positions[v[0]] - m_.positions[v[2]]),
+                             glm::length(m_.positions[v[1]] - m_.positions[v[3]])};
+      // Score before and after collapsing the diagonal starting at corner c.
+      auto score = [&](int c, int& before, int& after) {
+        const int a = val[c], b = val[c + 1], o = val[c + 2], d = val[(c + 3) & 3];
+        before = irregularity(a) + irregularity(o) + irregularity(b) + irregularity(d);
+        after = irregularity(a + o - 2) + irregularity(b - 1) + irregularity(d - 1);
+      };
       int k = -1;
-      if (std::min(d0, d1) < kSliverDiagonal * h_) {
-        k = d0 < d1 ? 0 : 1;
+      if (std::min(diag[0], diag[1]) < kSliverDiagonal * h_) {
+        k = diag[0] < diag[1] ? 0 : 1;
       } else {
         int bestGain = 0;
         for (int c = 0; c < 2; ++c) {
-          if ((c == 0 ? d0 : d1) > kDiamondDiagonal * h_) continue;
-          const int a = val[c], b = val[c + 1], o = val[c + 2], d = val[(c + 3) & 3];
-          const int before = irregularity(a) + irregularity(o) + irregularity(b) + irregularity(d);
-          const int after = irregularity(a + o - 2) + irregularity(b - 1) + irregularity(d - 1);
+          if (diag[c] > kDiamondDiagonal * h_) continue;
+          int before = 0, after = 0;
+          score(c, before, after);
           if (before - after > bestGain) {
             bestGain = before - after;
             k = c;
+          }
+        }
+        if (k < 0 && mode == Mode::Drift) {
+          const std::uint32_t r = hashMix(f, seed);
+          const int c = int(r & 1u);
+          int before = 0, after = 0;
+          score(c, before, after);
+          if (before > 0 && before == after && diag[c] <= kDiamondDiagonal * h_) {
+            const Index skip[6] = {v[0], v[1], v[2], v[3], v[0], v[0]};
+            int sb = 0, sa = 0;
+            for (int i = 0; i < 4; ++i)
+              if (val[i] != 4) sb += nearbyIrregular(v[i], skip);
+            if (val[c] + val[c + 2] - 2 != 4) sa += nearbyIrregular(v[c], skip);
+            if (val[c + 1] - 1 != 4) sa += nearbyIrregular(v[c + 1], skip);
+            if (val[(c + 3) & 3] - 1 != 4) sa += nearbyIrregular(v[(c + 3) & 3], skip);
+            if (sa > sb || (sa == sb && (r & 12u) == 0)) k = c;
           }
         }
       }
@@ -86,9 +128,9 @@ class Optimizer {
     return done;
   }
 
-  // Rotates edges between two quads when that lowers the irregularity of the six vertices
-  // around them.
-  int rotatePass() {
+  // Rotates edges between two quads when that lowers (or in drift mode keeps, while gathering
+  // irregular vertices) the irregularity of the six vertices around them.
+  int rotatePass(Mode mode, std::uint32_t seed = 0) {
     int done = 0;
     const Index nh = m_.halfEdgeCount();
     for (Index h = 0; h < nh; ++h) {
@@ -103,22 +145,45 @@ class Optimizer {
       const Index d = m_.heVert[tnn], g = m_.heVert[tp];
       const int va = val_[a], vb = val_[b], vc = val_[c], ve = val_[e], vd = val_[d], vg = val_[g];
       if (va <= 3 || vb <= 3) continue;
-      const int common = irregularity(va) + irregularity(vb);
-      const int base = common + irregularity(vc) + irregularity(vd) + irregularity(ve) + irregularity(vg);
+      const int base = irregularity(va) + irregularity(vb) + irregularity(vc) + irregularity(vd) + irregularity(ve) +
+                       irregularity(vg);
       const int lowered = irregularity(va - 1) + irregularity(vb - 1);
       const int once = lowered + irregularity(vc + 1) + irregularity(vd + 1) + irregularity(ve) + irregularity(vg);
       const int twice = lowered + irregularity(vc) + irregularity(vd) + irregularity(ve + 1) + irregularity(vg + 1);
-      const int best = std::min(once, twice);
-      if (best >= base) continue;
+      int first = 0, second = 0;  // Configurations to try, in order: 1 = once, 2 = twice.
+      if (once < base || twice < base) {
+        first = once <= twice ? 1 : 2;
+        second = first == 1 ? (twice < base ? 2 : 0) : (once < base ? 1 : 0);
+      } else {
+        if (mode != Mode::Drift || base == 0 || std::min(once, twice) > base) continue;
+        // Score-neutral: take it only if it gathers irregular vertices (or now and then on a tie).
+        const std::uint32_t r = hashMix(h, seed);
+        const bool useOnce = once == base && (twice != base || (r & 2u));
+        const Index six[6] = {a, b, c, d, e, g};
+        const int delta[6] = {-1, -1, useOnce, useOnce, !useOnce, !useOnce};
+        int sb = 0, sa = 0;
+        for (int i = 0; i < 6; ++i) {
+          const int v0 = val_[six[i]], v1 = v0 + delta[i];
+          if (v0 == 4 && v1 == 4) continue;
+          const int n = nearbyIrregular(six[i], six);
+          if (v0 != 4) sb += n;
+          if (v1 != 4) sa += n;
+        }
+        if (sa < sb || (sa == sb && (r & 12u) != 0)) continue;
+        first = useOnce ? 1 : 2;
+      }
 
       const auto& p = m_.positions;
       const Vec3 n = m_.faceAreaNormal(m_.heFace[h]) + m_.faceAreaNormal(m_.heFace[t]);
+      auto valid = [&](int option) {
+        if (option == 1) return quadOk({p[d], p[c], p[e], p[a]}, n) && quadOk({p[c], p[d], p[g], p[b]}, n);
+        return quadOk({p[g], p[e], p[a], p[d]}, n) && quadOk({p[e], p[g], p[b], p[c]}, n) && !ed_.connected(e, g);
+      };
       int steps = 0;
-      if (once == best && quadOk({p[d], p[c], p[e], p[a]}, n) && quadOk({p[c], p[d], p[g], p[b]}, n)) {
-        steps = 1;
-      } else if (twice < base && quadOk({p[g], p[e], p[a], p[d]}, n) && quadOk({p[e], p[g], p[b], p[c]}, n) &&
-                 !ed_.connected(e, g)) {
-        steps = 2;
+      if (valid(first)) {
+        steps = first;
+      } else if (second != 0 && valid(second)) {
+        steps = second;
       }
       if (steps == 0 || !ed_.rotateEdge(h)) continue;
       // The second step cannot be refused: c and d gained an edge and e-g was checked above.
@@ -135,10 +200,38 @@ class Optimizer {
   void compact() { ed_.compact(); }
 
  private:
+  // Irregular vertices within kGatherRings rings of v, not counting `skip`.
+  int nearbyIrregular(Index v, const Index (&skip)[6]) {
+    ++tick_;
+    queue_.clear();
+    queue_.push_back(v);
+    stamp_[v] = tick_;
+    for (const Index s : skip) stamp_[s] = tick_;
+    int count = 0;
+    std::size_t begin = 0;
+    for (int ring = 0; ring < kGatherRings; ++ring) {
+      const std::size_t end = queue_.size();
+      for (std::size_t i = begin; i < end; ++i) {
+        m_.forEachOutgoing(queue_[i], [&](Index he) {
+          const Index w = m_.heTarget(he);
+          if (stamp_[w] == tick_) return;
+          stamp_[w] = tick_;
+          count += val_[w] != 4;
+          queue_.push_back(w);
+        });
+      }
+      begin = end;
+    }
+    return count;
+  }
+
   MeshEditor ed_;
   Mesh& m_;
   float h_;
   std::vector<int> val_;  // Valence of every vertex, kept up to date by the passes.
+  std::vector<std::uint32_t> stamp_;
+  std::uint32_t tick_ = 0;
+  std::vector<Index> queue_;
 };
 
 // Moves vertices towards the average of their neighbours along the surface. The last step also
@@ -174,15 +267,48 @@ void relax(Mesh& m, const Mesh& ref, const Bvh& refBvh, float h, int iterations)
   m.computeNormals();
 }
 
+// Splits every quad into four: new vertices at edge midpoints and face centres. Existing
+// vertices keep their valence and every new vertex has valence 4.
+Mesh subdivideQuads(const Mesh& m) {
+  std::vector<Vec3> pos(m.positions);
+  std::vector<Index> edgeVert(m.halfEdgeCount(), kInvalid);
+  for (Index h = 0; h < m.halfEdgeCount(); ++h) {
+    if (edgeVert[h] != kInvalid) continue;
+    const Index v = static_cast<Index>(pos.size());
+    pos.push_back((m.positions[m.heVert[h]] + m.positions[m.heTarget(h)]) * 0.5f);
+    edgeVert[h] = v;
+    if (m.heTwin[h] != kInvalid) edgeVert[m.heTwin[h]] = v;
+  }
+  std::vector<Index> idx, sizes;
+  idx.reserve(m.halfEdgeCount() * 4);
+  sizes.reserve(m.halfEdgeCount());
+  for (Index f = 0; f < m.faceCount(); ++f) {
+    const Index c = static_cast<Index>(pos.size());
+    pos.push_back(m.faceCentroid(f));
+    const Index h0 = m.faceHe[f];
+    Index h = h0;
+    do {
+      const Index next = m.heNext[h];
+      idx.insert(idx.end(), {m.heVert[next], edgeVert[next], c, edgeVert[h]});
+      sizes.push_back(4);
+      h = next;
+    } while (h != h0);
+  }
+  return buildMesh(std::move(pos), idx, sizes);
+}
+
 }  // namespace
 
 std::optional<Mesh> quadRemesh(const Mesh& input, const QuadRemeshParams& params, QuadRemeshStats* stats,
                                std::string* error) {
   QuadRemeshStats local;
   QuadRemeshStats& st = stats ? *stats : local;
-  std::optional<Mesh> out = voxelRemesh(input, {params.targetEdge, params.maxResolution}, &st.voxel, error);
+  const bool optimize = params.rounds > 0;
+  const int subdivisions = optimize ? std::clamp(params.subdivisions, 0, 3) : 0;
+  float h = params.targetEdge * float(1 << subdivisions);  // Edge length of the current mesh.
+  std::optional<Mesh> out = voxelRemesh(input, {h, params.maxResolution}, &st.voxel, error);
   if (!out) return out;
-  if (params.rounds <= 0) {  // Plain voxel remesh.
+  if (!optimize) {  // Plain voxel remesh.
     st.raw = st.optimized = measureQuality(*out);
     return out;
   }
@@ -191,7 +317,6 @@ std::optional<Mesh> quadRemesh(const Mesh& input, const QuadRemeshParams& params
   Mesh ref = input;
   Bvh refBvh;
   refBvh.build(ref, {.maxLeafFaces = 8});  // Small leaves: millions of point queries follow.
-  const float h = params.targetEdge;
   const Mesh* errRef = params.measureError ? &ref : nullptr;
   const Bvh* errBvh = params.measureError ? &refBvh : nullptr;
   double statsMs = 0.0;
@@ -200,13 +325,25 @@ std::optional<Mesh> quadRemesh(const Mesh& input, const QuadRemeshParams& params
     st.raw = measureQuality(*out, errRef, errBvh);
     statsMs = s.ms();
   }
+  using Mode = Optimizer::Mode;
   for (int round = 0; round < params.rounds; ++round) {
     if (params.optimizeValence) {
       Optimizer opt(*out, h);
-      st.collapsed += opt.collapsePass();
-      st.rotated += opt.rotatePass();
+      st.collapsed += opt.collapsePass(Mode::Improve);
+      st.rotated += opt.rotatePass(Mode::Improve);
+      for (int k = 0; k < params.driftPasses; ++k) {
+        const auto seed = static_cast<std::uint32_t>(round * 1000 + k);
+        st.rotated += opt.rotatePass(Mode::Drift, seed);
+        st.collapsed += opt.collapsePass(Mode::Drift, seed);
+        st.rotated += opt.rotatePass(Mode::Improve);
+      }
       opt.compact();
     }
+    relax(*out, ref, refBvh, h, params.relaxIterations);
+  }
+  for (int i = 0; i < subdivisions; ++i) {
+    *out = subdivideQuads(*out);
+    h *= 0.5f;
     relax(*out, ref, refBvh, h, params.relaxIterations);
   }
   st.optimizeMs = t.ms() - statsMs;

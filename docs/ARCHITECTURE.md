@@ -76,11 +76,16 @@ Output Surface Nets mentah punya valence 4 sekitar 50% (khas pada permukaan mele
 
 ## Quad remesh (`remesh/QuadRemesh.h`)
 
-Pipeline: `voxelRemesh` → beberapa ronde (default 3) dari:
+Pipeline: `voxelRemesh` pada **2× target edge** → beberapa ronde (default 3) optimasi → subdivisi 1 level ke target edge → relaksasi.
 
-1. **Collapse diagonal**: quad tipis (diagonal < 0,35 × target edge) dan quad yang collapse-nya menurunkan ketidakteraturan valence (pola 3-x-3-x yang ditinggalkan Surface Nets di bagian melengkung) dihapus.
+Satu ronde optimasi:
+
+1. **Collapse diagonal**: quad tipis (diagonal < 0,35 × edge) dan quad yang collapse-nya menurunkan ketidakteraturan valence (skor Σ(valence − 4)²) dihapus, misalnya pola 3-x-3-x yang ditinggalkan Surface Nets di bagian melengkung.
 2. **Rotasi edge**: edge di antara dua quad diputar kalau enam vertex di sekitarnya jadi lebih dekat ke valence 4, selama tidak ada sudut quad yang terlipat.
-3. **Relaksasi**: vertex bergeser ke rata-rata tetangganya sepanjang bidang singgung, lalu diproyeksikan ke mesh asli (`Bvh::closestPoint`, daun kecil 8 face) dengan cek arah normal supaya tidak menempel ke sisi seberang bagian tipis.
+3. **Drift** (default 5 pass): langkah 1 dan 2 berhenti di sekitar 95% karena sisa vertex tidak teratur berupa pasangan 3-5 yang tersebar (mirip dislokasi pada kisi). Memindahkan pasangan satu langkah tidak mengubah skor, dan pasangan baru bisa saling hilang kalau bertemu. Pass drift mengambil langkah yang skornya tetap, tetapi memilih yang mendekatkan vertex tidak teratur ke vertex tidak teratur lain dalam radius 3 ring. Pass perbaikan sesudahnya menghapus pasangan yang sudah bertemu.
+4. **Relaksasi**: vertex bergeser ke rata-rata tetangganya sepanjang bidang singgung. Langkah terakhir memproyeksikannya ke mesh asli (`Bvh::closestPoint`, daun kecil 8 face) dengan cek arah normal supaya tidak menempel ke sisi seberang bagian tipis.
+
+**Subdivisi** memecah setiap quad menjadi empat. Vertex lama mempertahankan valence-nya dan semua vertex baru bervalence 4, jadi porsi vertex tidak teratur turun sekitar empat kali. Ini yang membawa hasil dari ~98% ke ~99,5%. Harga yang dibayar: volume yang lebih tipis dari 2× edge bisa hilang pada langkah voxel, dan sudut tajam sedikit lebih bulat. Permukaannya tetap dipasang ke mesh asli pada target edge. `subdivisions = 0` memakai pipeline lama tanpa subdivisi.
 
 Valence disimpan di cache dan diperbarui per operasi, sehingga pass topologi tetap linear. Hasil tetap tertutup, manifold, dan 100% quad. `measureQuality` memberi rasio valence 4, koefisien variasi panjang edge, dan galat permukaan (jarak pusat face ke mesh asli).
 
@@ -149,20 +154,20 @@ Target PRD: 100K < 1 s, 500K < 3 s, 1M < 5 s. Volume bola berubah kurang dari 2%
 
 | Vertex input | Target edge | Vertex output | Voxel | Optimasi | Total | Valence 4 |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 100K | 0,010 | 158K | 0,24 s | 0,26 s | 0,51 s | 95,9% |
-| 100K | 0,005 | 633K | 0,80 s | 0,89 s | 1,7 s | 96,0% |
-| 500K | 0,010 | 158K | 0,50 s | 0,45 s | 0,97 s | 95,9% |
-| 500K | 0,005 | 633K | 1,1 s | 1,2 s | 2,4 s | 96,0% |
-| 1M | 0,010 | 158K | 0,78 s | 0,73 s | 1,5 s | 96,0% |
-| 1M | 0,005 | 633K | 1,4 s | 1,5 s | 2,9 s | 96,0% |
+| 100K | 0,010 | 157K | 0,11 s | 0,27 s | 0,39 s | 99,5% |
+| 100K | 0,005 | 628K | 0,23 s | 1,0 s | 1,3 s | 99,6% |
+| 500K | 0,010 | 157K | 0,36 s | 0,46 s | 0,84 s | 99,5% |
+| 500K | 0,005 | 628K | 0,54 s | 1,3 s | 1,8 s | 99,6% |
+| 1M | 0,010 | 157K | 0,66 s | 0,67 s | 1,3 s | 99,5% |
+| 1M | 0,005 | 628K | 0,84 s | 1,4 s | 2,2 s | 99,6% |
 
-Kualitas dibanding voxel remesh mentah (tes `quad remesh improves ...`, galat dalam satuan panjang edge rata-rata):
+Kualitas dibanding voxel remesh biasa pada target edge yang sama (tes `quad remesh reaches 98% ...`, galat dalam satuan panjang edge rata-rata). Mesh tes ini kecil (7K sampai 13K vertex); makin besar mesh, makin tinggi rasio valence 4:
 
 | Mesh | Valence 4 | CV panjang edge | Galat rata-rata |
 | --- | --- | --- | --- |
-| Quad sphere | 51% → 94% | 0,21 → 0,17 | 0,020 → 0,010 |
-| UV sphere | 48% → 94% | 0,22 → 0,17 | 0,025 → 0,013 |
-| Cube | 99,9% → 99,9% | 0,11 → 0,05 | 0,012 → 0,005 |
-| Dua bola tumpang tindih | 52% → 93% | 0,22 → 0,17 | 0,022 → 0,010 |
+| Quad sphere | 51% → 98,6% | 0,21 → 0,18 | 0,020 → 0,009 |
+| UV sphere | 48% → 98,7% | 0,22 → 0,18 | 0,025 → 0,010 |
+| Cube | 99,9% → 99,9% | 0,11 → 0,06 | 0,012 → 0,017 |
+| Dua bola tumpang tindih | 52% → 99,1% | 0,22 → 0,17 | 0,022 → 0,012 |
 
-Volume berubah kurang dari 1% dibanding hasil voxel. Sudut tajam (misalnya rusuk kubus) tetap sedikit membulat seperti pada voxel remesh; penjagaan fitur tajam belum ada.
+Volume berubah kurang dari 1% dibanding hasil voxel. Rusuk kubus lebih bulat daripada voxel remesh biasa karena layout dibangun di 2× edge; penjagaan fitur tajam belum ada.
