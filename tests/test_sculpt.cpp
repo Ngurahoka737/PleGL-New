@@ -234,7 +234,7 @@ TEST_CASE("undo stack drops the oldest entries over budget") {
   for (int i = 0; i < 5; ++i) {
     SculptUndo e;
     e.label = std::to_string(i);
-    e.before.push_back({0, std::vector<Vec3>(20), {}});  // 240 bytes
+    e.before.push_back({0, std::vector<Vec3>(20), {}, {}});  // 240 bytes
     stack.push(std::move(e));
   }
   CHECK(stack.bytes() <= 1000);

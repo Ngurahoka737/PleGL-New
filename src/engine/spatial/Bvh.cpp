@@ -188,6 +188,9 @@ bool Bvh::closestPoint(const Mesh& mesh, const Vec3& p, float maxDist, ClosestHi
             out.position = q;
             out.face = f;
             out.distSq = d;
+            out.corners[0] = mesh.heVert[h0];
+            out.corners[1] = mesh.heVert[h];
+            out.corners[2] = mesh.heVert[hn];
             const Vec3 n = glm::cross(b - a, c - a);
             const float len = glm::length(n);
             out.faceNormal = len > 0.0f ? n / len : Vec3{0.0f};

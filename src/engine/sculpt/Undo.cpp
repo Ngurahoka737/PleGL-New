@@ -7,13 +7,14 @@ namespace plegl {
 std::size_t SculptUndo::bytes() const {
   std::size_t n = 0;
   for (const auto* list : {&before, &after})
-    for (const LeafState& s : *list) n += (s.positions.size() + s.normals.size()) * sizeof(Vec3);
+    for (const LeafState& s : *list)
+      n += (s.positions.size() + s.normals.size()) * sizeof(Vec3) + s.mask.size() * sizeof(float);
   return n;
 }
 
 std::size_t MeshState::bytes() const {
   const Mesh& m = mesh;
-  return (m.positions.size() + m.normals.size()) * sizeof(Vec3) +
+  return (m.positions.size() + m.normals.size()) * sizeof(Vec3) + m.mask.size() * sizeof(float) +
          (m.heNext.size() + m.heTwin.size() + m.heVert.size() + m.heFace.size() + m.vertHe.size() +
           m.faceHe.size()) * sizeof(Index) +
          bvh.memoryBytes();
@@ -57,15 +58,25 @@ bool UndoStack::apply(Scene& scene, const SculptUndo& entry, const std::vector<L
   Mesh& m = obj->mesh;
   std::vector<Index> leaves;
   leaves.reserve(states.size());
+  std::size_t maskLeaves = 0;
+  for (const LeafState& s : states) maskLeaves += s.mask.empty() ? 0 : 1;
+  // A mask operation can touch every leaf; one full mask upload is cheaper than many small ones.
+  const bool maskAll = maskLeaves > kMaskDirtyAllLeaves;
+  if (maskLeaves > 0) m.ensureMask();  // The mask may have been dropped by a redone remesh.
   for (const LeafState& s : states) {
     const BvhLeaf& leaf = obj->bvh.leaves()[s.leaf];
     std::copy(s.positions.begin(), s.positions.end(), m.positions.begin() + leaf.vertBegin);
     std::copy(s.normals.begin(), s.normals.end(), m.normals.begin() + leaf.vertBegin);
-    obj->markLeafDirty(s.leaf);
-    leaves.push_back(s.leaf);
+    std::copy(s.mask.begin(), s.mask.end(), m.mask.begin() + leaf.vertBegin);
+    if (!s.positions.empty()) {
+      obj->markLeafDirty(s.leaf);
+      leaves.push_back(s.leaf);
+    }
+    if (!s.mask.empty() && !maskAll) obj->markMaskDirty(s.leaf);
   }
+  if (maskAll) obj->markMaskDirtyAll();
   // Every leaf whose faces moved has its own snapshot, so refitting these is enough.
-  obj->bvh.refitLeaves(m, leaves);
+  if (!leaves.empty()) obj->bvh.refitLeaves(m, leaves);
   return true;
 }
 
@@ -75,7 +86,7 @@ bool UndoStack::apply(Scene& scene, const TopologyUndo& entry, const MeshState& 
   obj->mesh = to.mesh;
   obj->bvh = to.bvh;
   obj->topologyVersion = to.topologyVersion;
-  obj->dirtyLeaves.clear();
+  obj->clearDirty();
   return true;
 }
 

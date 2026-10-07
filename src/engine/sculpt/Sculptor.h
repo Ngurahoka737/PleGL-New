@@ -27,7 +27,8 @@ struct DabTiming {
 
 // Runs strokes on one scene object. For every dab it queries the BVH, snapshots the touched
 // leaves for undo, runs the brush, recomputes normals around the moved vertices, refits the BVH
-// and marks GPU ranges dirty. Brushes only move positions.
+// and marks GPU ranges dirty. Brushes only move positions. Mask brushes take a shorter path: the
+// sculptor allocates the mask, snapshots only mask values and skips normals and refitting.
 class Sculptor {
  public:
   void beginStroke(SceneObject& object, const Brush& brush, const StrokeOptions& options, std::string label);
@@ -46,7 +47,8 @@ class Sculptor {
   // Moves the captured vertices to their start position plus `offset` (local space).
   void grab(const Vec3& offset);
 
-  // Ends the stroke. Returns the undo entry, or nothing if the stroke changed nothing.
+  // Ends the stroke. Returns the undo entry, or nothing if the stroke changed nothing. Mask
+  // strokes keep only the leaves whose mask actually changed.
   std::optional<SculptUndo> endStroke();
 
   const DabTiming& lastDab() const { return lastDab_; }
@@ -61,6 +63,7 @@ class Sculptor {
 
   SceneObject* object_ = nullptr;
   const Brush* brush_ = nullptr;
+  bool maskStroke_ = false;
   StrokeOptions options_;
   SculptUndo undo_;
   std::unordered_map<Index, std::size_t> snapshotIndex_;  // leaf -> index in undo_.before

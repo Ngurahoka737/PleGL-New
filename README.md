@@ -2,7 +2,7 @@
 
 Software digital sculpting 3D untuk desktop yang fokus pada satu hal: sculpting yang cepat, stabil, dan mudah dipelajari.
 
-Status: **Phase 5 (Project file)**. Tujuh brush (Draw, Clay, Smooth, Grab, Inflate, Flatten, Crease), empat jenis falloff, tekanan pen, undo/redo, simetri X, dan quad remesh (voxel remesh lalu optimasi valence 4 sampai sekitar 99%, relaksasi, dan proyeksi ke permukaan asli) sudah jalan di atas engine Phase 0 (mesh, BVH, renderer, import/export OBJ). Project bisa disimpan dan dibuka sebagai `.psculpt`, dengan autosave tiap 5 menit dan pemulihan setelah crash.
+Status: **Phase 6 (Masking)**. Tujuh brush (Draw, Clay, Smooth, Grab, Inflate, Flatten, Crease), empat jenis falloff, tekanan pen, undo/redo, simetri X, dan quad remesh (voxel remesh lalu optimasi valence 4 sampai sekitar 99%, relaksasi, dan proyeksi ke permukaan asli) sudah jalan di atas engine Phase 0 (mesh, BVH, renderer, import/export OBJ). Project bisa disimpan dan dibuka sebagai `.psculpt`, dengan autosave tiap 5 menit dan pemulihan setelah crash. Mask melindungi area dari semua brush, bisa dicat, dibalik, dihapus, diperhalus, dan dipertajam, lalu ikut tersimpan di project dan ikut pindah saat remesh.
 
 ## Stack
 
@@ -68,13 +68,17 @@ cmake --build --preset engine-only
 | Balik arah brush (Add/Subtract) | Ctrl + drag kiri |
 | Pilih brush Draw / Clay / Smooth / Grab | D / C / S / G |
 | Pilih brush Inflate / Flatten / Crease | I / T / Shift + C |
+| Brush Mask | M (drag untuk mengecat, Ctrl + drag atau ujung penghapus pen untuk menghapus, Shift + drag untuk menghaluskan mask) |
+| Invert mask | Ctrl + I (di Sculpt mode) |
+| Hapus semua mask / mask semua | Alt + M / Alt + Shift + M (di kedua mode) |
+| Blur / Sharpen mask | Alt + B / Alt + Shift + B (di kedua mode) |
 | Radius brush | [ dan ], atau tahan F lalu geser mouse ke samping |
 | Simetri X on/off | X (di Sculpt mode) |
 | Remesh objek terpilih | Ctrl + R |
 | Undo / Redo | Ctrl + Z / Ctrl + Shift + Z atau Ctrl + Y |
 | Project baru / buka / simpan / simpan sebagai | Ctrl + N / Ctrl + O / Ctrl + S / Ctrl + Shift + S |
-| Import / Export OBJ | Ctrl + I / Ctrl + E |
-| Uji update GPU parsial | B (menonjolkan permukaan di bawah cursor) |
+| Import / Export OBJ | Ctrl + Shift + I (Ctrl + I di Object mode) / Ctrl + E |
+| Uji update GPU parsial | B di Object mode (menonjolkan permukaan di bawah cursor) |
 
 File project (`.psculpt`) dan OBJ juga bisa dibuka dengan menaruhnya sebagai argumen (`PleGLSculpt kepala.psculpt`) atau dengan drag-and-drop ke jendela.
 
@@ -87,7 +91,7 @@ src/engine/   Library engine tanpa UI (diuji headless)
   spatial/    BVH (node daun = unit kerja engine), raycast, query bola, titik terdekat
   io/         Import dan export OBJ, project file .psculpt
   scene/      Objek, transform, picking
-  sculpt/     Brush, stroke sampler, sculptor (dab, simetri), undo per daun BVH
+  sculpt/     Brush, stroke sampler, sculptor (dab, simetri), operasi mask, undo per daun BVH
   remesh/     Grid voxel (SDF), Surface Nets quad, voxel remesh, quad remesh
 src/app/      Aplikasi: SDL3, renderer OpenGL, kamera, UI
 tests/        Unit test (doctest)
