@@ -148,9 +148,23 @@ void DyntopoSession::Observer::beforeWrite(ElementKind kind, Index index) {
   if (kind == ElementKind::Face) {
     session->markFace(index);
   } else if (kind == ElementKind::HalfEdge) {
+    // The face's triangles change, and so does the edge list of the leaf holding the half-edge,
+    // which after earlier splits is not always the leaf of its face.
     const Index f = session->m_.heFace[index];
     if (f != kInvalid) session->markFace(f);
+    session->markHalfEdge(index);
   }
+}
+
+void DyntopoSession::markHalfEdge(Index h) {
+  if (heLeaf_ != kInvalid) {
+    const BvhLeaf& cached = bvh_.leaves()[heLeaf_];
+    if (h >= cached.heBegin && h < cached.heEnd) return;
+  }
+  const Index l = bvh_.leafOfHalfEdge(h);
+  if (l == kInvalid) return;
+  heLeaf_ = l;
+  pass_.topoDirtyLeaves.push_back(l);
 }
 
 void DyntopoSession::markFace(Index f) {
@@ -213,7 +227,7 @@ const DyntopoPass& DyntopoSession::pass(const Vec3& center, float radius, const 
   if (faulted_ || topo.detail <= 0.0f || radius <= 0.0f) return pass_;
   passTimer_.reset();
   opsSinceCheck_ = 0;
-  faceLeaf_ = kInvalid;
+  faceLeaf_ = heLeaf_ = kInvalid;
   leavesBefore_ = bvh_.leaves().size();
   openTailBefore_ = leavesBefore_ > static_cast<std::size_t>(bvh_.firstTailLeaf()) ? bvh_.leaves().back() : BvhLeaf{};
 

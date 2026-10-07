@@ -35,6 +35,7 @@ add_library(plegl_engine STATIC
   src/engine/io/Project.cpp
   src/engine/spatial/Bvh.cpp
   src/engine/spatial/LeafLayout.cpp
+  src/engine/render/LeafIndexBlocks.cpp
   src/engine/scene/Scene.cpp
   src/engine/sculpt/Brush.cpp
   src/engine/sculpt/Dyntopo.cpp
@@ -84,6 +85,7 @@ if(PLEGL_BUILD_TESTS)
     tests/test_bvh.cpp
     tests/test_leaflayout.cpp
     tests/test_dyntopo.cpp
+    tests/test_render_blocks.cpp
     tests/test_scene.cpp
     tests/test_sculpt.cpp
     tests/test_remesh.cpp

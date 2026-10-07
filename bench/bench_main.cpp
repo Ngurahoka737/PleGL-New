@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <algorithm>
 #include <cstring>
+#include <memory>
 #include <random>
 #include <vector>
 
@@ -144,17 +145,29 @@ int main(int argc, char** argv) {
   }
   // Dynamic topology strokes with the app's default per-pass budget (3 ms). The detail size is a
   // twelfth of the radius, so every dab refines. "dab" includes the topology pass; "end" is the
-  // compaction in endStroke().
+  // compaction in endStroke(), with a warm workspace as in the app (it keeps one for the session).
   std::printf("\nDyntopo stroke benchmark (ms per dab, Draw, 200 dabs, detail = radius / 12)\n\n");
   std::printf("%10s %8s %10s %10s %10s %10s %10s %10s %8s %8s %8s\n", "vertices", "radius", "out verts", "avg",
               "p95", "max", "topo avg", "splits", "collapse", "end", "undo MB");
   for (int res : strokeRes) {
+    const auto workspace = std::make_shared<LayoutWorkspace>();
+    {
+      Scene warm;
+      SceneObject& obj = warm.add("Warm", makeQuadSphere(res));
+      DrawBrush draw;
+      Sculptor sculptor;
+      sculptor.setLayoutWorkspace(workspace);
+      sculptor.beginStroke(obj, draw, {.strength = 0.5f, .dyntopo = true}, "Draw");
+      sculptor.dab({0.0f, 0.0f, 1.0f}, 0.1f, 0.5f, DabTopology{0.001f, kInvalid});
+      sculptor.endStroke();
+    }
     for (float radius : {0.05f, 0.15f, 0.4f}) {
       Scene scene;
       SceneObject& obj = scene.add("Sphere", makeQuadSphere(res));
       const Index vertsBefore = obj.mesh.vertexCount();
       DrawBrush draw;
       Sculptor sculptor;
+      sculptor.setLayoutWorkspace(workspace);
       sculptor.beginStroke(obj, draw, {.strength = 0.5f, .dyntopo = true}, "Draw");
       std::vector<double> times;
       double topo = 0.0;

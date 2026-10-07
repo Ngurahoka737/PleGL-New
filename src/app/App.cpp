@@ -105,6 +105,10 @@ bool App::init(std::string* error) {
   ImGui_ImplOpenGL3_Init("#version 450");
 
   if (!renderer_.init(error)) return false;
+  // Dynamic topology strokes and their undo share one scratch mesh, so neither reallocates it.
+  const auto workspace = std::make_shared<LayoutWorkspace>();
+  sculptor_.setLayoutWorkspace(workspace);
+  undoStack.setLayoutWorkspace(workspace);
   rendererReady_ = true;
 
   initRecovery();
@@ -157,7 +161,7 @@ void App::run() {
     drawUi();  // Also lays out the viewport rectangle.
     drawGizmo();
     updateHover();
-    renderer_.sync(scene);
+    renderer_.sync(scene, view.wireframe);
     ImGui::Render();
 
     int fbw = 0, fbh = 0;
@@ -229,6 +233,18 @@ void App::handleEvent(const SDL_Event& e) {
         sculpt.radiusPx = std::clamp(sculpt.radiusPx * std::exp(dx * 0.01f), 2.0f, 1000.0f);
         break;
       }
+      if (adjustingDetail_) {
+        if (sculpt.detailMode == DetailMode::Relative) {
+          sculpt.detailPx = std::clamp(sculpt.detailPx * std::exp(dx * 0.01f), 2.0f, 64.0f);
+          statusMessage = "Detail " + std::to_string(static_cast<int>(std::lround(sculpt.detailPx))) + " px";
+        } else {
+          sculpt.detailSize = std::clamp(sculpt.detailSize * std::exp(dx * 0.01f), 1e-5f, 10.0f);
+          char text[48];
+          std::snprintf(text, sizeof(text), "Detail %.4g units", sculpt.detailSize);
+          statusMessage = text;
+        }
+        break;
+      }
       if (sculptor_.active()) {
         continueStroke(mouseX_, mouseY_, e.motion.timestamp);
         break;
@@ -280,6 +296,7 @@ void App::handleEvent(const SDL_Event& e) {
       break;
     case SDL_EVENT_KEY_UP:
       if (e.key.key == SDLK_F) adjustingRadius_ = false;
+      if (e.key.key == SDLK_R) adjustingDetail_ = false;
       break;
 
     // Pen tablets. SDL also turns pen input into mouse events, so navigation works with a pen;
@@ -328,6 +345,10 @@ void App::handleShortcut(const SDL_KeyboardEvent& key) {
     if (key.key == SDLK_E) requestExport();
     if (key.key == SDLK_N) requestNewScene();
     if (key.key == SDLK_R) requestRemesh();
+    if (key.key == SDLK_D && mode == Mode::Sculpt) {
+      sculpt.dyntopo = !sculpt.dyntopo;
+      statusMessage = sculpt.dyntopo ? "Dynamic topology on" : "Dynamic topology off";
+    }
     return;
   }
   switch (key.key) {
@@ -363,6 +384,7 @@ void App::handleShortcut(const SDL_KeyboardEvent& key) {
       case SDLK_I: sculpt.brush = BrushKind::Inflate; break;
       case SDLK_T: sculpt.brush = BrushKind::Flatten; break;
       case SDLK_F: adjustingRadius_ = true; break;  // Move the mouse sideways while holding F.
+      case SDLK_R: adjustingDetail_ = true; break;  // The same for the dynamic topology detail.
       case SDLK_LEFTBRACKET: sculpt.radiusPx = std::max(2.0f, sculpt.radiusPx / 1.15f); break;
       case SDLK_RIGHTBRACKET: sculpt.radiusPx = std::min(1000.0f, sculpt.radiusPx * 1.15f); break;
       case SDLK_X: sculpt.symmetryX = !sculpt.symmetryX; break;
@@ -437,6 +459,7 @@ void App::addPrimitive(const std::string& name, Mesh mesh) {
 }
 
 void App::newScene() {
+  if (sculptor_.active()) endStroke();  // Never act on a mesh in the middle of a stroke.
   scene.clear();
   undoStack.clear();
   selectedId = 0;
@@ -447,6 +470,7 @@ void App::newScene() {
 }
 
 void App::deleteSelected() {
+  if (sculptor_.active()) endStroke();  // Never act on a mesh in the middle of a stroke.
   if (selectedId && scene.remove(selectedId)) {
     statusMessage = "Deleted object";
     selectedId = 0;
@@ -455,6 +479,7 @@ void App::deleteSelected() {
 }
 
 void App::duplicateSelected() {
+  if (sculptor_.active()) endStroke();  // Never act on a mesh in the middle of a stroke.
   if (SceneObject* copy = scene.duplicate(selectedId)) {
     selectedId = copy->id;
     statusMessage = "Duplicated as " + copy->name;
@@ -536,6 +561,8 @@ void App::beginStroke(float x, float y, std::uint64_t timestampNs) {
   opts.strength = sculpt.strength[static_cast<int>(strokeBrush_)];
   // The Mask brush ignores Add/Subtract: it paints, and erases with Ctrl or the pen's eraser end.
   opts.invert = masking ? ctrl || (pen.down && pen.eraser) : sculpt.invert != ctrl;
+  opts.dyntopo = sculpt.dyntopo;  // The sculptor ignores it for Grab and Mask.
+  opts.dyntopoOptions.refine = sculpt.dyntopoRefine;
   if (strokeBrush_ == BrushKind::Grab) {
     // Grab captures once at the press; pressure only scales the radius here.
     const float p = currentPressure();
@@ -604,9 +631,15 @@ void App::applySamples(std::uint64_t timestampNs) {
     const float px = sculpt.radiusPx * (mapRadius ? std::max(p, 0.1f) : 1.0f);
     const float radius = camera.worldPerPixel(worldHit) * px / std::max(scale, 1e-6f);
     const float strength = baseStrength * (mapStrength ? p : 1.0f);
-    if (sculptor_.dab(hit.position, radius, strength)) {
+    DabTopology topology;
+    if (sculpt.dyntopo) {
+      topology.detail = detailSizeAt(*obj, worldHit);
+      topology.hintFace = hit.face;
+    }
+    if (sculptor_.dab(hit.position, radius, strength, topology)) {
       ++dabsThisFrame_;
       stats.dabMs = sculptor_.lastDab().totalMs;
+      stats.topologyMs = sculptor_.lastDab().topologyMs;
     }
   }
   if (timestampNs != 0) {
@@ -617,13 +650,31 @@ void App::applySamples(std::uint64_t timestampNs) {
 }
 
 void App::endStroke() {
-  if (auto entry = sculptor_.endStroke()) {
+  auto entry = sculptor_.endStroke();
+  const StrokeTopologyStats& topo = sculptor_.lastStrokeTopology();
+  if (entry) {
     ++editCounter_;
     const int dabs = sculptor_.dabCount();
     const std::string label = std::visit([](const auto& e) { return e.label; }, *entry);
     statusMessage = label + " stroke, " + std::to_string(dabs) + (strokeBrush_ == BrushKind::Grab ? " moves" : " dabs");
+    if (topo.dyntopo) {
+      const long long diff = static_cast<long long>(topo.facesAfter) - topo.facesBefore;
+      statusMessage += ", " + std::string(diff >= 0 ? "+" : "") + std::to_string(diff) + " faces";
+    }
     undoStack.push(std::move(*entry));
+  } else if (topo.lostUndo) {
+    // The mesh is fine, but the stroke could not be recorded; older history no longer applies.
+    ++editCounter_;
+    statusMessage = "Stroke could not be recorded for undo; earlier history was cut";
   }
+  if (topo.outOfRoom) statusMessage += " (dynamic topology stopped: stroke too large)";
+  if (topo.faulted) statusMessage += " (dynamic topology stopped on a damaged area)";
+}
+
+float App::detailSizeAt(const SceneObject& obj, const Vec3& worldPoint) const {
+  if (sculpt.detailMode == DetailMode::Constant) return sculpt.detailSize;
+  const float scale = (obj.transform.scale.x + obj.transform.scale.y + obj.transform.scale.z) / 3.0f;
+  return camera.worldPerPixel(worldPoint) * sculpt.detailPx / std::max(scale, 1e-6f);
 }
 
 const Brush* App::brushFor(BrushKind kind) const {
@@ -845,6 +896,7 @@ void App::importFile(const std::filesystem::path& path) {
 }
 
 void App::exportFile(const std::filesystem::path& requested) {
+  if (sculptor_.active()) endStroke();  // A dynamic topology stroke leaves holes until it ends.
   const SceneObject* obj = scene.find(selectedId);
   if (!obj) return;
   std::filesystem::path path = requested;

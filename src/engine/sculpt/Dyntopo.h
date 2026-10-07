@@ -34,7 +34,7 @@ struct DyntopoPass {
   int edits = 0;                       // Every topology edit, quad triangulations included.
   std::vector<Index> changedVerts;     // Live vertices whose normal may have changed (sorted).
   std::vector<Index> refitLeaves;      // Leaves whose bounds may have changed (sorted).
-  std::vector<Index> topoDirtyLeaves;  // Leaves whose faces changed, for GPU index data (sorted).
+  std::vector<Index> topoDirtyLeaves;  // Leaves whose triangles or edges changed, for GPU index data (sorted).
   bool changed() const { return edits > 0; }
 };
 
@@ -97,6 +97,7 @@ class DyntopoSession {
   bool frozen(Index f, int& size) const;
   bool pickDiagonal(Index f, Index& ha, Index& hb) const;
   void markFace(Index f);
+  void markHalfEdge(Index h);
   void gather(const Vec3& c, float r, float lmax2, float lmin2, Index hintFace);
   void splitAll(const Vec3& c, float r, float lmax2);
   bool collapseOne(const Edge& e, float lmax2, float lmin2);
@@ -127,6 +128,7 @@ class DyntopoSession {
   std::vector<Edge> splits_, collapses_;
   std::vector<Index> ring_;
   Index faceLeaf_ = kInvalid;  // Leaf of the last face marked, which is already in topoDirtyLeaves.
+  Index heLeaf_ = kInvalid;    // The same for half-edges.
   std::size_t leavesBefore_ = 0;
   BvhLeaf openTailBefore_;
   Timer passTimer_;

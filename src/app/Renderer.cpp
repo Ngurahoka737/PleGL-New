@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <unordered_set>
 
 #include <glm/gtc/type_ptr.hpp>
@@ -251,54 +252,54 @@ void Renderer::shutdown() {
 }
 
 void Renderer::destroy(GpuMesh& gpu) {
-  const GLuint buffers[] = {gpu.positions, gpu.normals, gpu.mask, gpu.triangles, gpu.edges};
+  const GLuint buffers[] = {gpu.positions, gpu.normals, gpu.mask, gpu.triangles.buffer, gpu.edges.buffer};
   glDeleteBuffers(5, buffers);
   glDeleteVertexArrays(1, &gpu.vao);
   gpu = {};
 }
 
-void Renderer::upload(GpuMesh& gpu, const SceneObject& object) {
+namespace {
+
+// A new buffer of `newBytes` holding the first `keepBytes` of the old one, copied on the GPU.
+GLuint regrow(GLuint old, std::size_t keepBytes, std::size_t newBytes) {
+  GLuint fresh = 0;
+  glCreateBuffers(1, &fresh);
+  glNamedBufferStorage(fresh, static_cast<GLsizeiptr>(newBytes), nullptr, GL_DYNAMIC_STORAGE_BIT);
+  if (old != 0 && keepBytes > 0) glCopyNamedBufferSubData(old, fresh, 0, 0, static_cast<GLsizeiptr>(keepBytes));
+  glDeleteBuffers(1, &old);
+  return fresh;
+}
+
+// Room for the vertices a dynamic topology stroke appends, so most strokes never regrow.
+std::uint32_t vertexRoom(std::size_t vertices) {
+  return static_cast<std::uint32_t>(vertices + std::max<std::size_t>(65536, vertices / 4));
+}
+
+}  // namespace
+
+void Renderer::upload(GpuMesh& gpu, const SceneObject& object, bool wireframe) {
   destroy(gpu);
   const Mesh& m = object.mesh;
-
-  // Fan-triangulate faces in order, so each leaf's triangles stay contiguous.
-  std::vector<std::uint32_t> tris;
-  tris.reserve(static_cast<std::size_t>(m.halfEdgeCount()) * 3);
-  for (Index f = 0; f < m.faceCount(); ++f) {
-    const Index h0 = m.faceHe[f];
-    const auto a = static_cast<std::uint32_t>(m.heVert[h0]);
-    for (Index h = m.heNext[h0]; m.heNext[h] != h0; h = m.heNext[h]) {
-      tris.push_back(a);
-      tris.push_back(static_cast<std::uint32_t>(m.heVert[h]));
-      tris.push_back(static_cast<std::uint32_t>(m.heTarget(h)));
-    }
-  }
-  // Real polygon edges, so quads draw as quads in the wireframe.
-  std::vector<std::uint32_t> edges;
-  edges.reserve(static_cast<std::size_t>(m.halfEdgeCount()));
-  for (Index h = 0; h < m.halfEdgeCount(); ++h) {
-    if (m.heTwin[h] == kInvalid || h < m.heTwin[h]) {
-      edges.push_back(static_cast<std::uint32_t>(m.heVert[h]));
-      edges.push_back(static_cast<std::uint32_t>(m.heTarget(h)));
-    }
-  }
-
-  const auto vbytes = static_cast<GLsizeiptr>(m.positions.size() * sizeof(Vec3));
+  const std::size_t nv = m.positions.size();
+  gpu.vertexCapacity = vertexRoom(nv);
+  const std::size_t vbytes = nv * sizeof(Vec3);
+  const std::size_t vcap = static_cast<std::size_t>(gpu.vertexCapacity) * sizeof(Vec3);
   glCreateBuffers(1, &gpu.positions);
-  glNamedBufferStorage(gpu.positions, vbytes, m.positions.data(), GL_DYNAMIC_STORAGE_BIT);
+  glNamedBufferStorage(gpu.positions, static_cast<GLsizeiptr>(vcap), nullptr, GL_DYNAMIC_STORAGE_BIT);
   glCreateBuffers(1, &gpu.normals);
-  glNamedBufferStorage(gpu.normals, vbytes, m.normals.data(), GL_DYNAMIC_STORAGE_BIT);
+  glNamedBufferStorage(gpu.normals, static_cast<GLsizeiptr>(vcap), nullptr, GL_DYNAMIC_STORAGE_BIT);
+  if (vbytes > 0) {
+    glNamedBufferSubData(gpu.positions, 0, static_cast<GLsizeiptr>(vbytes), m.positions.data());
+    glNamedBufferSubData(gpu.normals, 0, static_cast<GLsizeiptr>(vbytes), m.normals.data());
+  }
   // One float per vertex; an unmasked mesh gets a zero-filled buffer so the shader can always read it.
   const bool hasMask = !m.mask.empty();
   glCreateBuffers(1, &gpu.mask);
-  glNamedBufferStorage(gpu.mask, static_cast<GLsizeiptr>(std::max<std::size_t>(m.positions.size(), 1) * sizeof(float)),
-                       hasMask ? m.mask.data() : nullptr, GL_DYNAMIC_STORAGE_BIT);
-  if (!hasMask) glClearNamedBufferData(gpu.mask, GL_R32F, GL_RED, GL_FLOAT, nullptr);
+  glNamedBufferStorage(gpu.mask, static_cast<GLsizeiptr>(gpu.vertexCapacity * sizeof(float)), nullptr,
+                       GL_DYNAMIC_STORAGE_BIT);
+  glClearNamedBufferData(gpu.mask, GL_R32F, GL_RED, GL_FLOAT, nullptr);
+  if (hasMask) glNamedBufferSubData(gpu.mask, 0, static_cast<GLsizeiptr>(nv * sizeof(float)), m.mask.data());
   gpu.maskOnGpu = hasMask;
-  glCreateBuffers(1, &gpu.triangles);
-  glNamedBufferStorage(gpu.triangles, static_cast<GLsizeiptr>(tris.size() * 4), tris.data(), 0);
-  glCreateBuffers(1, &gpu.edges);
-  glNamedBufferStorage(gpu.edges, static_cast<GLsizeiptr>(edges.size() * 4), edges.data(), 0);
 
   glCreateVertexArrays(1, &gpu.vao);
   glVertexArrayVertexBuffer(gpu.vao, 0, gpu.positions, 0, sizeof(Vec3));
@@ -313,14 +314,74 @@ void Renderer::upload(GpuMesh& gpu, const SceneObject& object) {
   glEnableVertexArrayAttrib(gpu.vao, 3);
   glVertexArrayAttribFormat(gpu.vao, 3, 1, GL_FLOAT, GL_FALSE, 0);
   glVertexArrayAttribBinding(gpu.vao, 3, 2);
-  glVertexArrayElementBuffer(gpu.vao, gpu.triangles);
 
-  gpu.triangleIndexCount = static_cast<GLsizei>(tris.size());
-  gpu.edgeIndexCount = static_cast<GLsizei>(edges.size());
+  // Indices per BVH leaf, back to back, so a dynamic topology stroke can rewrite single leaves.
+  uploadIndices(gpu.triangles, LeafIndexKind::Triangles, object);
+  glVertexArrayElementBuffer(gpu.vao, gpu.triangles.buffer);
+  gpu.edgesValid = wireframe;
+  if (wireframe) uploadIndices(gpu.edges, LeafIndexKind::Edges, object);
+
   gpu.topologyVersion = object.topologyVersion;
-  stats_.uploadedBytes += static_cast<std::size_t>(vbytes) * 2 + m.mask.size() * sizeof(float) + tris.size() * 4 +
-                         edges.size() * 4;
+  stats_.uploadedBytes += vbytes * 2 + m.mask.size() * sizeof(float);
   ++stats_.fullUploads;
+}
+
+void Renderer::uploadIndices(IndexBuffer& ib, LeafIndexKind kind, const SceneObject& object) {
+  glDeleteBuffers(1, &ib.buffer);
+  const std::vector<std::uint32_t> indices = buildLeafIndices(kind, object.mesh, object.bvh, ib.blocks);
+  // Some slack for the blocks a stroke moves or appends; running out grows the buffer on the GPU.
+  ib.capacity = static_cast<std::uint32_t>(indices.size() + indices.size() / 8 + 4096);
+  glCreateBuffers(1, &ib.buffer);
+  glNamedBufferStorage(ib.buffer, static_cast<GLsizeiptr>(ib.capacity) * 4, nullptr, GL_DYNAMIC_STORAGE_BIT);
+  if (!indices.empty())
+    glNamedBufferSubData(ib.buffer, 0, static_cast<GLsizeiptr>(indices.size() * 4), indices.data());
+  ib.runsStale = true;
+  stats_.uploadedBytes += indices.size() * 4;
+}
+
+void Renderer::ensureVertexCapacity(GpuMesh& gpu, std::uint32_t vertices) {
+  if (vertices <= gpu.vertexCapacity) return;
+  const std::uint32_t cap = std::max(vertices, gpu.vertexCapacity + gpu.vertexCapacity / 2);
+  const std::size_t oldCap = gpu.vertexCapacity;
+  gpu.positions = regrow(gpu.positions, oldCap * sizeof(Vec3), cap * sizeof(Vec3));
+  gpu.normals = regrow(gpu.normals, oldCap * sizeof(Vec3), cap * sizeof(Vec3));
+  gpu.mask = regrow(gpu.mask, oldCap * sizeof(float), cap * sizeof(float));
+  // The copy keeps the old values; the new tail of the mask must read as unmasked.
+  glClearNamedBufferSubData(gpu.mask, GL_R32F, static_cast<GLintptr>(oldCap * sizeof(float)),
+                            static_cast<GLsizeiptr>((cap - oldCap) * sizeof(float)), GL_RED, GL_FLOAT, nullptr);
+  glVertexArrayVertexBuffer(gpu.vao, 0, gpu.positions, 0, sizeof(Vec3));
+  glVertexArrayVertexBuffer(gpu.vao, 1, gpu.normals, 0, sizeof(Vec3));
+  glVertexArrayVertexBuffer(gpu.vao, 2, gpu.mask, 0, sizeof(float));
+  gpu.vertexCapacity = cap;
+  ++stats_.bufferGrowths;
+}
+
+void Renderer::growIndexBuffer(GpuMesh& gpu, IndexBuffer& ib, std::uint32_t indices) {
+  if (indices <= ib.capacity) return;
+  const std::uint32_t cap = std::max(indices, ib.capacity + ib.capacity / 2);
+  ib.buffer = regrow(ib.buffer, static_cast<std::size_t>(ib.capacity) * 4, static_cast<std::size_t>(cap) * 4);
+  ib.capacity = cap;
+  if (&ib == &gpu.triangles) glVertexArrayElementBuffer(gpu.vao, ib.buffer);
+  ++stats_.bufferGrowths;
+}
+
+void Renderer::syncLeaves(GpuMesh& gpu, IndexBuffer& ib, LeafIndexKind kind, const SceneObject& object,
+                          std::span<const Index> leaves) {
+  const auto all = object.bvh.leaves();
+  for (Index l : leaves) {
+    if (l < 0 || static_cast<std::size_t>(l) >= all.size()) continue;
+    scratch_.clear();
+    appendLeafIndices(kind, object.mesh, all[l], scratch_);
+    ib.blocks.place(l, static_cast<std::uint32_t>(scratch_.size()));
+    growIndexBuffer(gpu, ib, ib.blocks.size());
+    if (!scratch_.empty()) {
+      const auto bytes = static_cast<GLsizeiptr>(scratch_.size() * 4);
+      glNamedBufferSubData(ib.buffer, static_cast<GLintptr>(ib.blocks.block(l).first) * 4, bytes, scratch_.data());
+      stats_.uploadedBytes += static_cast<std::size_t>(bytes);
+    }
+    ++stats_.indexBlockUploads;
+  }
+  ib.runsStale = true;
 }
 
 void Renderer::syncMask(GpuMesh& gpu, SceneObject& obj) {
@@ -354,17 +415,55 @@ void Renderer::syncMask(GpuMesh& gpu, SceneObject& obj) {
   obj.maskDirtyAll = false;
 }
 
-void Renderer::sync(Scene& scene) {
+void Renderer::sync(Scene& scene, bool wireframe) {
   stats_ = {};
   std::unordered_set<std::uint32_t> alive;
   for (const auto& objPtr : scene.objects()) {
     SceneObject& obj = *objPtr;
     alive.insert(obj.id);
     GpuMesh& gpu = meshes_[obj.id];
-    if (gpu.topologyVersion != obj.topologyVersion) {
-      upload(gpu, obj);
+    if (gpu.vao == 0 || gpu.topologyVersion != obj.topologyVersion) {
+      upload(gpu, obj, wireframe);
       obj.clearDirty();
       continue;
+    }
+    const Mesh& m = obj.mesh;
+    ensureVertexCapacity(gpu, static_cast<std::uint32_t>(m.positions.size()));
+    const std::size_t leafCount = obj.bvh.leaves().size();
+    if (gpu.triangles.blocks.leafCount() > leafCount) {  // Defensive: leaves only grow mid-stroke.
+      gpu.triangles.blocks.truncate(leafCount);
+      gpu.edges.blocks.truncate(leafCount);
+      gpu.triangles.runsStale = gpu.edges.runsStale = true;
+    }
+    if (!obj.topoDirtyLeaves.empty()) {
+      std::sort(obj.topoDirtyLeaves.begin(), obj.topoDirtyLeaves.end());
+      obj.topoDirtyLeaves.erase(std::unique(obj.topoDirtyLeaves.begin(), obj.topoDirtyLeaves.end()),
+                                obj.topoDirtyLeaves.end());
+      syncLeaves(gpu, gpu.triangles, LeafIndexKind::Triangles, obj, obj.topoDirtyLeaves);
+      if (gpu.edgesValid && wireframe) {
+        syncLeaves(gpu, gpu.edges, LeafIndexKind::Edges, obj, obj.topoDirtyLeaves);
+      } else {
+        gpu.edgesValid = false;  // Rebuilt in one go when the wireframe is turned on.
+      }
+      // New vertices carry interpolated mask values that no mask stroke announced.
+      if (!m.mask.empty()) {
+        const auto leaves = obj.bvh.leaves();
+        for (Index l : obj.topoDirtyLeaves) {
+          if (l < 0 || static_cast<std::size_t>(l) >= leaves.size()) continue;
+          const BvhLeaf& leaf = leaves[l];
+          const auto bytes = static_cast<GLsizeiptr>((leaf.vertEnd - leaf.vertBegin) * sizeof(float));
+          if (bytes == 0) continue;
+          glNamedBufferSubData(gpu.mask, static_cast<GLintptr>(leaf.vertBegin * sizeof(float)), bytes,
+                               &m.mask[leaf.vertBegin]);
+          stats_.uploadedBytes += static_cast<std::size_t>(bytes);
+        }
+        gpu.maskOnGpu = true;
+      }
+      obj.topoDirtyLeaves.clear();
+    }
+    if (wireframe && !gpu.edgesValid) {
+      uploadIndices(gpu.edges, LeafIndexKind::Edges, obj);
+      gpu.edgesValid = true;
     }
     syncMask(gpu, obj);
     if (obj.dirtyLeaves.empty()) continue;
@@ -372,12 +471,13 @@ void Renderer::sync(Scene& scene) {
     obj.dirtyLeaves.erase(std::unique(obj.dirtyLeaves.begin(), obj.dirtyLeaves.end()), obj.dirtyLeaves.end());
     const auto leaves = obj.bvh.leaves();
     for (Index l : obj.dirtyLeaves) {
+      if (l < 0 || static_cast<std::size_t>(l) >= leaves.size()) continue;
       const BvhLeaf& leaf = leaves[l];
       const auto offset = static_cast<GLintptr>(leaf.vertBegin * sizeof(Vec3));
       const auto bytes = static_cast<GLsizeiptr>((leaf.vertEnd - leaf.vertBegin) * sizeof(Vec3));
       if (bytes == 0) continue;
-      glNamedBufferSubData(gpu.positions, offset, bytes, &obj.mesh.positions[leaf.vertBegin]);
-      glNamedBufferSubData(gpu.normals, offset, bytes, &obj.mesh.normals[leaf.vertBegin]);
+      glNamedBufferSubData(gpu.positions, offset, bytes, &m.positions[leaf.vertBegin]);
+      glNamedBufferSubData(gpu.normals, offset, bytes, &m.normals[leaf.vertBegin]);
       stats_.uploadedBytes += static_cast<std::size_t>(bytes) * 2;
       ++stats_.partialUploads;
     }
@@ -390,6 +490,29 @@ void Renderer::sync(Scene& scene) {
     } else {
       ++it;
     }
+  }
+  // Draw lists for the blocks that changed.
+  for (auto& [id, gpu] : meshes_) {
+    for (IndexBuffer* ib : {&gpu.triangles, &gpu.edges}) {
+      if (!ib->runsStale) continue;
+      std::vector<std::uint32_t> first, count;
+      ib->blocks.runs(first, count);
+      ib->counts.assign(count.begin(), count.end());
+      ib->offsets.resize(first.size());
+      for (std::size_t i = 0; i < first.size(); ++i)
+        ib->offsets[i] = reinterpret_cast<const void*>(static_cast<std::uintptr_t>(first[i]) * 4);
+      ib->runsStale = false;
+    }
+    stats_.drawRuns += static_cast<int>(gpu.triangles.counts.size());
+  }
+}
+
+void Renderer::draw(const IndexBuffer& ib, GLenum mode) {
+  if (ib.counts.size() == 1) {
+    glDrawElements(mode, ib.counts[0], GL_UNSIGNED_INT, ib.offsets[0]);
+  } else if (!ib.counts.empty()) {
+    glMultiDrawElements(mode, ib.counts.data(), GL_UNSIGNED_INT, ib.offsets.data(),
+                        static_cast<GLsizei>(ib.counts.size()));
   }
 }
 
@@ -435,7 +558,7 @@ void Renderer::render(const Scene& scene, const Camera& camera, const ViewportRe
     glUniformMatrix3fv(loc(meshProgram_, "uNormalMat"), 1, GL_FALSE, glm::value_ptr(normalMat));
     glUniform1f(loc(meshProgram_, "uSelected"), obj->id == selectedId ? 1.0f : 0.0f);
     glBindVertexArray(it->second.vao);
-    glDrawElements(GL_TRIANGLES, it->second.triangleIndexCount, GL_UNSIGNED_INT, nullptr);
+    draw(it->second.triangles, GL_TRIANGLES);
   }
   glDisable(GL_POLYGON_OFFSET_FILL);
 
@@ -461,16 +584,16 @@ void Renderer::render(const Scene& scene, const Camera& camera, const ViewportRe
     if (!settings.wireframe || !obj->visible) continue;
     const bool selected = obj->id == selectedId;
     auto it = meshes_.find(obj->id);
-    if (it == meshes_.end()) continue;
+    if (it == meshes_.end() || !it->second.edgesValid) continue;
     const Mat4 mvp = proj * view * obj->transform.matrix();
     glUniformMatrix4fv(mvpLoc, 1, GL_FALSE, glm::value_ptr(mvp));
     const Vec4 color = selected ? Vec4{1.0f, 0.65f, 0.3f, settings.wireframeOpacity}
                                 : Vec4{0.05f, 0.05f, 0.06f, settings.wireframeOpacity};
     glUniform4fv(colorLoc, 1, glm::value_ptr(color));
     glBindVertexArray(it->second.vao);
-    glVertexArrayElementBuffer(it->second.vao, it->second.edges);
-    glDrawElements(GL_LINES, it->second.edgeIndexCount, GL_UNSIGNED_INT, nullptr);
-    glVertexArrayElementBuffer(it->second.vao, it->second.triangles);
+    glVertexArrayElementBuffer(it->second.vao, it->second.edges.buffer);
+    draw(it->second.edges, GL_LINES);
+    glVertexArrayElementBuffer(it->second.vao, it->second.triangles.buffer);
   }
 
   if (cursor.visible) {
