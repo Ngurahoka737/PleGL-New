@@ -63,6 +63,7 @@ struct SculptSettings {
 
 struct RemeshSettings {
   float voxelSize = 0.01f;  // In object units; about the edge length of the result.
+  bool optimizeQuads = true;  // Valence optimisation and relaxation after the voxel remesh.
 };
 
 struct FrameStats {

@@ -51,6 +51,15 @@ class Bvh {
   bool raycast(const Mesh& mesh, const Ray& ray, RayHit& hit,
                float tMax = std::numeric_limits<float>::infinity()) const;
 
+  // Nearest surface point to p within maxDist. Returns false if there is none.
+  struct ClosestHit {
+    Vec3 position{0.0f};
+    Index face = kInvalid;
+    float distSq = 0.0f;
+    Vec3 faceNormal{0.0f};  // Normalized geometric normal of the closest face.
+  };
+  bool closestPoint(const Mesh& mesh, const Vec3& p, float maxDist, ClosestHit& out) const;
+
   // Appends every leaf whose bounds intersect the sphere.
   void querySphere(const Vec3& center, float radius, std::vector<Index>& outLeaves) const;
 

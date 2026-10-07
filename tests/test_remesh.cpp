@@ -3,6 +3,7 @@
 
 #include "TestUtil.h"
 #include "mesh/Primitives.h"
+#include "remesh/QuadRemesh.h"
 #include "remesh/VoxelGrid.h"
 #include "remesh/VoxelRemesh.h"
 #include "scene/Scene.h"
@@ -180,4 +181,56 @@ TEST_CASE("undoing a remesh restores the mesh and earlier sculpt undo still appl
   CHECK(obj.mesh.vertexCount() == remeshedVerts);
   RayHit after;
   CHECK(obj.bvh.raycast(obj.mesh, Ray{{0, 3, 0}, {0, -1, 0}}, after));
+}
+
+namespace {
+
+void requireQuadRemeshOk(const Mesh& out) {
+  test::requireValid(out);
+  for (Index h = 0; h < out.halfEdgeCount(); ++h) REQUIRE(out.heTwin[h] != kInvalid);
+  for (Index f = 0; f < out.faceCount(); ++f) REQUIRE(out.faceSize(f) == 4);
+  for (Index v = 0; v < out.vertexCount(); ++v) REQUIRE(out.valence(v) >= 3);
+}
+
+void printQuality(const std::string& name, const QuadRemeshStats& st) {
+  MESSAGE(name << ": raw v4 " << st.raw.valence4Ratio << " cv " << st.raw.edgeLengthCv << " err " << st.raw.meanError
+               << "/" << st.raw.maxError << " -> final v4 " << st.optimized.valence4Ratio << " cv "
+               << st.optimized.edgeLengthCv << " err " << st.optimized.meanError << "/" << st.optimized.maxError << " edge " << st.raw.meanEdge << "->" << st.optimized.meanEdge << " collapsed "
+               << st.collapsed << " rotated " << st.rotated << " ms " << st.optimizeMs);
+}
+
+}  // namespace
+
+TEST_CASE("quad remesh improves valence, evenness and surface error over the raw voxel remesh") {
+  struct Case {
+    const char* name;
+    Mesh mesh;
+    float h;
+  };
+  Soup two;
+  two.add(makeQuadSphere(48), {-0.5f, 0.0f, 0.0f});
+  two.add(makeQuadSphere(48), {0.5f, 0.0f, 0.0f});
+  std::vector<Case> cases;
+  cases.push_back({"sphere", makeQuadSphere(48), 0.04f});
+  cases.push_back({"uv sphere", makeUvSphere(64, 32), 0.05f});
+  cases.push_back({"cube", makeCube(16), 0.06f});
+  cases.push_back({"two spheres", two.build(), 0.04f});
+  for (const Case& c : cases) {
+    QuadRemeshStats st;
+    std::string error;
+    auto out = quadRemesh(c.mesh, {.targetEdge = c.h, .measureError = true}, &st, &error);
+    INFO(c.name << " " << error);
+    REQUIRE(out);
+    printQuality(c.name, st);
+    requireQuadRemeshOk(*out);
+    CHECK(test::eulerCharacteristic(*out) == 2);
+    test::requireOutward(*out);
+    // Against the raw voxel result: the input of "two spheres" counts the overlap twice.
+    const double v0 = meshVolume(*voxelRemesh(c.mesh, {.voxelSize = c.h})), v1 = meshVolume(*out);
+    CHECK(std::abs(v1 - v0) / v0 < 0.01);
+    CHECK(st.optimized.valence4Ratio >= st.raw.valence4Ratio);
+    if (st.raw.valence4Ratio < 0.9) CHECK(st.optimized.valence4Ratio > 0.8);
+    CHECK(st.optimized.edgeLengthCv < st.raw.edgeLengthCv);
+    CHECK(st.optimized.meanError < st.raw.meanError);
+  }
 }

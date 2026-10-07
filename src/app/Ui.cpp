@@ -188,8 +188,11 @@ void App::drawUi() {
           }
         }
       }
+      ImGui::Checkbox("Optimize quads", &remesh.optimizeQuads);
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Raise valence-4 vertices, even out edge lengths and fit the original surface.");
       ImGui::BeginDisabled(remeshing() || strokeActive() || !scene.find(selectedId));
-      if (ImGui::Button(remeshing() ? "Remeshing..." : "Voxel Remesh (Ctrl+R)", ImVec2(-1, 0))) requestRemesh();
+      if (ImGui::Button(remeshing() ? "Remeshing..." : "Remesh (Ctrl+R)", ImVec2(-1, 0))) requestRemesh();
       ImGui::EndDisabled();
       if (!lastRemeshInfo.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));

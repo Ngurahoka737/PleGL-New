@@ -11,7 +11,7 @@ Dokumen ini merangkum keputusan yang sudah diterapkan di kode. Rencana lengkap P
 - Topologi adalah array `int32`: `heNext`, `heTwin`, `heVert`, `heFace`, ditambah `vertHe` dan `faceHe`. Tidak ada pointer, jadi mesh murah disalin, diserialisasi, dan dikirim ke thread lain.
 - Atribut disimpan sebagai struct-of-arrays (`positions`, `normals`). Jalur panas brush hanya menyentuh array ini.
 - Edge terbuka ditandai `heTwin == -1`, tanpa loop boundary eksplisit.
-- Face boleh segitiga, quad, atau n-gon. Output voxel remesh nanti quad-dominant.
+- Face boleh segitiga, quad, atau n-gon. Output remesh 100% quad.
 - `buildMesh` membangun twin lewat adjacency per vertex (linear terhadap jumlah half-edge) dan melaporkan edge non-manifold, vertex non-manifold, dan face degenerate.
 - `validate()` memeriksa semua invarian topologi. Dipakai di test dan nanti di build debug setiap selesai operasi topologi.
 
@@ -68,7 +68,23 @@ Pipeline: mesh → `VoxelGrid` (signed distance di node grid) → `extractSurfac
 - **Surface Nets** membuat satu vertex per patch permukaan di tiap sel dan satu quad per edge grid yang disilang permukaan, jadi hasilnya 100% quad dan tertutup. Sel yang dilewati dua lembar permukaan mendapat satu vertex per lembar. Face sel yang ambigu diputuskan dari nilai tengahnya dengan urutan penjumlahan tetap, jadi dua sel tetangga selalu sepakat dan setiap edge dipakai tepat dua quad (manifold).
 - Remesh di aplikasi berjalan di worker thread. Undo menyimpan mesh lengkap sebelum dan sesudah (`TopologyUndo`), termasuk `topologyVersion`, sehingga undo stroke sebelum remesh tetap berlaku setelah remesh di-undo.
 
-Keterbatasan saat ini: valence 4 baru sekitar 50% (khas Surface Nets pada permukaan melengkung). Optimasi valence, relaksasi, dan proyeksi ke permukaan asli ada di fase berikutnya.
+Output Surface Nets mentah punya valence 4 sekitar 50% (khas pada permukaan melengkung). Itu diperbaiki oleh quad remesh di bawah.
+
+## Operasi topologi (`mesh/MeshEdit.h`)
+
+`MeshEditor` mengubah topologi secara lokal: `rotateEdge` (flip pada segitiga, rotasi edge pada quad), `splitEdge`, `splitFace`, `collapseEdge`, dan `collapseDiagonal` (menghapus satu quad dengan menggabungkan dua sudut yang berseberangan, sehingga semua face lain tetap quad). Elemen yang dihapus hanya ditandai mati, jadi index tetap stabil selama editing; `compact()` membuang yang mati dan menomori ulang sekali di akhir. Setiap operasi memeriksa link condition dan valence minimum, dan menolak (tanpa mengubah apa pun) kalau hasilnya tidak manifold. Operasi ini juga fondasi untuk dynamic topology nanti.
+
+## Quad remesh (`remesh/QuadRemesh.h`)
+
+Pipeline: `voxelRemesh` → beberapa ronde (default 3) dari:
+
+1. **Collapse diagonal**: quad tipis (diagonal < 0,35 × target edge) dan quad yang collapse-nya menurunkan ketidakteraturan valence (pola 3-x-3-x yang ditinggalkan Surface Nets di bagian melengkung) dihapus.
+2. **Rotasi edge**: edge di antara dua quad diputar kalau enam vertex di sekitarnya jadi lebih dekat ke valence 4, selama tidak ada sudut quad yang terlipat.
+3. **Relaksasi**: vertex bergeser ke rata-rata tetangganya sepanjang bidang singgung, lalu diproyeksikan ke mesh asli (`Bvh::closestPoint`, daun kecil 8 face) dengan cek arah normal supaya tidak menempel ke sisi seberang bagian tipis.
+
+Valence disimpan di cache dan diperbarui per operasi, sehingga pass topologi tetap linear. Hasil tetap tertutup, manifold, dan 100% quad. `measureQuality` memberi rasio valence 4, koefisien variasi panjang edge, dan galat permukaan (jarak pusat face ke mesh asli).
+
+Di aplikasi, toggle **Optimize quads** (default aktif) memilih antara quad remesh dan voxel remesh biasa.
 
 ## Threading (`core/Parallel.h`)
 
@@ -126,3 +142,27 @@ Target PRD (latensi brush di bawah 16 ms) masih terpenuhi pada 1M vertex dengan 
 | 1M | 0,005 | 408³ | 754K | 1,6 s | 98 MB |
 
 Target PRD: 100K < 1 s, 500K < 3 s, 1M < 5 s. Volume bola berubah kurang dari 2% pada voxel 0,04, dan dua bola yang tumpang tindih menjadi satu permukaan dengan volume gabungan yang benar (selisih di bawah 3%).
+
+## Hasil quad remesh (Phase 4)
+
+`plegl_bench`, mesin dan mesh sama. Total termasuk voxel remesh:
+
+| Vertex input | Target edge | Vertex output | Voxel | Optimasi | Total | Valence 4 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 100K | 0,010 | 158K | 0,24 s | 0,26 s | 0,51 s | 95,9% |
+| 100K | 0,005 | 633K | 0,80 s | 0,89 s | 1,7 s | 96,0% |
+| 500K | 0,010 | 158K | 0,50 s | 0,45 s | 0,97 s | 95,9% |
+| 500K | 0,005 | 633K | 1,1 s | 1,2 s | 2,4 s | 96,0% |
+| 1M | 0,010 | 158K | 0,78 s | 0,73 s | 1,5 s | 96,0% |
+| 1M | 0,005 | 633K | 1,4 s | 1,5 s | 2,9 s | 96,0% |
+
+Kualitas dibanding voxel remesh mentah (tes `quad remesh improves ...`, galat dalam satuan panjang edge rata-rata):
+
+| Mesh | Valence 4 | CV panjang edge | Galat rata-rata |
+| --- | --- | --- | --- |
+| Quad sphere | 51% → 94% | 0,21 → 0,17 | 0,020 → 0,010 |
+| UV sphere | 48% → 94% | 0,22 → 0,17 | 0,025 → 0,013 |
+| Cube | 99,9% → 99,9% | 0,11 → 0,05 | 0,012 → 0,005 |
+| Dua bola tumpang tindih | 52% → 93% | 0,22 → 0,17 | 0,022 → 0,010 |
+
+Volume berubah kurang dari 1% dibanding hasil voxel. Sudut tajam (misalnya rusuk kubus) tetap sedikit membulat seperti pada voxel remesh; penjagaan fitur tajam belum ada.
