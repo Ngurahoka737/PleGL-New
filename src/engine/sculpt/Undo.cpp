@@ -9,7 +9,7 @@ std::size_t SculptUndo::bytes() const {
   for (const auto* list : {&before, &after})
     for (const LeafState& s : *list)
       n += (s.positions.size() + s.normals.size()) * sizeof(Vec3) + s.mask.size() * sizeof(float);
-  return n;
+  return n + refit.size() * sizeof(Index);
 }
 
 std::size_t MeshState::bytes() const {
@@ -24,12 +24,20 @@ std::size_t TopologyUndo::bytes() const {
   return (before ? before->bytes() : 0) + (after ? after->bytes() : 0);
 }
 
+std::size_t DyntopoUndo::bytes() const {
+  return delta.bytes() + before.bytes() + (after ? after->bytes() : 0);
+}
+
 std::size_t UndoStack::bytesOf(const Entry& e) {
   return std::visit([](const auto& x) { return x.bytes(); }, e);
 }
 
 void UndoStack::push(SculptUndo entry) { pushEntry(std::move(entry)); }
 void UndoStack::push(TopologyUndo entry) { pushEntry(std::move(entry)); }
+void UndoStack::push(DyntopoUndo entry) { pushEntry(std::move(entry)); }
+void UndoStack::push(StrokeUndo entry) {
+  std::visit([this](auto&& e) { pushEntry(std::move(e)); }, std::move(entry));
+}
 
 void UndoStack::pushEntry(Entry entry) {
   while (entries_.size() > cursor_) {
@@ -39,7 +47,12 @@ void UndoStack::pushEntry(Entry entry) {
   bytes_ += bytesOf(entry);
   entries_.push_back(std::move(entry));
   cursor_ = entries_.size();
-  while (bytes_ > maxBytes_ && entries_.size() > 1) {
+  trim();
+}
+
+void UndoStack::trim() {
+  // Never drop the newest entry, nor anything that can still be redone.
+  while (bytes_ > maxBytes_ && cursor_ > 0 && entries_.size() > 1) {
     bytes_ -= bytesOf(entries_.front());
     entries_.erase(entries_.begin());
     --cursor_;
@@ -57,7 +70,7 @@ bool UndoStack::apply(Scene& scene, const SculptUndo& entry, const std::vector<L
   if (!obj || obj->topologyVersion != entry.topologyVersion) return false;
   Mesh& m = obj->mesh;
   std::vector<Index> leaves;
-  leaves.reserve(states.size());
+  leaves.reserve(states.size() + entry.refit.size());
   std::size_t maskLeaves = 0;
   for (const LeafState& s : states) maskLeaves += s.mask.empty() ? 0 : 1;
   // A mask operation can touch every leaf; one full mask upload is cheaper than many small ones.
@@ -75,8 +88,10 @@ bool UndoStack::apply(Scene& scene, const SculptUndo& entry, const std::vector<L
     if (!s.mask.empty() && !maskAll) obj->markMaskDirty(s.leaf);
   }
   if (maskAll) obj->markMaskDirtyAll();
-  // Every leaf whose faces moved has its own snapshot, so refitting these is enough.
-  if (!leaves.empty()) obj->bvh.refitLeaves(m, leaves);
+  if (!leaves.empty()) {
+    for (Index l : entry.refit) leaves.push_back(l);
+    obj->bvh.refitLeaves(m, leaves);
+  }
   return true;
 }
 
@@ -90,14 +105,47 @@ bool UndoStack::apply(Scene& scene, const TopologyUndo& entry, const MeshState& 
   return true;
 }
 
+bool UndoStack::apply(Scene& scene, DyntopoUndo& entry, bool redo) {
+  SceneObject* obj = scene.find(entry.objectId);
+  if (!obj) return false;
+  if (!workspace_) workspace_ = std::make_shared<LayoutWorkspace>();
+  if (!redo) {
+    if (obj->topologyVersion != entry.afterVersion) return false;
+    if (!entry.after) {
+      // Undo is last in, first out, so the current mesh is exactly the state after the stroke.
+      std::vector<Index> moved;
+      for (const LeafState& s : entry.before.posOnly) moved.push_back(s.leaf);
+      entry.after = std::make_unique<LayoutSide>(captureSide(obj->mesh, obj->bvh, entry.delta, moved, entry.afterVersion));
+      bytes_ += entry.after->bytes();
+    }
+    if (!relayout(obj->mesh, obj->bvh, entry.before, entry.delta, false, *workspace_)) return false;
+    obj->topologyVersion = entry.before.topologyVersion;
+  } else {
+    if (obj->topologyVersion != entry.before.topologyVersion || !entry.after) return false;
+    if (!relayout(obj->mesh, obj->bvh, *entry.after, entry.delta, true, *workspace_)) return false;
+    obj->topologyVersion = entry.afterVersion;
+    // The current mesh is the after side again; capture it anew if the stroke is undone again.
+    bytes_ -= entry.after->bytes();
+    entry.after.reset();
+  }
+  obj->clearDirty();
+  return true;
+}
+
 std::string UndoStack::undo(Scene& scene) {
   // Skip entries whose object is gone or was rebuilt; they can never apply again.
   while (cursor_ > 0) {
-    const Entry& entry = entries_[--cursor_];
+    Entry& entry = entries_[--cursor_];
     if (const auto* s = std::get_if<SculptUndo>(&entry)) {
       if (apply(scene, *s, s->before)) return s->label;
     } else if (const auto* t = std::get_if<TopologyUndo>(&entry)) {
       if (apply(scene, *t, *t->after, *t->before)) return t->label;
+    } else if (auto* d = std::get_if<DyntopoUndo>(&entry)) {
+      if (apply(scene, *d, false)) {
+        std::string label = d->label;
+        trim();  // The captured after side may push the stack over budget.
+        return label;
+      }
     }
   }
   return {};
@@ -105,11 +153,13 @@ std::string UndoStack::undo(Scene& scene) {
 
 std::string UndoStack::redo(Scene& scene) {
   while (cursor_ < entries_.size()) {
-    const Entry& entry = entries_[cursor_++];
+    Entry& entry = entries_[cursor_++];
     if (const auto* s = std::get_if<SculptUndo>(&entry)) {
       if (apply(scene, *s, s->after)) return s->label;
     } else if (const auto* t = std::get_if<TopologyUndo>(&entry)) {
       if (apply(scene, *t, *t->before, *t->after)) return t->label;
+    } else if (auto* d = std::get_if<DyntopoUndo>(&entry)) {
+      if (apply(scene, *d, true)) return d->label;
     }
   }
   return {};

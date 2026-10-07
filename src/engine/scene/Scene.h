@@ -43,11 +43,17 @@ struct SceneObject {
   // Leaves whose mask values changed, or the whole mask when maskDirtyAll is set.
   std::vector<Index> maskDirtyLeaves;
   bool maskDirtyAll = false;
+  // Leaves whose faces changed during a dynamic topology stroke (topologyVersion only changes
+  // when the stroke ends), so their GPU index data must be rebuilt.
+  std::vector<Index> topoDirtyLeaves;
+  // topologyVersion at which the mesh was last found free of non-manifold vertices.
+  std::uint64_t manifoldCheckedVersion = 0;
 
   // Rebuilds the BVH (which reorders the mesh) and bumps topologyVersion.
   void rebuildSpatial();
   void markLeafDirty(Index leaf) { dirtyLeaves.push_back(leaf); }
   void markMaskDirty(Index leaf) { maskDirtyLeaves.push_back(leaf); }
+  void markTopologyDirty(Index leaf) { topoDirtyLeaves.push_back(leaf); }
   void markMaskDirtyAll() {
     maskDirtyAll = true;
     maskDirtyLeaves.clear();
@@ -57,6 +63,7 @@ struct SceneObject {
     dirtyLeaves.clear();
     maskDirtyLeaves.clear();
     maskDirtyAll = false;
+    topoDirtyLeaves.clear();
   }
 };
 

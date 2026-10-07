@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <algorithm>
 #include <cstring>
+#include <memory>
 #include <random>
 #include <vector>
 
@@ -142,6 +143,57 @@ int main(int argc, char** argv) {
       report(obj, radius, "Grab", times, verts);
     }
   }
+  // Dynamic topology strokes with the app's default per-pass budget (3 ms). The detail size is a
+  // twelfth of the radius, so every dab refines. "dab" includes the topology pass; "end" is the
+  // compaction in endStroke(), with a warm workspace as in the app (it keeps one for the session).
+  std::printf("\nDyntopo stroke benchmark (ms per dab, Draw, 200 dabs, detail = radius / 12)\n\n");
+  std::printf("%10s %8s %10s %10s %10s %10s %10s %10s %8s %8s %8s\n", "vertices", "radius", "out verts", "avg",
+              "p95", "max", "topo avg", "splits", "collapse", "end", "undo MB");
+  for (int res : strokeRes) {
+    const auto workspace = std::make_shared<LayoutWorkspace>();
+    {
+      Scene warm;
+      SceneObject& obj = warm.add("Warm", makeQuadSphere(res));
+      DrawBrush draw;
+      Sculptor sculptor;
+      sculptor.setLayoutWorkspace(workspace);
+      sculptor.beginStroke(obj, draw, {.strength = 0.5f, .dyntopo = true}, "Draw");
+      sculptor.dab({0.0f, 0.0f, 1.0f}, 0.1f, 0.5f, DabTopology{0.001f, kInvalid});
+      sculptor.endStroke();
+    }
+    for (float radius : {0.05f, 0.15f, 0.4f}) {
+      Scene scene;
+      SceneObject& obj = scene.add("Sphere", makeQuadSphere(res));
+      const Index vertsBefore = obj.mesh.vertexCount();
+      DrawBrush draw;
+      Sculptor sculptor;
+      sculptor.setLayoutWorkspace(workspace);
+      sculptor.beginStroke(obj, draw, {.strength = 0.5f, .dyntopo = true}, "Draw");
+      std::vector<double> times;
+      double topo = 0.0;
+      for (int i = 0; i < 200; ++i) {
+        const float a = -0.8f + 1.6f * static_cast<float>(i) / 199.0f;
+        const Vec3 dir = glm::normalize(Vec3{std::sin(a), 0.3f, std::cos(a)});
+        RayHit hit;
+        if (!obj.bvh.raycast(obj.mesh, Ray{dir * 3.0f, -dir}, hit)) continue;
+        sculptor.dab(hit.position, radius, 0.5f, DabTopology{radius / 12.0f, hit.face});
+        times.push_back(sculptor.lastDab().totalMs);
+        topo += sculptor.lastDab().topologyMs;
+      }
+      auto undo = sculptor.endStroke();
+      const StrokeTopologyStats& st = sculptor.lastStrokeTopology();
+      const std::size_t undoBytes = undo ? std::visit([](const auto& e) { return e.bytes(); }, *undo) : 0;
+      std::sort(times.begin(), times.end());
+      double avg = 0;
+      for (double t : times) avg += t;
+      avg /= static_cast<double>(times.size());
+      std::printf("%10d %8.2f %10d %10.3f %10.3f %10.3f %10.3f %10d %8d %8.1f %8.2f\n", vertsBefore, radius,
+                  obj.mesh.vertexCount(), avg, times.at(times.size() * 95 / 100), times.back(),
+                  topo / static_cast<double>(times.size()), st.splits, st.collapses, st.consolidateMs,
+                  static_cast<double>(undoBytes) / (1024.0 * 1024.0));
+    }
+  }
+
   // Whole-mesh mask operations, run on the main thread in the app. Blur and Sharpen use two
   // iterations (the app default). The undo entry is built inside the timed call.
   std::printf("\nMask operation benchmark (ms)\n\n");

@@ -157,3 +157,106 @@ TEST_CASE("rays through shared edges hit the near side") {
     CHECK(glm::dot(hit.position, dir) > 0.99f);
   }
 }
+
+TEST_CASE("BVH leaves own contiguous half-edge ranges laid out face by face") {
+  for (int shape = 0; shape < 3; ++shape) {
+    Mesh m = shape == 0 ? makeQuadSphere(40) : shape == 1 ? makeIcosphere(4) : makePlane(30);
+    Bvh bvh;
+    bvh.build(m, {256});
+    REQUIRE(bvh.leaves().size() >= 4);
+    Index h = 0;
+    for (const BvhLeaf& leaf : bvh.leaves()) {
+      CHECK(leaf.heBegin == h);
+      CHECK(leaf.heBegin == m.faceHe[leaf.faceBegin]);
+      h = leaf.heEnd;
+      for (Index e = leaf.heBegin; e < leaf.heEnd; ++e) CHECK(bvh.leafOfHalfEdge(e) == bvh.leafOfFace(m.heFace[e]));
+    }
+    CHECK(h == m.halfEdgeCount());
+    const ValidationResult r = validateLayout(m, bvh);
+    INFO(r.message);
+    CHECK(r.ok);
+  }
+}
+
+TEST_CASE("rebuilding the tree keeps leaf indices and skips empty leaves") {
+  Mesh m = makeQuadSphere(32);
+  Bvh bvh;
+  bvh.build(m, {128});
+  // Insert two empty leaves (as dynamic topology leaves behind) and rebuild the tree.
+  std::vector<BvhLeaf> leaves(bvh.leaves().begin(), bvh.leaves().end());
+  const std::size_t original = leaves.size();
+  BvhLeaf empty;
+  empty.faceBegin = empty.faceEnd = leaves[3].faceEnd;
+  empty.vertBegin = empty.vertEnd = leaves[3].vertEnd;
+  empty.heBegin = empty.heEnd = leaves[3].heEnd;
+  leaves.insert(leaves.begin() + 4, empty);
+  BvhLeaf last = leaves.back();
+  last.faceBegin = last.faceEnd;
+  last.vertBegin = last.vertEnd = m.vertexCount();
+  last.heBegin = last.heEnd;
+  leaves.push_back(last);
+  bvh.setLeaves(leaves);
+  REQUIRE(bvh.leaves().size() == original + 2);
+  const ValidationResult r = validateLayout(m, bvh);
+  INFO(r.message);
+  CHECK(r.ok);
+  CHECK(bvh.leafOfFace(leaves[5].faceBegin) == 5);
+  CHECK(bvh.leafOfVertex(leaves[5].vertBegin) == 5);
+
+  std::mt19937 rng(3);
+  std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+  for (int i = 0; i < 200; ++i) {
+    Ray ray{Vec3{u(rng), u(rng), u(rng)} * 3.0f, {u(rng), u(rng), u(rng)}};
+    RayHit hit;
+    const bool any = bvh.raycast(m, ray, hit);
+    const float ref = bruteForce(m, ray);
+    CHECK(any == std::isfinite(ref));
+    if (any) CHECK(hit.t == doctest::Approx(ref).epsilon(1e-4));
+  }
+}
+
+TEST_CASE("BVH tail leaves are found by every query in dynamic mode") {
+  Mesh m = makeQuadSphere(16);
+  Bvh bvh;
+  bvh.build(m, {64});
+  bvh.beginDynamic(m);
+  // Append a lone triangle far outside the root box, as a tail face.
+  const Index v0 = m.vertexCount();
+  for (const Vec3& p : {Vec3{5, 0, 0}, Vec3{5, 1, 0}, Vec3{5, 0, 1}}) {
+    m.positions.push_back(p);
+    m.normals.push_back({1, 0, 0});
+    m.vertHe.push_back(m.halfEdgeCount() + static_cast<Index>(m.positions.size()) - 1 - v0);
+  }
+  const Index h0 = m.halfEdgeCount(), f = m.faceCount();
+  for (Index k = 0; k < 3; ++k) {
+    m.heNext.push_back(h0 + (k + 1) % 3);
+    m.heTwin.push_back(kInvalid);
+    m.heVert.push_back(v0 + k);
+    m.heFace.push_back(f);
+  }
+  m.faceHe.push_back(h0);
+  bvh.growTail(m);
+  const Index tail = bvh.firstTailLeaf();
+  REQUIRE(static_cast<Index>(bvh.leaves().size()) == tail + 1);
+  CHECK(bvh.isTail(tail));
+  CHECK(bvh.leafOfFace(f) == tail);
+  CHECK(bvh.leafOfVertex(v0 + 1) == tail);
+  CHECK(bvh.leafOfHalfEdge(h0 + 2) == tail);
+  const Index tailLeaf[] = {tail};
+  bvh.refitLeaves(m, tailLeaf);  // Has no node; must not touch the tree.
+
+  std::vector<Index> found;
+  bvh.querySphere({5, 0.3f, 0.3f}, 0.2f, found);
+  CHECK(found == std::vector<Index>{tail});
+  RayHit hit;
+  REQUIRE(bvh.raycast(m, Ray{{6, 0.2f, 0.2f}, {-1, 0, 0}}, hit));
+  CHECK(hit.face == f);
+  Bvh::ClosestHit near;
+  REQUIRE(bvh.closestPoint(m, {5.5f, 0.2f, 0.2f}, 1.0f, near));
+  CHECK(near.face == f);
+
+  // A removed face in a flagged leaf is skipped.
+  m.faceHe[f] = kInvalid;
+  CHECK_FALSE(bvh.raycast(m, Ray{{6, 0.2f, 0.2f}, {-1, 0, 0}}, hit, 2.0f));
+  bvh.endDynamic();
+}
