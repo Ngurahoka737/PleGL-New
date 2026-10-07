@@ -26,7 +26,9 @@ Dokumen ini merangkum keputusan yang sudah diterapkan di kode. Rencana lengkap P
 ## Renderer (`src/app/Renderer.*`)
 
 - Satu buffer posisi, satu buffer normal, dan satu buffer mask per objek, urutannya sama dengan mesh. Daun yang ditandai dirty diunggah per rentang, bukan seluruh buffer. Mask punya daftar dirty sendiri, jadi stroke mask tidak mengunggah ulang posisi.
-- Wireframe memakai edge poligon asli (bukan diagonal segitiga), jadi quad tampil sebagai quad.
+- Indeks segitiga dan edge disimpan **per daun BVH** dalam blok sendiri (`render/LeafIndexBlocks.h`) dan digambar dengan satu `glMultiDrawElements`. Saat mesh diam, blok-blok itu bersambung dan digambar sebagai satu rentang. Selama stroke dynamic topology hanya blok daun yang face-nya berubah yang ditulis ulang; blok yang tidak muat lagi pindah ke ruang kosong atau ke ujung buffer dengan sisa ruang.
+- Buffer vertex dan index punya ruang tambahan (vertex: +25%, minimal 65.536) dan diperbesar dengan salinan di GPU (`glCopyNamedBufferSubData`) kalau stroke kehabisan ruang, tanpa upload ulang dari CPU.
+- Wireframe memakai edge poligon asli (bukan diagonal segitiga), jadi quad tampil sebagai quad. Indeks edge hanya dijaga selama wireframe aktif dan dibangun ulang sekali saat wireframe dinyalakan.
 - Matcap dibuat secara prosedural saat start, tanpa file aset.
 
 ## Sculpting (`sculpt/`)
@@ -82,7 +84,23 @@ Output Surface Nets mentah punya valence 4 sekitar 50% (khas pada permukaan mele
 
 ## Operasi topologi (`mesh/MeshEdit.h`)
 
-`MeshEditor` mengubah topologi secara lokal: `rotateEdge` (flip pada segitiga, rotasi edge pada quad), `splitEdge`, `splitFace`, `collapseEdge`, dan `collapseDiagonal` (menghapus satu quad dengan menggabungkan dua sudut yang berseberangan, sehingga semua face lain tetap quad). Elemen yang dihapus hanya ditandai mati, jadi index tetap stabil selama editing; `compact()` membuang yang mati dan menomori ulang sekali di akhir. Setiap operasi memeriksa link condition dan valence minimum, dan menolak (tanpa mengubah apa pun) kalau hasilnya tidak manifold. Operasi ini juga fondasi untuk dynamic topology nanti.
+`MeshEditor` mengubah topologi secara lokal: `rotateEdge` (flip pada segitiga, rotasi edge pada quad), `splitEdge`, `splitFace`, `collapseEdge`, dan `collapseDiagonal` (menghapus satu quad dengan menggabungkan dua sudut yang berseberangan, sehingga semua face lain tetap quad). Elemen yang dihapus hanya ditandai mati, jadi index tetap stabil selama editing; `compact()` membuang yang mati dan menomori ulang sekali di akhir. Setiap operasi memeriksa link condition dan valence minimum, dan menolak (tanpa mengubah apa pun) kalau hasilnya tidak manifold. Operasi ini juga dipakai dynamic topology; untuk itu `MeshEditor` bisa diberi `EditObserver` yang diberi tahu setiap elemen sebelum ditulis.
+
+## Dynamic topology (`sculpt/Dyntopo.h`, `spatial/LeafLayout.h`)
+
+Dengan dynamic topology (Ctrl+D di Sculpt mode), setiap dab mengubah topologi di bawah brush sebelum brush berjalan: edge yang lebih panjang dari ukuran detail D dipecah, dan edge yang lebih pendek dari 0,4 D digabung. Detail bisa ditentukan dalam pixel layar (Relative, default 8 px, diubah ke satuan objek di titik kena, jadi zoom in menambah detail) atau sebagai panjang tetap dalam satuan objek (Constant). Tahan R lalu geser mouse untuk mengubahnya. D tidak pernah lebih halus dari radius/20, supaya satu dab tidak meledakkan jumlah face. Satu pass dibatasi 1.024 split, 1.024 collapse, dan 3 ms. Grab dan Mask tidak mengubah topologi.
+
+**Split** mengikuti *longest-edge bisection*: segitiga hanya dipotong lewat edge terpanjangnya. Kalau segitiga di sebelah edge yang mau dipecah punya edge yang lebih panjang, edge itu dipecah dulu, walaupun di luar brush. Tanpa aturan ini, split berulang di samping edge panjang yang tidak terjangkau brush menghasilkan segitiga yang makin tipis tanpa pernah memendek (ditemukan oleh test). Titik baru diletakkan di tengah edge, lalu kedua face dipotong dari titik itu ke sudut seberangnya. Quad dipotong jadi dua segitiga (diagonal terpendek yang tidak terlipat) hanya kalau edge-nya perlu dipecah. Edge border juga dipecah di tengah, jadi bentuk border tetap.
+
+**Collapse** menggabungkan kedua ujung edge di tengahnya (atau di ujung yang lebih ter-mask) dan ditolak kalau: ada face di sekitarnya yang tidak boleh diubah, valence hasilnya lebih dari 12, ada edge baru yang lebih panjang dari D (supaya split dan collapse tidak berosilasi), ada face yang terlipat atau mengecil hampir nol, atau link condition `MeshEditor` gagal. Vertex border tidak pernah digabung.
+
+**Tidak disentuh**: vertex dengan mask ≥ 0,5, vertex non-manifold (dicek sekali per versi topologi), setiap face yang punya sudut seperti itu, dan face dengan lebih dari 4 sudut.
+
+**Layout selama stroke.** Edit dilakukan di tempat: elemen yang dihapus hanya ditandai mati, elemen baru masuk ke daun ekor BVH yang diperiksa raycast dan query bola lebih dulu. Index lama tidak pernah bergeser selama stroke, jadi brush, raycast, dan renderer tetap bekerja di tengah stroke. Ruang untuk elemen baru dipesan di awal stroke (paling sedikit 65.536 vertex) supaya tidak ada realokasi di dalam dab.
+
+**Undo.** `ClaimRecorder` (sebuah `EditObserver`) menyalin satu daun utuh tepat sebelum tulisan pertama ke daun itu. Daun yang hanya bergerak tetap memakai snapshot posisi biasa. Di akhir stroke `consolidate` membangun ulang hanya daun yang tersentuh, dengan index daun yang stabil (daun yang diklaim dipakai lagi, lalu daun kosong, baru kemudian daun baru), dan menyalin sisanya dengan pergeseran. Hasilnya layout kanonik yang sama seperti mesh biasa, sehingga sisa engine tidak pernah melihat elemen mati. `DyntopoUndo` menyimpan sisi sebelum (daun yang diklaim dan snapshot posisi) ditambah pasangan referensi di batas wilayah; sisi sesudah baru disalin saat undo pertama. Undo dan redo adalah relayout yang bit-exact. Kalau ada perubahan yang tidak tercatat, `consolidate` mendeteksinya, membangun ulang semua daun, dan memutus riwayat sebelum stroke itu daripada menerapkannya ke mesh yang salah.
+
+**GPU.** Setiap dab menandai daun yang segitiga atau edge-nya berubah (`SceneObject::topoDirtyLeaves`), dan renderer hanya menulis ulang blok indeks daun itu, ditambah rentang vertex dan mask daun yang berubah. Di akhir stroke versi topologi berubah, jadi mesh diunggah penuh sekali dengan indeks yang dibuat paralel per daun. Statistik mesh (persentase quad, valence 4) dihitung paralel satu frame kemudian, tidak pernah di tengah stroke.
 
 ## Quad remesh (`remesh/QuadRemesh.h`)
 
@@ -161,6 +179,16 @@ Phase 6, mask brush pada 1M vertex: p95 di bawah 1,6 ms untuk semua radius (tanp
 | ---: | ---: | ---: | ---: | ---: | ---: |
 | 500K | 1,2 ms | 17 ms | 16 ms | 0,8 ms | 3,8 MB |
 | 1M | 2,7 ms | 37 ms | 37 ms | 1,5 ms | 7,6 MB |
+
+Phase 6b, Draw dengan dynamic topology (detail = radius/12, jadi mesh 500K dihaluskan di dab kecil dan dikasarkan di dab besar). "Topologi" adalah bagian waktu dab untuk split dan collapse. "Akhir stroke" adalah `consolidate` sekali setelah dab terakhir:
+
+| Vertex | Radius dab | Rata-rata | p95 | Topologi | Split | Collapse | Akhir stroke | Undo |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 500K | 0,05 | 1,1 ms | 1,6 ms | 0,4 ms | 19.521 | 0 | 33 ms | 1,7 MB |
+| 500K | 0,15 | 1,4 ms | 2,9 ms | 0,4 ms | 0 | 6.063 | 35 ms | 3,3 MB |
+| 500K | 0,40 | 5,1 ms | 8,3 ms | 2,5 ms | 2.652 | 42.385 | 32 ms | 7,0 MB |
+| 1M | 0,15 | 2,2 ms | 4,2 ms | 1,0 ms | 249 | 29.773 | 91 ms | 5,9 MB |
+| 1M | 0,40 | 10,7 ms | 13,9 ms | 5,2 ms | 0 | 5.204 | 71 ms | 6,1 MB |
 
 Target PRD (latensi brush di bawah 16 ms) masih terpenuhi pada 1M vertex dengan brush besar. Upload GPU belum termasuk angka ini; panel Performance di aplikasi menampilkan waktu dab dan latensi input-ke-frame secara langsung.
 
