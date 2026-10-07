@@ -1,5 +1,6 @@
 #include "io/Project.h"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstring>
@@ -20,6 +21,8 @@ constexpr std::uint32_t tag(const char (&s)[5]) {
 }
 constexpr std::uint32_t kTagSettings = tag("SETT");
 constexpr std::uint32_t kTagObjects = tag("OBJS");
+constexpr std::uint32_t kTagMask = tag("MASK");
+constexpr std::uint8_t kMaskEncodingF32 = 0;
 constexpr std::uint32_t kTagEnd = tag("END ");
 
 class Writer {
@@ -170,6 +173,42 @@ bool readObject(Reader& r, ProjectObject& out, std::string* error) {
   return true;
 }
 
+void writeMasks(Writer& w, const Scene& scene) {
+  std::vector<std::uint32_t> masked;
+  for (std::size_t i = 0; i < scene.objects().size(); ++i)
+    if (scene.objects()[i]->mesh.anyMasked()) masked.push_back(static_cast<std::uint32_t>(i));
+  if (masked.empty()) return;
+  const std::size_t at = w.beginChunk(kTagMask);
+  w.put(static_cast<std::uint32_t>(masked.size()));
+  for (std::uint32_t i : masked) {
+    const Mesh& m = scene.objects()[i]->mesh;
+    w.put(i);
+    w.put(static_cast<std::uint32_t>(m.mask.size()));
+    w.put(kMaskEncodingF32);
+    w.putArray(m.mask.data(), m.mask.size());
+  }
+  w.endChunk(at);
+}
+
+// Attaches the masks of a MASK chunk to the parsed objects.
+bool readMasks(Reader& r, std::size_t size, std::vector<ProjectObject>& objects, std::string* error) {
+  const auto count = r.get<std::uint32_t>();
+  if (!r.ok() || count > size) return setError(error, "The mask data is damaged.");
+  for (std::uint32_t k = 0; k < count; ++k) {
+    const auto index = r.get<std::uint32_t>();
+    const auto vertexCount = r.get<std::uint32_t>();
+    const auto encoding = r.get<std::uint8_t>();
+    if (!r.ok() || index >= objects.size() || encoding != kMaskEncodingF32 ||
+        vertexCount != std::uint32_t(objects[index].mesh.vertexCount()))
+      return setError(error, "The mask data is damaged.");
+    std::vector<float> values;
+    if (!r.getArray(values, vertexCount)) return setError(error, "The mask data is cut off.");
+    for (float& v : values) v = v > 0.0f ? std::min(v, 1.0f) : 0.0f;  // Also turns NaN into 0.
+    objects[index].mesh.mask = std::move(values);
+  }
+  return true;
+}
+
 }  // namespace
 
 std::uint32_t crc32(const std::uint8_t* data, std::size_t size, std::uint32_t crc) {
@@ -189,10 +228,10 @@ std::uint32_t crc32(const std::uint8_t* data, std::size_t size, std::uint32_t cr
 
 std::vector<std::uint8_t> serializeProject(const Scene& scene, const std::string& settings) {
   Writer w;
-  std::size_t total = 64 + settings.size();
+  std::size_t total = 64 + 16 + settings.size();  // 16: MASK chunk header and count.
   for (const auto& obj : scene.objects())
     total += 64 + obj->name.size() + obj->mesh.positions.size() * 12 + std::size_t(obj->mesh.faceCount()) * 4 +
-             std::size_t(obj->mesh.halfEdgeCount()) * 4;
+             std::size_t(obj->mesh.halfEdgeCount()) * 4 + (obj->mesh.mask.empty() ? 0 : 9 + obj->mesh.mask.size() * 4);
   w.bytes.reserve(total);
 
   w.putArray(kMagic, sizeof(kMagic));
@@ -204,6 +243,7 @@ std::vector<std::uint8_t> serializeProject(const Scene& scene, const std::string
   w.put(static_cast<std::uint32_t>(scene.objects().size()));
   for (const auto& obj : scene.objects()) writeObject(w, *obj);
   w.endChunk(at);
+  writeMasks(w, scene);
   const std::uint32_t crc = crc32(w.bytes.data(), w.bytes.size());
   at = w.beginChunk(kTagEnd);
   w.put(crc);
@@ -225,6 +265,8 @@ std::optional<Project> parseProject(const std::uint8_t* data, std::size_t size, 
   }
   Project project;
   bool sawObjects = false;
+  const std::uint8_t* maskData = nullptr;  // Applied after the loop, once the objects exist.
+  std::size_t maskSize = 0;
   for (;;) {
     const std::uint8_t* chunkStart = r.position();
     const auto t = r.get<std::uint32_t>();
@@ -255,12 +297,19 @@ std::optional<Project> parseProject(const std::uint8_t* data, std::size_t size, 
       for (ProjectObject& obj : project.objects)
         if (!readObject(chunk, obj, error)) return std::nullopt;
       sawObjects = true;
+    } else if (t == kTagMask) {
+      maskData = chunk.position();
+      maskSize = std::size_t(chunkSize);
     }
     // Unknown chunks are skipped.
   }
   if (!sawObjects) {
     setError(error, "The project file has no object list.");
     return std::nullopt;
+  }
+  if (maskData) {
+    Reader masks(maskData, maskSize);
+    if (!readMasks(masks, maskSize, project.objects, error)) return std::nullopt;
   }
   return project;
 }

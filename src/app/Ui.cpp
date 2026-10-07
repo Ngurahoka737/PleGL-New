@@ -76,7 +76,7 @@ void App::drawUi() {
       if (ImGui::MenuItem("Save Project", "Ctrl+S")) requestSaveProject(false);
       if (ImGui::MenuItem("Save Project As...", "Ctrl+Shift+S")) requestSaveProject(true);
       ImGui::Separator();
-      if (ImGui::MenuItem("Import OBJ...", "Ctrl+I")) requestImport();
+      if (ImGui::MenuItem("Import OBJ...", "Ctrl+Shift+I")) requestImport();
       if (ImGui::MenuItem("Export Selected OBJ...", "Ctrl+E", false, scene.find(selectedId) != nullptr)) requestExport();
       ImGui::Separator();
       ImGui::SetNextItemWidth(120.0f * scale);
@@ -91,6 +91,19 @@ void App::drawUi() {
       if (ImGui::MenuItem("Icosphere")) addPrimitive("Icosphere", makeIcosphere(primitives.icoSubdivisions));
       if (ImGui::MenuItem("Cube")) addPrimitive("Cube", makeCube(primitives.cubeResolution));
       if (ImGui::MenuItem("Plane")) addPrimitive("Plane", makePlane(primitives.planeResolution));
+      ImGui::EndMenu();
+    }
+    if (ImGui::BeginMenu("Mask")) {
+      // Ctrl+I imports in Object mode, so it inverts the mask only in Sculpt mode.
+      const bool can = canEditMask();
+      if (ImGui::MenuItem("Invert Mask", mode == Mode::Sculpt ? "Ctrl+I" : nullptr, false, can))
+        applyMask(MaskOp::Invert);
+      if (ImGui::MenuItem("Clear Mask", "Alt+M", false, can)) applyMask(MaskOp::Clear);
+      if (ImGui::MenuItem("Mask All", "Alt+Shift+M", false, can)) applyMask(MaskOp::Fill);
+      if (ImGui::MenuItem("Blur Mask", "Alt+B", false, can)) applyMask(MaskOp::Blur);
+      if (ImGui::MenuItem("Sharpen Mask", "Alt+Shift+B", false, can)) applyMask(MaskOp::Sharpen);
+      ImGui::Separator();
+      ImGui::MenuItem("Show Mask", nullptr, &view.showMask);
       ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("View")) {
@@ -110,6 +123,13 @@ void App::drawUi() {
       ImGui::TextUnformatted("X / Delete          Delete");
       ImGui::TextUnformatted("Home                Frame selected");
       ImGui::TextUnformatted("Tab                 Object / Sculpt mode");
+      ImGui::Separator();
+      ImGui::TextUnformatted("Alt + M             Clear mask (Alt+Shift+M: mask all)");
+      ImGui::TextUnformatted("Alt + B             Blur mask (Alt+Shift+B: sharpen)");
+      ImGui::Separator();
+      ImGui::TextUnformatted("Sculpt mode:");
+      ImGui::TextUnformatted("M                   Mask brush (Ctrl+drag erases, Shift+drag smooths)");
+      ImGui::TextUnformatted("Ctrl + I            Invert mask");
       ImGui::EndMenu();
     }
     ImGui::EndMainMenuBar();
@@ -150,7 +170,11 @@ void App::drawUi() {
       float& strength = sculpt.strength[static_cast<int>(sculpt.brush)];
       ImGui::SetNextItemWidth(-1);
       ImGui::SliderFloat("##strength", &strength, 0.0f, 1.0f, "strength %.2f");
-      if (sculpt.brush != BrushKind::Smooth && sculpt.brush != BrushKind::Grab) {
+      if (sculpt.brush == BrushKind::Mask) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextWrapped("Masked areas are protected from every brush. Ctrl+drag: erase. Shift+drag: smooth mask.");
+        ImGui::PopStyleColor();
+      } else if (sculpt.brush != BrushKind::Smooth && sculpt.brush != BrushKind::Grab) {
         int inv = sculpt.invert ? 1 : 0;
         ImGui::RadioButton("Add", &inv, 0);
         ImGui::SameLine();
@@ -174,6 +198,30 @@ void App::drawUi() {
 
       sectionHeader("Symmetry");
       ImGui::Checkbox("Mirror X (X)", &sculpt.symmetryX);
+
+      sectionHeader("Mask");
+      {
+        const float half = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+        ImGui::BeginDisabled(!canEditMask());
+        if (ImGui::Button("Invert", ImVec2(half, 0))) applyMask(MaskOp::Invert);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Ctrl+I");
+        ImGui::SameLine();
+        if (ImGui::Button("Clear", ImVec2(half, 0))) applyMask(MaskOp::Clear);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Alt+M");
+        if (ImGui::Button("Blur", ImVec2(half, 0))) applyMask(MaskOp::Blur);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Alt+B");
+        ImGui::SameLine();
+        if (ImGui::Button("Sharpen", ImVec2(half, 0))) applyMask(MaskOp::Sharpen);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Alt+Shift+B");
+        ImGui::EndDisabled();
+        ImGui::SetNextItemWidth(-1);
+        ImGui::SliderInt("##maskSteps", &sculpt.maskFilterSteps, 1, 10, "blur/sharpen steps %d",
+                         ImGuiSliderFlags_AlwaysClamp);
+        ImGui::Checkbox("Show", &view.showMask);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(-1);
+        ImGui::SliderFloat("##maskOpacity", &view.maskOpacity, 0.1f, 1.0f, "opacity %.2f", ImGuiSliderFlags_AlwaysClamp);
+      }
 
       sectionHeader("Remesh");
       ImGui::SetNextItemWidth(-1);
@@ -210,18 +258,18 @@ void App::drawUi() {
       }
 
       sectionHeader("History");
-      ImGui::BeginDisabled(!undoStack.canUndo() || strokeActive());
+      ImGui::BeginDisabled(!undoStack.canUndo() || strokeActive() || remeshing());
       if (ImGui::Button("Undo")) undo();
       ImGui::EndDisabled();
       ImGui::SameLine();
-      ImGui::BeginDisabled(!undoStack.canRedo() || strokeActive());
+      ImGui::BeginDisabled(!undoStack.canRedo() || strokeActive() || remeshing());
       if (ImGui::Button("Redo")) redo();
       ImGui::EndDisabled();
       ImGui::SameLine();
       ImGui::TextDisabled("%.0f MB", static_cast<double>(undoStack.bytes()) / (1024.0 * 1024.0));
 
       ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-      ImGui::TextWrapped("Shift+drag: Smooth. Ctrl+drag: invert. [ ]: radius, hold F and move: radius.");
+      ImGui::TextWrapped("Shift+drag: Smooth. Ctrl+drag: invert. [ ]: radius, hold F and move: radius. M: mask.");
       ImGui::PopStyleColor();
     } else {
       sectionHeader("Transform");
@@ -356,6 +404,7 @@ void App::drawUi() {
     ImGui::Text("Input to frame  %.1f ms", stats.inputToFrameMs);
     const RenderStats& rs = renderStats();
     ImGui::Text("Uploads  %d full, %d partial", rs.fullUploads, rs.partialUploads);
+    if (stats.maskOpMs > 0.0) ImGui::Text("Last mask op  %.1f ms", stats.maskOpMs);
     ImGui::Text("Worker threads  %zu", workerCount());
     if (ImGui::Button("Bump under cursor (B)")) bumpUnderCursor();
     if (stats.partialTestMs > 0) {
@@ -374,7 +423,7 @@ void App::drawUi() {
   if (ImGui::Begin("Status", nullptr, panelFlags | ImGuiWindowFlags_NoScrollbar)) {
     ImGui::TextUnformatted(statusMessage.c_str());
     const char* hint = mode == Mode::Object ? "Object mode  |  Alt+drag navigate  |  G R S transform  |  Tab sculpt"
-                                            : "Sculpt mode  |  Alt+drag navigate  |  Tab object";
+                                            : "Sculpt mode  |  Alt+drag navigate  |  M mask  |  Tab object";
     const float w = ImGui::CalcTextSize(hint).x;
     ImGui::SameLine(std::max(ImGui::GetCursorPosX() + 20.0f, ImGui::GetWindowWidth() - w - 12.0f * scale));
     ImGui::TextDisabled("%s", hint);

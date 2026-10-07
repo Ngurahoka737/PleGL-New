@@ -187,6 +187,7 @@ std::string App::settingsText() const {
   w.put("brush.pressure", static_cast<int>(sculpt.pressure));
   w.put("brush.spacing", sculpt.spacing);
   w.put("symmetry.x", sculpt.symmetryX);
+  w.put("mask.filter_steps", sculpt.maskFilterSteps);
 
   w.put("view.matcap", view.matcap);
   w.put("view.wireframe", view.wireframe);
@@ -194,6 +195,8 @@ std::string App::settingsText() const {
   w.put("view.grid", view.grid);
   w.put("view.background_top", view.backgroundTop);
   w.put("view.background_bottom", view.backgroundBottom);
+  w.put("view.mask", view.showMask);
+  w.put("view.mask_opacity", view.maskOpacity);
 
   w.put("remesh.edge", remesh.voxelSize);
   w.put("remesh.optimize", remesh.optimizeQuads);
@@ -229,6 +232,8 @@ void App::applySettings(const std::string& text) {
   r.getEnum("brush.pressure", sculpt.pressure, 4);
   r.get("brush.spacing", sculpt.spacing);
   r.get("symmetry.x", sculpt.symmetryX);
+  r.get("mask.filter_steps", sculpt.maskFilterSteps);
+  sculpt.maskFilterSteps = std::clamp(sculpt.maskFilterSteps, 1, 10);
   sculpt.radiusPx = std::clamp(sculpt.radiusPx, 2.0f, 2000.0f);
   sculpt.spacing = std::clamp(sculpt.spacing, 0.01f, 1.0f);
 
@@ -238,7 +243,10 @@ void App::applySettings(const std::string& text) {
   r.get("view.grid", view.grid);
   r.get("view.background_top", view.backgroundTop);
   r.get("view.background_bottom", view.backgroundBottom);
+  r.get("view.mask", view.showMask);
+  r.get("view.mask_opacity", view.maskOpacity);
   view.matcap = std::max(view.matcap, 0);
+  view.maskOpacity = std::clamp(view.maskOpacity, 0.1f, 1.0f);
 
   r.get("remesh.edge", remesh.voxelSize);
   r.get("remesh.optimize", remesh.optimizeQuads);
