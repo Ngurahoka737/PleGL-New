@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <span>
 
 #include "mesh/Mesh.h"
@@ -34,19 +35,54 @@ struct Dab {
   Vec3 areaCenter{0.0f};              // Falloff-weighted mean position under the dab.
 };
 
-// What a brush may touch: the mesh positions (or, for mask brushes, mask values) owned by
-// `leaves`.
+// Face set limits on a stroke, on top of the mask. Off (the default) it costs nothing; on, it
+// walks the faces around each vertex inside the dab.
+struct FaceSetFilter {
+  // Mesh::faceSets data while any limit below is on, otherwise nullptr. Refreshed every dab.
+  const std::int32_t* faceSets = nullptr;
+  bool skipHidden = false;      // Vertices with no visible face stay put.
+  std::int32_t onlySet = 0;     // > 0: only vertices touching a visible face of this set move.
+  bool lockBoundaries = false;  // Vertices where face sets meet stay put.
+
+  // True if the brush may change vertex v.
+  bool allows(const Mesh& m, Index v) const {
+    if (!faceSets) return true;
+    bool visible = false, inSet = false, mixed = false;
+    std::int32_t first = 0;
+    m.forEachOutgoing(v, [&](Index h) {
+      const std::int32_t value = faceSets[m.heFace[h]];
+      const std::int32_t id = faceSetId(value);
+      visible |= value > 0;
+      inSet |= value > 0 && id == onlySet;
+      mixed |= first != 0 && id != first;
+      if (first == 0) first = id;
+    });
+    if (first == 0) return false;  // No faces.
+    return (!skipHidden || visible) && (onlySet <= 0 || inSet) && (!lockBoundaries || !mixed);
+  }
+  // True if a face set brush may repaint face f.
+  bool allowsFace(Index f) const {
+    return !faceSets || ((!skipHidden || faceSets[f] > 0) && (onlySet <= 0 || faceSets[f] == onlySet));
+  }
+};
+
+// What a brush may touch: the mesh positions (or, for mask brushes, mask values, and for face set
+// brushes, face sets) owned by `leaves`.
 struct BrushContext {
   Mesh& mesh;
   const Bvh& bvh;
   std::span<const Index> leaves;  // Leaves whose bounds intersect the dab sphere.
   const Dab& dab;
+  FaceSetFilter filter;
+  std::int32_t paintFaceSet = kDefaultFaceSet;  // The set a face set brush paints.
 };
 
 // A brush moves vertices; it never changes topology, normals or bounds. The sculptor recomputes
 // those, records undo and marks GPU ranges afterwards, so new brushes only implement apply().
-// Moving brushes scale their effect by (1 - mask), so fully masked vertices never move. Mask
-// brushes (editsMask() true) change only Mesh::mask, which the sculptor allocates beforehand.
+// Moving brushes scale their effect by (1 - mask), so fully masked vertices never move, and leave
+// vertices the face set filter refuses alone. Mask brushes (editsMask() true) change only
+// Mesh::mask, which the sculptor allocates beforehand; face set brushes (editsFaceSets() true)
+// only Mesh::faceSets, likewise allocated.
 //
 // Contract: only vertices inside the dab sphere move, and none moves farther than kMaxDabMove
 // radius in one dab, so none ends up beyond 1.25 radius from the centre (the sculptor finds
@@ -59,6 +95,8 @@ class Brush {
   virtual bool needsArea() const { return false; }
   // True if apply() writes Mesh::mask instead of positions.
   virtual bool editsMask() const { return false; }
+  // True if apply() writes Mesh::faceSets instead of positions.
+  virtual bool editsFaceSets() const { return false; }
   virtual void apply(BrushContext& ctx) const = 0;
 };
 
@@ -129,6 +167,16 @@ class MaskSmoothBrush final : public Brush {
  public:
   const char* name() const override { return "Smooth Mask"; }
   bool editsMask() const override { return true; }
+  void apply(BrushContext& ctx) const override;
+};
+
+// Paints BrushContext::paintFaceSet onto the visible faces whose centre lies inside the dab, as
+// far out as the falloff stays above 1 - strength (so a light touch paints a thinner line). Faces
+// that are mostly masked keep their set.
+class FaceSetBrush final : public Brush {
+ public:
+  const char* name() const override { return "Face Set"; }
+  bool editsFaceSets() const override { return true; }
   void apply(BrushContext& ctx) const override;
 };
 

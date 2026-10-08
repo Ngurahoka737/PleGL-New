@@ -158,8 +158,10 @@ std::vector<Index> Mesh::reorder(std::span<const Index> faceOrder) {
     newVert[h] = vertMap[heVert[o]];
   }
   std::vector<Index> newFaceHe(nf);
+  std::vector<std::int32_t> newFaceSets(faceSets.size() == faceHe.size() ? nf : 0);
   for (Index f = 0; f < nf; ++f) {
     newFaceHe[f] = heMap[faceHe[faceOrder[f]]];
+    if (!newFaceSets.empty()) newFaceSets[f] = faceSets[faceOrder[f]];
     Index h = newFaceHe[f];
     do {
       newFace[h] = f;
@@ -181,6 +183,7 @@ std::vector<Index> Mesh::reorder(std::span<const Index> faceOrder) {
   positions = std::move(newPos);
   normals = std::move(newNrm);
   mask = std::move(newMask);
+  faceSets = std::move(newFaceSets);
   vertHe = std::move(newVertHe);
   faceHe = std::move(newFaceHe);
   heNext = std::move(newNext);
@@ -200,6 +203,7 @@ void Mesh::reserveHeadroom(Index vertices, Index faces, Index halfEdges) {
   if (!mask.empty()) mask.reserve(nv);
   vertHe.reserve(nv);
   faceHe.reserve(nf);
+  if (!faceSets.empty()) faceSets.reserve(nf);
   heNext.reserve(nh);
   heTwin.reserve(nh);
   heVert.reserve(nh);
@@ -210,6 +214,7 @@ bool Mesh::hasHeadroom(Index vertices, Index faces, Index halfEdges) const {
   auto fits = [](const auto& v, Index n) { return v.size() + static_cast<std::size_t>(n) <= v.capacity(); };
   return fits(positions, vertices) && (normals.empty() || fits(normals, vertices)) &&
          (mask.empty() || fits(mask, vertices)) && fits(vertHe, vertices) && fits(faceHe, faces) &&
+         (faceSets.empty() || fits(faceSets, faces)) &&
          fits(heNext, halfEdges) && fits(heTwin, halfEdges) && fits(heVert, halfEdges) && fits(heFace, halfEdges);
 }
 
@@ -218,6 +223,46 @@ bool Mesh::anyMasked() const {
     if (v > 0.0f) return true;
   }
   return false;
+}
+
+bool Mesh::anyFaceSet() const {
+  for (std::size_t f = 0; f < faceSets.size(); ++f) {
+    if (faceSetId(faceSets[f]) != kDefaultFaceSet && faceHe[f] != kInvalid) return true;
+  }
+  return false;
+}
+
+bool Mesh::anyHidden() const {
+  for (std::size_t f = 0; f < faceSets.size(); ++f) {
+    if (faceSets[f] < 0 && faceHe[f] != kInvalid) return true;
+  }
+  return false;
+}
+
+bool Mesh::hasFaceSetData() const {
+  for (std::size_t f = 0; f < faceSets.size(); ++f) {
+    if (faceSets[f] != kDefaultFaceSet && faceHe[f] != kInvalid) return true;
+  }
+  return false;
+}
+
+std::int32_t Mesh::maxFaceSetId() const {
+  std::int32_t id = kDefaultFaceSet;
+  for (std::size_t f = 0; f < faceSets.size(); ++f) {
+    if (faceHe[f] != kInvalid) id = std::max(id, faceSetId(faceSets[f]));
+  }
+  return id;
+}
+
+bool Mesh::vertexVisible(Index v) const {
+  if (vertHe[v] == kInvalid) return false;
+  if (faceSets.empty()) return true;
+  bool visible = false;
+  forEachOutgoing(v, [&](Index h) {
+    const Index f = heFace[h];
+    visible |= f != kInvalid && faceSets[f] > 0;
+  });
+  return visible;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -422,6 +467,10 @@ ValidationResult validateImpl(const Mesh& m, bool live) {
   if (!m.mask.empty() && static_cast<Index>(m.mask.size()) != nv) return fail("mask size mismatch");
   for (Index v = 0; v < static_cast<Index>(m.mask.size()); ++v) {
     if (!(m.mask[v] >= 0.0f && m.mask[v] <= 1.0f)) return fail("mask out of range at vertex " + std::to_string(v));
+  }
+  if (!m.faceSets.empty() && static_cast<Index>(m.faceSets.size()) != nf) return fail("face set size mismatch");
+  for (Index f = 0; f < static_cast<Index>(m.faceSets.size()); ++f) {
+    if (m.faceSets[f] == 0 && (!live || m.faceHe[f] != kInvalid)) return fail("face set 0 at face " + std::to_string(f));
   }
   if (static_cast<Index>(m.heTwin.size()) != nh || static_cast<Index>(m.heVert.size()) != nh ||
       static_cast<Index>(m.heFace.size()) != nh)

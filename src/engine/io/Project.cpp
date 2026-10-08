@@ -23,6 +23,8 @@ constexpr std::uint32_t kTagSettings = tag("SETT");
 constexpr std::uint32_t kTagObjects = tag("OBJS");
 constexpr std::uint32_t kTagMask = tag("MASK");
 constexpr std::uint8_t kMaskEncodingF32 = 0;
+constexpr std::uint32_t kTagFaceSets = tag("FSET");
+constexpr std::uint8_t kFaceSetEncodingI32 = 0;
 constexpr std::uint32_t kTagEnd = tag("END ");
 
 class Writer {
@@ -209,6 +211,44 @@ bool readMasks(Reader& r, std::size_t size, std::vector<ProjectObject>& objects,
   return true;
 }
 
+void writeFaceSets(Writer& w, const Scene& scene) {
+  std::vector<std::uint32_t> withSets;
+  for (std::size_t i = 0; i < scene.objects().size(); ++i)
+    if (scene.objects()[i]->mesh.hasFaceSetData()) withSets.push_back(static_cast<std::uint32_t>(i));
+  if (withSets.empty()) return;
+  const std::size_t at = w.beginChunk(kTagFaceSets);
+  w.put(static_cast<std::uint32_t>(withSets.size()));
+  for (std::uint32_t i : withSets) {
+    const Mesh& m = scene.objects()[i]->mesh;
+    w.put(i);
+    w.put(static_cast<std::uint32_t>(m.faceSets.size()));
+    w.put(kFaceSetEncodingI32);
+    w.putArray(m.faceSets.data(), m.faceSets.size());
+  }
+  w.endChunk(at);
+}
+
+// Attaches the face sets of an FSET chunk to the parsed objects. The face count is compared with
+// the built mesh, which is what the values are indexed by.
+bool readFaceSets(Reader& r, std::size_t size, std::vector<ProjectObject>& objects, std::string* error) {
+  const auto count = r.get<std::uint32_t>();
+  if (!r.ok() || count > size) return setError(error, "The face set data is damaged.");
+  for (std::uint32_t k = 0; k < count; ++k) {
+    const auto index = r.get<std::uint32_t>();
+    const auto faceCount = r.get<std::uint32_t>();
+    const auto encoding = r.get<std::uint8_t>();
+    if (!r.ok() || index >= objects.size() || encoding != kFaceSetEncodingI32 ||
+        faceCount != std::uint32_t(objects[index].mesh.faceCount()))
+      return setError(error, "The face set data is damaged.");
+    std::vector<std::int32_t> values;
+    if (!r.getArray(values, faceCount)) return setError(error, "The face set data is cut off.");
+    for (std::int32_t v : values)
+      if (v == 0 || v == INT32_MIN) return setError(error, "The face set data is damaged.");
+    objects[index].mesh.faceSets = std::move(values);
+  }
+  return true;
+}
+
 }  // namespace
 
 std::uint32_t crc32(const std::uint8_t* data, std::size_t size, std::uint32_t crc) {
@@ -228,10 +268,11 @@ std::uint32_t crc32(const std::uint8_t* data, std::size_t size, std::uint32_t cr
 
 std::vector<std::uint8_t> serializeProject(const Scene& scene, const std::string& settings) {
   Writer w;
-  std::size_t total = 64 + 16 + settings.size();  // 16: MASK chunk header and count.
+  std::size_t total = 64 + 32 + settings.size();  // 32: MASK and FSET chunk headers and counts.
   for (const auto& obj : scene.objects())
     total += 64 + obj->name.size() + obj->mesh.positions.size() * 12 + std::size_t(obj->mesh.faceCount()) * 4 +
-             std::size_t(obj->mesh.halfEdgeCount()) * 4 + (obj->mesh.mask.empty() ? 0 : 9 + obj->mesh.mask.size() * 4);
+             std::size_t(obj->mesh.halfEdgeCount()) * 4 + (obj->mesh.mask.empty() ? 0 : 9 + obj->mesh.mask.size() * 4) +
+             (obj->mesh.faceSets.empty() ? 0 : 9 + obj->mesh.faceSets.size() * 4);
   w.bytes.reserve(total);
 
   w.putArray(kMagic, sizeof(kMagic));
@@ -244,6 +285,7 @@ std::vector<std::uint8_t> serializeProject(const Scene& scene, const std::string
   for (const auto& obj : scene.objects()) writeObject(w, *obj);
   w.endChunk(at);
   writeMasks(w, scene);
+  writeFaceSets(w, scene);
   const std::uint32_t crc = crc32(w.bytes.data(), w.bytes.size());
   at = w.beginChunk(kTagEnd);
   w.put(crc);
@@ -267,6 +309,8 @@ std::optional<Project> parseProject(const std::uint8_t* data, std::size_t size, 
   bool sawObjects = false;
   const std::uint8_t* maskData = nullptr;  // Applied after the loop, once the objects exist.
   std::size_t maskSize = 0;
+  const std::uint8_t* faceSetData = nullptr;
+  std::size_t faceSetSize = 0;
   for (;;) {
     const std::uint8_t* chunkStart = r.position();
     const auto t = r.get<std::uint32_t>();
@@ -300,6 +344,9 @@ std::optional<Project> parseProject(const std::uint8_t* data, std::size_t size, 
     } else if (t == kTagMask) {
       maskData = chunk.position();
       maskSize = std::size_t(chunkSize);
+    } else if (t == kTagFaceSets) {
+      faceSetData = chunk.position();
+      faceSetSize = std::size_t(chunkSize);
     }
     // Unknown chunks are skipped.
   }
@@ -310,6 +357,10 @@ std::optional<Project> parseProject(const std::uint8_t* data, std::size_t size, 
   if (maskData) {
     Reader masks(maskData, maskSize);
     if (!readMasks(masks, maskSize, project.objects, error)) return std::nullopt;
+  }
+  if (faceSetData) {
+    Reader faceSets(faceSetData, faceSetSize);
+    if (!readFaceSets(faceSets, faceSetSize, project.objects, error)) return std::nullopt;
   }
   return project;
 }

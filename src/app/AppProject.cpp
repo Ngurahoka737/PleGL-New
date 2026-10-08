@@ -188,6 +188,8 @@ std::string App::settingsText() const {
   w.put("brush.spacing", sculpt.spacing);
   w.put("symmetry.x", sculpt.symmetryX);
   w.put("mask.filter_steps", sculpt.maskFilterSteps);
+  w.put("face_sets.automask", sculpt.faceSetAutoMask);
+  w.put("face_sets.lock_borders", sculpt.lockFaceSetBorders);
   w.put("dyntopo.enabled", sculpt.dyntopo);
   w.put("dyntopo.refine", static_cast<int>(sculpt.dyntopoRefine));
   w.put("dyntopo.detail_mode", static_cast<int>(sculpt.detailMode));
@@ -202,6 +204,8 @@ std::string App::settingsText() const {
   w.put("view.background_bottom", view.backgroundBottom);
   w.put("view.mask", view.showMask);
   w.put("view.mask_opacity", view.maskOpacity);
+  w.put("view.face_sets", view.showFaceSets);
+  w.put("view.face_set_opacity", view.faceSetOpacity);
 
   w.put("remesh.edge", remesh.voxelSize);
   w.put("remesh.optimize", remesh.optimizeQuads);
@@ -238,6 +242,8 @@ void App::applySettings(const std::string& text) {
   r.get("brush.spacing", sculpt.spacing);
   r.get("symmetry.x", sculpt.symmetryX);
   r.get("mask.filter_steps", sculpt.maskFilterSteps);
+  r.get("face_sets.automask", sculpt.faceSetAutoMask);
+  r.get("face_sets.lock_borders", sculpt.lockFaceSetBorders);
   sculpt.maskFilterSteps = std::clamp(sculpt.maskFilterSteps, 1, 10);
   sculpt.radiusPx = std::clamp(sculpt.radiusPx, 2.0f, 2000.0f);
   sculpt.spacing = std::clamp(sculpt.spacing, 0.01f, 1.0f);
@@ -257,8 +263,11 @@ void App::applySettings(const std::string& text) {
   r.get("view.background_bottom", view.backgroundBottom);
   r.get("view.mask", view.showMask);
   r.get("view.mask_opacity", view.maskOpacity);
+  r.get("view.face_sets", view.showFaceSets);
+  r.get("view.face_set_opacity", view.faceSetOpacity);
   view.matcap = std::max(view.matcap, 0);
   view.maskOpacity = std::clamp(view.maskOpacity, 0.1f, 1.0f);
+  view.faceSetOpacity = std::isfinite(view.faceSetOpacity) ? std::clamp(view.faceSetOpacity, 0.1f, 1.0f) : 0.6f;
 
   r.get("remesh.edge", remesh.voxelSize);
   r.get("remesh.optimize", remesh.optimizeQuads);

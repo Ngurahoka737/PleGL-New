@@ -72,6 +72,11 @@ cmake --build --preset engine-only
 | Invert mask | Ctrl + I (di Sculpt mode) |
 | Hapus semua mask / mask semua | Alt + M / Alt + Shift + M (di kedua mode) |
 | Blur / Sharpen mask | Alt + B / Alt + Shift + B (di kedua mode) |
+| Brush Face Set | P (setiap stroke mengecat set baru, Ctrl + drag memperluas set di bawah cursor) |
+| Sembunyikan face set di bawah cursor | H (di Sculpt mode) |
+| Tampilkan hanya face set di bawah cursor | Shift + H (tekan lagi untuk menampilkan semua) |
+| Tampilkan semua yang tersembunyi | Alt + H (di kedua mode) |
+| Mask face set di bawah cursor | Shift + M (di Sculpt mode) |
 | Radius brush | [ dan ], atau tahan F lalu geser mouse ke samping |
 | Dynamic topology on/off | Ctrl + D (di Sculpt mode) |
 | Ukuran detail dynamic topology | Tahan R lalu geser mouse ke samping (di Sculpt mode) |
@@ -93,7 +98,7 @@ src/engine/   Library engine tanpa UI (diuji headless)
   spatial/    BVH (node daun = unit kerja engine), raycast, query bola, titik terdekat
   io/         Import dan export OBJ, project file .psculpt
   scene/      Objek, transform, picking
-  sculpt/     Brush, stroke sampler, sculptor (dab, simetri), dynamic topology, operasi mask, undo per daun BVH
+  sculpt/     Brush, stroke sampler, sculptor (dab, simetri), dynamic topology, operasi mask dan face set, undo per daun BVH
   render/     Indeks gambar per daun BVH (tanpa OpenGL, diuji headless)
   remesh/     Grid voxel (SDF), Surface Nets quad, voxel remesh, quad remesh
 src/app/      Aplikasi: SDL3, renderer OpenGL, kamera, UI

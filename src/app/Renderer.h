@@ -23,6 +23,8 @@ struct ViewSettings {
   Vec3 backgroundBottom{0.11f, 0.11f, 0.13f};
   bool showMask = true;
   float maskOpacity = 0.7f;  // How dark fully masked areas are drawn.
+  bool showFaceSets = true;
+  float faceSetOpacity = 0.6f;  // How strongly face set colours tint the surface.
 };
 
 struct ViewportRect {
@@ -43,6 +45,7 @@ struct RenderStats {
   int indexBlockUploads = 0;       // Leaf index blocks rewritten this frame (dynamic topology).
   int bufferGrowths = 0;           // GPU buffers that ran out of room and were enlarged this frame.
   int drawRuns = 0;                // Index ranges drawn for triangles (1 when the mesh is at rest).
+  int faceSetUploads = 0;          // Face set ranges uploaded this frame.
 };
 
 class Renderer {
@@ -54,9 +57,10 @@ class Renderer {
   void shutdown();
 
   // Uploads changed meshes: full rebuild on topology change, per-leaf ranges otherwise. During a
-  // dynamic topology stroke it rewrites the index blocks of the leaves whose faces changed.
-  // Consumes each object's dirty geometry, mask and topology ranges. Edge (wireframe) indices
-  // are only kept up to date while `wireframe` is on and rebuilt when it is turned on.
+  // dynamic topology stroke, or after faces were hidden or shown, it rewrites the index blocks of
+  // the leaves whose triangles changed. Consumes each object's dirty geometry, mask, face set and
+  // topology ranges. Edge (wireframe) indices are only kept up to date while `wireframe` is on and
+  // rebuilt when it is turned on.
   void sync(Scene& scene, bool wireframe);
 
   void render(const Scene& scene, const Camera& camera, const ViewportRect& rect, const ViewSettings& settings,
@@ -65,21 +69,34 @@ class Renderer {
   const RenderStats& stats() const { return stats_; }
 
  private:
+  // glMultiDrawElementsIndirect's command layout.
+  struct DrawCommand {
+    GLuint count, instanceCount, firstIndex, baseVertex, baseInstance;
+  };
   // An index buffer split into per-leaf blocks, drawn with one (multi-)draw call.
   struct IndexBuffer {
     GLuint buffer = 0;
     std::uint32_t capacity = 0;  // In indices.
     LeafIndexBlocks blocks;
-    std::vector<GLsizei> counts;         // Runs to draw, rebuilt when blocks change.
-    std::vector<const void*> offsets;
+    std::vector<GLsizei> counts{};       // Runs to draw, rebuilt when blocks change.
+    std::vector<const void*> offsets{};
     bool runsStale = true;
   };
+  // Triangles are drawn with one indirect command per run. Command i has baseInstance i, so the
+  // per-instance attribute that reads the commands' firstIndex fields gives every run its own first
+  // index; the fragment shader adds gl_PrimitiveID (which restarts with every command) to find the
+  // triangle's slot in the face set buffer. Triangle blocks start on whole triangles for this.
   struct GpuMesh {
     GLuint vao = 0, positions = 0, normals = 0, mask = 0;
     std::uint32_t vertexCapacity = 0;  // Vertices the buffers have room for; strokes append more.
-    IndexBuffer triangles, edges;
-    bool edgesValid = false;  // Edge blocks are kept up to date only while the wireframe is shown.
-    bool maskOnGpu = false;   // The mask buffer may hold non-zero values.
+    IndexBuffer triangles{.blocks = LeafIndexBlocks(3)}, edges;
+    GLuint commands = 0;               // DrawCommand per triangle run, also vertex binding 3.
+    std::uint32_t commandCapacity = 0;
+    GLuint faceSets = 0;               // Face set per triangle slot (index / 3); shader storage.
+    std::uint32_t faceSetSlots = 0;
+    bool edgesValid = false;     // Edge blocks are kept up to date only while the wireframe is shown.
+    bool maskOnGpu = false;      // The mask buffer may hold non-zero values.
+    bool faceSetsOnGpu = false;  // The face set buffer matches the triangles; else a stand-in.
     std::uint64_t topologyVersion = 0;
   };
 
@@ -90,7 +107,11 @@ class Renderer {
   void ensureVertexCapacity(GpuMesh& gpu, std::uint32_t vertices);
   void growIndexBuffer(GpuMesh& gpu, IndexBuffer& ib, std::uint32_t indices);
   void syncMask(GpuMesh& gpu, SceneObject& object);
+  void uploadFaceSets(GpuMesh& gpu, const SceneObject& object);
+  void syncFaceSets(GpuMesh& gpu, SceneObject& object);
+  void uploadCommands(GpuMesh& gpu);
   void draw(const IndexBuffer& ib, GLenum mode);
+  void drawTriangles(const GpuMesh& gpu);
   void destroy(GpuMesh& gpu);
 
   GLuint meshProgram_ = 0, lineProgram_ = 0, backgroundProgram_ = 0;
@@ -101,6 +122,8 @@ class Renderer {
   GLuint cursorVao_ = 0, cursorVbo_ = 0;
   std::unordered_map<std::uint32_t, GpuMesh> meshes_;
   std::vector<std::uint32_t> scratch_;
+  std::vector<std::int32_t> faceSetScratch_;
+  std::vector<DrawCommand> commandScratch_;
   RenderStats stats_;
 };
 

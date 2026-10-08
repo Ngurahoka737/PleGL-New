@@ -12,8 +12,9 @@
 
 namespace plegl {
 
-// One sculpt stroke or mask edit: only the leaves it touched, before and after. A stroke over a
-// 1M vertex mesh that touches 20 leaves stores about 20 * 1024 vertices, not the whole mesh.
+// One sculpt stroke, mask edit or face set edit: only the leaves it touched, before and after. A
+// stroke over a 1M vertex mesh that touches 20 leaves stores about 20 * 1024 vertices, not the
+// whole mesh.
 struct SculptUndo {
   std::string label;
   std::uint32_t objectId = 0;

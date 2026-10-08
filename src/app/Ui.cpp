@@ -142,6 +142,22 @@ void App::drawUi() {
       ImGui::MenuItem("Show Mask", nullptr, &view.showMask);
       ImGui::EndMenu();
     }
+    if (ImGui::BeginMenu("Face Sets")) {
+      const bool can = canEditMask();
+      if (ImGui::MenuItem("Face Set from Mask", nullptr, false, can)) applyFaceSets(FaceSetOp::FromMask);
+      if (ImGui::MenuItem("Face Sets from Loose Parts", nullptr, false, can)) applyFaceSets(FaceSetOp::FromLooseParts);
+      if (ImGui::MenuItem("Clear Face Sets", nullptr, false, can)) applyFaceSets(FaceSetOp::Clear);
+      ImGui::Separator();
+      if (ImGui::MenuItem("Reveal All", "Alt+H", false, can)) applyFaceSets(FaceSetOp::RevealAll);
+      if (ImGui::MenuItem("Invert Visibility", nullptr, false, can)) applyFaceSets(FaceSetOp::InvertVisibility);
+      // These act on the set under the cursor, which the menu covers, so they are keys only.
+      ImGui::MenuItem("Hide Set Under Cursor", "H", false, false);
+      ImGui::MenuItem("Show Only Set Under Cursor", "Shift+H", false, false);
+      ImGui::MenuItem("Mask Set Under Cursor", "Shift+M", false, false);
+      ImGui::Separator();
+      ImGui::MenuItem("Show Face Sets", nullptr, &view.showFaceSets);
+      ImGui::EndMenu();
+    }
     if (ImGui::BeginMenu("View")) {
       ImGui::MenuItem("Wireframe", nullptr, &view.wireframe);
       ImGui::MenuItem("Grid", nullptr, &view.grid);
@@ -162,10 +178,14 @@ void App::drawUi() {
       ImGui::Separator();
       ImGui::TextUnformatted("Alt + M             Clear mask (Alt+Shift+M: mask all)");
       ImGui::TextUnformatted("Alt + B             Blur mask (Alt+Shift+B: sharpen)");
+      ImGui::TextUnformatted("Alt + H             Reveal all hidden faces");
       ImGui::Separator();
       ImGui::TextUnformatted("Sculpt mode:");
       ImGui::TextUnformatted("M                   Mask brush (Ctrl+drag erases, Shift+drag smooths)");
       ImGui::TextUnformatted("Ctrl + I            Invert mask");
+      ImGui::TextUnformatted("P                   Face Set brush (Ctrl+drag grows the set under it)");
+      ImGui::TextUnformatted("H / Shift + H       Hide / show only the face set under the cursor");
+      ImGui::TextUnformatted("Shift + M           Mask the face set under the cursor");
       ImGui::TextUnformatted("Ctrl + D            Dynamic topology on / off");
       ImGui::TextUnformatted("F / R + move        Brush radius / detail size");
       ImGui::EndMenu();
@@ -198,7 +218,7 @@ void App::drawUi() {
         if (i % 2 == 1) ImGui::SameLine();
         const bool active = static_cast<int>(sculpt.brush) == i;
         if (active) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
-        if (ImGui::Button(kBrushNames[i], ImVec2(bw, 0))) sculpt.brush = static_cast<BrushKind>(i);
+        if (ImGui::Button(kBrushLabels[i], ImVec2(bw, 0))) sculpt.brush = static_cast<BrushKind>(i);
         if (active) ImGui::PopStyleColor();
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Shortcut: %s", kBrushKeys[i]);
       }
@@ -211,6 +231,11 @@ void App::drawUi() {
       if (sculpt.brush == BrushKind::Mask) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
         ImGui::TextWrapped("Masked areas are protected from every brush. Ctrl+drag: erase. Shift+drag: smooth mask.");
+        ImGui::PopStyleColor();
+      } else if (sculpt.brush == BrushKind::FaceSet) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextWrapped("Each stroke paints a new face set. Ctrl+drag: grow the set under the cursor. "
+                           "Lower strength paints a smaller core.");
         ImGui::PopStyleColor();
       } else if (sculpt.brush != BrushKind::Smooth && sculpt.brush != BrushKind::Grab) {
         int inv = sculpt.invert ? 1 : 0;
@@ -259,9 +284,10 @@ void App::drawUi() {
       ImGui::SetNextItemWidth(-1);
       if (ImGui::Combo("##refine", &rm, kRefine, 3)) sculpt.dyntopoRefine = static_cast<DyntopoRefine>(rm);
       ImGui::EndDisabled();
-      if (sculpt.dyntopo && (sculpt.brush == BrushKind::Grab || sculpt.brush == BrushKind::Mask)) {
+      if (sculpt.dyntopo && (sculpt.brush == BrushKind::Grab || sculpt.brush == BrushKind::Mask ||
+                             sculpt.brush == BrushKind::FaceSet)) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-        ImGui::TextWrapped("%s does not change topology.", kBrushNames[static_cast<int>(sculpt.brush)]);
+        ImGui::TextWrapped("%s does not change topology.", kBrushLabels[static_cast<int>(sculpt.brush)]);
         ImGui::PopStyleColor();
       }
 
@@ -287,6 +313,37 @@ void App::drawUi() {
         ImGui::SameLine();
         ImGui::SetNextItemWidth(-1);
         ImGui::SliderFloat("##maskOpacity", &view.maskOpacity, 0.1f, 1.0f, "opacity %.2f", ImGuiSliderFlags_AlwaysClamp);
+      }
+
+      sectionHeader("Face sets");
+      {
+        ImGui::Checkbox("Limit to one set", &sculpt.faceSetAutoMask);
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("Every brush changes only the face set where the stroke starts.");
+        ImGui::Checkbox("Keep set borders", &sculpt.lockFaceSetBorders);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Vertices where face sets meet do not move.");
+        const float half = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+        ImGui::BeginDisabled(!canEditMask());
+        if (ImGui::Button("From Mask", ImVec2(half, 0))) applyFaceSets(FaceSetOp::FromMask);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+          ImGui::SetTooltip("Masked faces become a new face set.");
+        ImGui::SameLine();
+        if (ImGui::Button("Loose Parts", ImVec2(half, 0))) applyFaceSets(FaceSetOp::FromLooseParts);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+          ImGui::SetTooltip("Every separate piece gets its own face set.");
+        if (ImGui::Button("Reveal All", ImVec2(half, 0))) applyFaceSets(FaceSetOp::RevealAll);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+          ImGui::SetTooltip("Alt+H. H hides the set under the cursor, Shift+H shows only it.");
+        ImGui::SameLine();
+        if (ImGui::Button("Clear##faceSets", ImVec2(half, 0))) applyFaceSets(FaceSetOp::Clear);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+          ImGui::SetTooltip("Every face back in one set. Hidden faces stay hidden.");
+        ImGui::EndDisabled();
+        ImGui::Checkbox("Show##faceSets", &view.showFaceSets);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(-1);
+        ImGui::SliderFloat("##faceSetOpacity", &view.faceSetOpacity, 0.1f, 1.0f, "opacity %.2f",
+                           ImGuiSliderFlags_AlwaysClamp);
       }
 
       sectionHeader("Remesh");
@@ -335,7 +392,8 @@ void App::drawUi() {
       ImGui::TextDisabled("%.0f MB", static_cast<double>(undoStack.bytes()) / (1024.0 * 1024.0));
 
       ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-      ImGui::TextWrapped("Shift+drag: Smooth. Ctrl+drag: invert. [ ]: radius, hold F and move: radius. M: mask.");
+      ImGui::TextWrapped("Shift+drag: Smooth. Ctrl+drag: invert. [ ]: radius, hold F and move: radius. M: mask. "
+                         "H: hide face set.");
       ImGui::PopStyleColor();
     } else {
       sectionHeader("Transform");
@@ -479,7 +537,7 @@ void App::drawUi() {
         ImGui::Text("  faces %d -> %d, end %.1f ms", ts.facesBefore, ts.facesAfter, ts.consolidateMs);
       }
     }
-    if (stats.maskOpMs > 0.0) ImGui::Text("Last mask op  %.1f ms", stats.maskOpMs);
+    if (stats.maskOpMs > 0.0) ImGui::Text("Last mask/set op  %.1f ms", stats.maskOpMs);
     ImGui::Text("Worker threads  %zu", workerCount());
     if (ImGui::Button("Bump under cursor (B)")) bumpUnderCursor();
     if (stats.partialTestMs > 0) {
@@ -498,7 +556,7 @@ void App::drawUi() {
   if (ImGui::Begin("Status", nullptr, panelFlags | ImGuiWindowFlags_NoScrollbar)) {
     ImGui::TextUnformatted(statusMessage.c_str());
     const char* hint = mode == Mode::Object ? "Object mode  |  Alt+drag navigate  |  G R S transform  |  Tab sculpt"
-                                            : "Sculpt mode  |  Alt+drag navigate  |  M mask  |  Ctrl+D dyntopo  |  Tab object";
+                                            : "Sculpt mode  |  Alt+drag navigate  |  M mask  |  H hide  |  Ctrl+D dyntopo  |  Tab object";
     const float w = ImGui::CalcTextSize(hint).x;
     ImGui::SameLine(std::max(ImGui::GetCursorPosX() + 20.0f, ImGui::GetWindowWidth() - w - 12.0f * scale));
     ImGui::TextDisabled("%s", hint);
