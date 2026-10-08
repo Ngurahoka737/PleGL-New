@@ -365,11 +365,12 @@ void App::handleShortcut(const SDL_KeyboardEvent& key) {
       break;
   }
   if ((key.mod & SDL_KMOD_ALT) != 0) {
-    // Mask operations work in both modes, like the Mask menu. Alt is the navigation modifier, so
-    // no other Alt+key does anything.
+    // Mask and visibility operations work in both modes, like their menus. Alt is the navigation
+    // modifier, so no other Alt+key does anything.
     switch (key.key) {
       case SDLK_M: applyMask(shift ? MaskOp::Fill : MaskOp::Clear); break;
       case SDLK_B: applyMask(shift ? MaskOp::Sharpen : MaskOp::Blur); break;
+      case SDLK_H: applyFaceSets(FaceSetOp::RevealAll); break;
       default: break;
     }
     return;
@@ -377,7 +378,12 @@ void App::handleShortcut(const SDL_KeyboardEvent& key) {
   if (mode == Mode::Sculpt) {
     switch (key.key) {
       case SDLK_D: sculpt.brush = BrushKind::Draw; break;
-      case SDLK_M: sculpt.brush = BrushKind::Mask; break;
+      case SDLK_M:
+        if (shift) maskFaceSetUnderCursor();
+        else sculpt.brush = BrushKind::Mask;
+        break;
+      case SDLK_P: sculpt.brush = BrushKind::FaceSet; break;
+      case SDLK_H: faceSetOpUnderCursor(shift ? FaceSetOp::Isolate : FaceSetOp::Hide); break;
       case SDLK_C: sculpt.brush = shift ? BrushKind::Crease : BrushKind::Clay; break;
       case SDLK_S: sculpt.brush = BrushKind::Smooth; break;
       case SDLK_G: sculpt.brush = BrushKind::Grab; break;
@@ -419,6 +425,11 @@ void App::updateHover() {
   hover_ = scene.pick(ray);
   const double us = t.us();
   stats.raycastUs = stats.raycastUs == 0.0 ? us : stats.raycastUs * 0.9 + us * 0.1;
+}
+
+std::optional<ScenePick> App::pickUnderMouse() const {
+  if (!mouseInViewport_ || ImGui::GetIO().WantCaptureMouse) return std::nullopt;
+  return scene.pick(camera.rayThroughPixel(mouseX_ - vpX_, mouseY_ - vpY_));
 }
 
 void App::drawGizmo() {
@@ -564,8 +575,12 @@ void App::beginStroke(float x, float y, std::uint64_t timestampNs) {
   opts.strength = sculpt.strength[static_cast<int>(strokeBrush_)];
   // The Mask brush ignores Add/Subtract: it paints, and erases with Ctrl or the pen's eraser end.
   opts.invert = masking ? ctrl || (pen.down && pen.eraser) : sculpt.invert != ctrl;
-  opts.dyntopo = sculpt.dyntopo;  // The sculptor ignores it for Grab and Mask.
+  opts.dyntopo = sculpt.dyntopo;  // The sculptor ignores it for Grab, Mask and Face Set.
   opts.dyntopoOptions.refine = sculpt.dyntopoRefine;
+  opts.faceSetAutoMask = sculpt.faceSetAutoMask;
+  opts.lockFaceSetBoundaries = sculpt.lockFaceSetBorders;
+  // The Face Set brush starts a new set per stroke; Ctrl grows the set under the cursor instead.
+  opts.extendFaceSet = ctrl;
   if (strokeBrush_ == BrushKind::Grab) {
     // Grab captures once at the press; pressure only scales the radius here.
     const float p = currentPressure();
@@ -626,7 +641,7 @@ void App::applySamples(std::uint64_t timestampNs) {
     const Ray world = camera.rayThroughPixel(smp.x, smp.y);
     Ray local{Vec3(inv * Vec4(world.origin, 1.0f)), Vec3(inv * Vec4(world.dir, 0.0f))};
     RayHit hit;
-    if (!obj->bvh.raycast(obj->mesh, local, hit)) continue;  // Off the mesh: no dab.
+    if (!obj->bvh.raycast(obj->mesh, local, hit, std::numeric_limits<float>::infinity(), true)) continue;  // Off the mesh: no dab.
     const Vec3 worldHit = world.origin + world.dir * hit.t;
     const float p = smp.pressure;
     const bool mapRadius = sculpt.pressure == PressureMap::Radius || sculpt.pressure == PressureMap::Both;
@@ -690,6 +705,7 @@ const Brush* App::brushFor(BrushKind kind) const {
     case BrushKind::Flatten: return &flattenBrush_;
     case BrushKind::Crease: return &creaseBrush_;
     case BrushKind::Mask: return &maskBrush_;
+    case BrushKind::FaceSet: return &faceSetBrush_;
   }
   return nullptr;
 }
@@ -722,31 +738,79 @@ bool App::canEditMask() const {
   return obj && !sculptor_.active() && obj->id != remeshObjectId_;
 }
 
-void App::applyMask(MaskOp op) {
-  SceneObject* obj = scene.find(selectedId);
+SceneObject* App::editableObject(std::uint32_t id, const char* what) {
+  SceneObject* obj = scene.find(id);
   if (!obj) {
     statusMessage = "Select an object first.";
-    return;
+    return nullptr;
   }
-  if (sculptor_.active()) return;
+  if (sculptor_.active()) return nullptr;
   if (obj->id == remeshObjectId_) {
     // The remesh result is built from the mesh as it was, so this edit would be lost.
-    statusMessage = "Wait for the remesh to finish before editing this object's mask.";
-    return;
+    statusMessage = std::string("Wait for the remesh to finish before editing this object's ") + what + ".";
+    return nullptr;
   }
-  const bool filter = op == MaskOp::Blur || op == MaskOp::Sharpen;
-  Timer t;
-  auto entry = applyMaskOp(*obj, op, filter ? std::clamp(sculpt.maskFilterSteps, 1, 10) : 1);
-  stats.maskOpMs = t.ms();
+  return obj;
+}
+
+void App::pushEdit(std::optional<SculptUndo> entry, const char* name, double ms) {
+  stats.maskOpMs = ms;
   if (!entry) {
-    statusMessage = std::string(maskOpName(op)) + ": nothing to change";
+    statusMessage = std::string(name) + ": nothing to change";
     return;
   }
   ++editCounter_;
   undoStack.push(std::move(*entry));
   char buf[96];
-  std::snprintf(buf, sizeof(buf), "%s (%.1f ms)", maskOpName(op), stats.maskOpMs);
+  std::snprintf(buf, sizeof(buf), "%s (%.1f ms)", name, ms);
   statusMessage = buf;
+}
+
+void App::applyMask(MaskOp op) {
+  SceneObject* obj = editableObject(selectedId, "mask");
+  if (!obj) return;
+  const bool filter = op == MaskOp::Blur || op == MaskOp::Sharpen;
+  Timer t;
+  auto entry = applyMaskOp(*obj, op, filter ? std::clamp(sculpt.maskFilterSteps, 1, 10) : 1);
+  pushEdit(std::move(entry), maskOpName(op), t.ms());
+}
+
+void App::applyFaceSets(FaceSetOp op) {
+  SceneObject* obj = editableObject(selectedId, "face sets");
+  if (!obj) return;
+  Timer t;
+  auto entry = applyFaceSetOp(*obj, op);
+  pushEdit(std::move(entry), faceSetOpName(op), t.ms());
+}
+
+void App::faceSetOpUnderCursor(FaceSetOp op) {
+  const std::optional<ScenePick> pick = pickUnderMouse();
+  if (!pick) {
+    statusMessage = "Hover over a face set, then press H (Shift+H shows only that set).";
+    return;
+  }
+  SceneObject* obj = editableObject(pick->objectId, "face sets");
+  if (!obj) return;
+  selectedId = obj->id;
+  const std::int32_t set = faceSetId(obj->mesh.faceSetValue(pick->localHit.face));
+  Timer t;
+  auto entry = applyFaceSetOp(*obj, op, set);
+  pushEdit(std::move(entry), faceSetOpName(op), t.ms());
+}
+
+void App::maskFaceSetUnderCursor() {
+  const std::optional<ScenePick> pick = pickUnderMouse();
+  if (!pick) {
+    statusMessage = "Hover over a face set, then press Shift+M to mask it.";
+    return;
+  }
+  SceneObject* obj = editableObject(pick->objectId, "mask");
+  if (!obj) return;
+  selectedId = obj->id;
+  const std::int32_t set = faceSetId(obj->mesh.faceSetValue(pick->localHit.face));
+  Timer t;
+  auto entry = maskFaceSet(*obj, set);
+  pushEdit(std::move(entry), "Mask Face Set", t.ms());
 }
 
 void App::requestRemesh() {

@@ -11,7 +11,8 @@ enum class ElementKind : std::uint8_t { Vertex, Face, HalfEdge };
 
 // Told about every element an edit is about to change, before anything is written, so it can
 // snapshot what it needs (dynamic topology undo records whole BVH leaves this way). Elements
-// appended by the edit are not reported. Vertex reports cover positions and mask too.
+// appended by the edit are not reported. Vertex reports cover positions and mask too, face
+// reports the face set.
 class EditObserver {
  public:
   virtual ~EditObserver() = default;
@@ -58,7 +59,8 @@ class MeshEditor {
   Index splitEdge(Index h, float t = 0.5f);
 
   // Splits face f by a new edge between the start vertices of ha and hb (both in f, not
-  // neighbours). Returns the new face, or kInvalid if refused (the edge already exists).
+  // neighbours). Returns the new face, which joins f's face set, or kInvalid if refused (the
+  // edge already exists).
   Index splitFace(Index ha, Index hb);
 
   // Merges the end vertex of h into its start vertex, placed at `position`. Triangles on the

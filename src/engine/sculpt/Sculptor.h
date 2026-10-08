@@ -21,6 +21,14 @@ struct StrokeOptions {
   // Ignored by grab and mask strokes.
   bool dyntopo = false;
   DyntopoOptions dyntopoOptions{};
+  // Face set auto-masking: only vertices of the face set under the first dab move (each side of
+  // the symmetry plane takes the set under its own first dab). Face set brushes only repaint
+  // faces of that set.
+  bool faceSetAutoMask = false;
+  // Vertices where face sets meet stay put.
+  bool lockFaceSetBoundaries = false;
+  // Face set brushes: continue the set under the first dab instead of starting a new one.
+  bool extendFaceSet = false;
 };
 
 struct DabTiming {
@@ -50,8 +58,10 @@ struct StrokeTopologyStats {
 
 // Runs strokes on one scene object. For every dab it queries the BVH, snapshots the touched
 // leaves for undo, runs the brush, recomputes normals around the moved vertices, refits the BVH
-// and marks GPU ranges dirty. Brushes only move positions. Mask brushes take a shorter path: the
-// sculptor allocates the mask, snapshots only mask values and skips normals and refitting.
+// and marks GPU ranges dirty. Brushes only move positions. Mask and face set brushes take a
+// shorter path: the sculptor allocates the mask (or face sets), snapshots only those values and
+// skips normals and refitting. Hidden faces (see Mesh::faceSets) are never changed: their
+// vertices do not move unless a visible face also uses them.
 //
 // With dynamic topology each dab first refines or coarsens the mesh under the brush (see
 // DyntopoSession), then runs the brush as usual. Leaves the topology pass changed are recorded
@@ -75,9 +85,9 @@ class Sculptor {
   // Moves the captured vertices to their start position plus `offset` (local space).
   void grab(const Vec3& offset);
 
-  // Ends the stroke. Returns the undo entry, or nothing if the stroke changed nothing. Mask
-  // strokes keep only the leaves whose mask actually changed. A dynamic topology stroke is
-  // compacted here and returns a DyntopoUndo.
+  // Ends the stroke. Returns the undo entry, or nothing if the stroke changed nothing. Mask and
+  // face set strokes keep only the leaves whose values actually changed. A dynamic topology
+  // stroke is compacted here and returns a DyntopoUndo.
   std::optional<StrokeUndo> endStroke();
 
   // Scratch memory for compacting dynamic topology strokes, shared with the undo stack. Without
@@ -85,6 +95,8 @@ class Sculptor {
   void setLayoutWorkspace(std::shared_ptr<LayoutWorkspace> workspace) { workspace_ = std::move(workspace); }
   // The running stroke's topology session, or nullptr.
   const DyntopoSession* dyntopo() const { return dyntopo_.get(); }
+  // The face set the running (or last) face set stroke paints on the primary side.
+  std::int32_t paintFaceSet() const { return paintSet_[0]; }
 
   const DabTiming& lastDab() const { return lastDab_; }
   int dabCount() const { return dabCount_; }
@@ -92,17 +104,25 @@ class Sculptor {
 
  private:
   void start(SceneObject& object, const StrokeOptions& options, std::string label);
-  bool applyOne(const Dab& dab, const DabTopology& topology);
+  bool applyOne(const Dab& dab, const DabTopology& topology, int side);
+  void resolveFaceSets(const Vec3& center, float radius);
+  FaceSetFilter filter(int side) const;
   void applyTopology(const Dab& dab, const DabTopology& topology);
   void mergeClaims();
   std::optional<StrokeUndo> endDyntopoStroke(SceneObject& obj, DyntopoSession& session);
   void recomputeNormals(std::span<const Index> verts);
   void snapshot(Index leaf);
-  bool computeArea(Dab& dab, std::span<const Index> leaves) const;
+  bool computeArea(Dab& dab, std::span<const Index> leaves, const FaceSetFilter& filter) const;
 
   SceneObject* object_ = nullptr;
   const Brush* brush_ = nullptr;
   bool maskStroke_ = false;
+  bool faceSetStroke_ = false;
+  bool hidden_ = false;           // The mesh had hidden faces when the stroke began.
+  bool faceSetsResolved_ = false;
+  // Per side (0 primary, 1 mirrored): the auto-mask set (0 none) and the set painted (0 nothing).
+  std::int32_t onlySet_[2] = {0, 0};
+  std::int32_t paintSet_[2] = {0, 0};
   StrokeOptions options_;
   SculptUndo undo_;
   std::unordered_map<Index, std::size_t> snapshotIndex_;  // leaf -> index in undo_.before

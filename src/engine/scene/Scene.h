@@ -24,8 +24,8 @@ struct Transform {
 // are matched by object id and version).
 std::uint64_t nextTopologyVersion();
 
-// Above this many changed leaves, a mask edit asks for one whole-mask upload instead of per-leaf
-// uploads.
+// Above this many changed leaves, a mask or face set edit asks for one whole upload instead of
+// per-leaf uploads.
 inline constexpr std::size_t kMaskDirtyAllLeaves = 64;
 
 struct SceneObject {
@@ -43,8 +43,13 @@ struct SceneObject {
   // Leaves whose mask values changed, or the whole mask when maskDirtyAll is set.
   std::vector<Index> maskDirtyLeaves;
   bool maskDirtyAll = false;
+  // Leaves whose face set values changed (colours only), or all of them when faceSetDirtyAll is
+  // set.
+  std::vector<Index> faceSetDirtyLeaves;
+  bool faceSetDirtyAll = false;
   // Leaves whose faces changed during a dynamic topology stroke (topologyVersion only changes
-  // when the stroke ends), so their GPU index data must be rebuilt.
+  // when the stroke ends), or whose faces were hidden or revealed, so their GPU index data must
+  // be rebuilt.
   std::vector<Index> topoDirtyLeaves;
   // topologyVersion at which the mesh was last found free of non-manifold vertices.
   std::uint64_t manifoldCheckedVersion = 0;
@@ -58,11 +63,21 @@ struct SceneObject {
     maskDirtyAll = true;
     maskDirtyLeaves.clear();
   }
+  void markFaceSetDirty(Index leaf) { faceSetDirtyLeaves.push_back(leaf); }
+  // Faces of `leaf` were hidden or shown: the leaf draws other triangles and edges now, and so may
+  // the leaves next to it (an edge is drawn by whichever of its two faces shows).
+  void markVisibilityDirty(Index leaf);
+  void markFaceSetDirtyAll() {
+    faceSetDirtyAll = true;
+    faceSetDirtyLeaves.clear();
+  }
   // Drops pending partial uploads; for use after a topology change, which re-uploads everything.
   void clearDirty() {
     dirtyLeaves.clear();
     maskDirtyLeaves.clear();
     maskDirtyAll = false;
+    faceSetDirtyLeaves.clear();
+    faceSetDirtyAll = false;
     topoDirtyLeaves.clear();
   }
 };
@@ -88,7 +103,7 @@ class Scene {
   SceneObject* find(std::uint32_t id);
   const SceneObject* find(std::uint32_t id) const;
 
-  // Nearest visible object hit by a world-space ray.
+  // Nearest visible object hit by a world-space ray. Hidden faces are not hit.
   std::optional<ScenePick> pick(const Ray& worldRay) const;
 
   Aabb worldBounds() const;

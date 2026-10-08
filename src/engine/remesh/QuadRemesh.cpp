@@ -311,13 +311,15 @@ std::optional<Mesh> quadRemesh(const Mesh& input, const QuadRemeshParams& params
   std::optional<Mesh> out = voxelRemesh(input, {h, params.maxResolution}, &st.voxel, error);
   if (!out) return out;
   const bool masked = input.anyMasked();
+  const bool faceSets = input.hasFaceSetData();
   if (!optimize) {  // Plain voxel remesh.
     st.raw = st.optimized = measureQuality(*out);
-    if (masked) {
+    if (masked || faceSets) {
       Mesh ref = input;
       Bvh refBvh;
       refBvh.build(ref, {.maxLeafFaces = 8});
-      transferMask(ref, refBvh, *out);
+      if (masked) transferMask(ref, refBvh, *out);
+      if (faceSets) transferFaceSets(ref, refBvh, *out);
     }
     return out;
   }
@@ -356,6 +358,7 @@ std::optional<Mesh> quadRemesh(const Mesh& input, const QuadRemeshParams& params
     relax(*out, ref, refBvh, h, params.relaxIterations);
   }
   if (masked) transferMask(ref, refBvh, *out);
+  if (faceSets) transferFaceSets(ref, refBvh, *out);
   st.optimizeMs = t.ms() - statsMs;
   st.optimized = measureQuality(*out, errRef, errBvh);
   return out;
@@ -375,6 +378,36 @@ void transferMask(const Mesh& source, const Bvh& sourceBvh, Mesh& target) {
       const Vec3 w = barycentric(hit.position, source.positions[c[0]], source.positions[c[1]], source.positions[c[2]]);
       const float value = w.x * source.mask[c[0]] + w.y * source.mask[c[1]] + w.z * source.mask[c[2]];
       target.mask[v] = std::clamp(value, 0.0f, 1.0f);
+    }
+  });
+}
+
+void transferFaceSets(const Mesh& source, const Bvh& sourceBvh, Mesh& target) {
+  if (!source.hasFaceSetData()) {
+    target.faceSets.clear();
+    return;
+  }
+  target.faceSets.assign(target.faceHe.size(), kDefaultFaceSet);
+  parallelFor(0, target.faceHe.size(), 1024, [&](std::size_t b, std::size_t e) {
+    for (std::size_t i = b; i < e; ++i) {
+      const Index f = static_cast<Index>(i);
+      if (target.faceHe[f] == kInvalid) continue;
+      const Vec3 c = target.faceCentroid(f);
+      const Vec3 an = target.faceAreaNormal(f);
+      constexpr float kInf = std::numeric_limits<float>::infinity();
+      Bvh::ClosestHit hit;
+      if (!sourceBvh.closestPoint(source, c, kInf, hit)) continue;
+      if (glm::dot(hit.faceNormal, an) <= 0.0f) {
+        // Probably the far side of a thin part. Ask again from a point just outside this face,
+        // which is closer to the side the face belongs to.
+        const float len = glm::length(an);
+        Bvh::ClosestHit outside;
+        if (len > 1e-20f && sourceBvh.closestPoint(source, c + an * (0.5f * std::sqrt(0.5f * len) / len), kInf,
+                                                   outside) &&
+            glm::dot(outside.faceNormal, an) > 0.0f)
+          hit = outside;
+      }
+      target.faceSets[f] = source.faceSets[hit.face];
     }
   });
 }

@@ -15,6 +15,7 @@
 #include "Camera.h"
 #include "Renderer.h"
 #include "scene/Scene.h"
+#include "sculpt/FaceSetOps.h"
 #include "sculpt/MaskOps.h"
 #include "sculpt/Sculptor.h"
 #include "sculpt/StrokeSampler.h"
@@ -46,12 +47,15 @@ struct PrimitiveSettings {
   int planeResolution = 64;
 };
 
-// Projects store the brush as its index here, so new brushes go at the end.
-enum class BrushKind { Draw, Clay, Smooth, Grab, Inflate, Flatten, Crease, Mask };
-inline constexpr int kBrushCount = 8;
-inline constexpr const char* kBrushNames[kBrushCount] = {"Draw",    "Clay",    "Smooth", "Grab",
-                                                         "Inflate", "Flatten", "Crease", "Mask"};
-inline constexpr const char* kBrushKeys[kBrushCount] = {"D", "C", "S", "G", "I", "T", "Shift+C", "M"};
+// Projects store the brush as its index here, so new brushes go at the end. Names are also
+// settings keys, so they have no spaces; labels are what the panel shows.
+enum class BrushKind { Draw, Clay, Smooth, Grab, Inflate, Flatten, Crease, Mask, FaceSet };
+inline constexpr int kBrushCount = 9;
+inline constexpr const char* kBrushNames[kBrushCount] = {"Draw",    "Clay",    "Smooth", "Grab",   "Inflate",
+                                                         "Flatten", "Crease", "Mask",   "FaceSet"};
+inline constexpr const char* kBrushLabels[kBrushCount] = {"Draw",    "Clay",    "Smooth", "Grab",    "Inflate",
+                                                          "Flatten", "Crease", "Mask",   "Face Set"};
+inline constexpr const char* kBrushKeys[kBrushCount] = {"D", "C", "S", "G", "I", "T", "Shift+C", "M", "P"};
 enum class PressureMap { Strength, Radius, Both, None };
 // How the dynamic topology detail size is given: in screen pixels at the cursor (so zooming in
 // adds detail), or as a fixed edge length in object units.
@@ -60,13 +64,17 @@ enum class DetailMode { Relative, Constant };
 struct SculptSettings {
   BrushKind brush = BrushKind::Draw;
   float radiusPx = 60.0f;      // Screen-space radius, like most sculpting tools.
-  float strength[kBrushCount] = {0.5f, 0.5f, 0.5f, 1.0f, 0.5f, 0.5f, 0.5f, 1.0f};  // Per brush.
+  float strength[kBrushCount] = {0.5f, 0.5f, 0.5f, 1.0f, 0.5f, 0.5f, 0.5f, 1.0f, 1.0f};  // Per brush.
   Falloff falloff = Falloff::Smooth;
   bool invert = false;         // Brushes subtract instead of add (Ctrl flips it per stroke).
   PressureMap pressure = PressureMap::Strength;
   bool symmetryX = true;       // PRD default for character sculpting.
   float spacing = 0.1f;        // Dab spacing as a fraction of the radius.
   int maskFilterSteps = 2;     // Iterations per Blur Mask / Sharpen Mask.
+  // Face set auto-masking for every brush: only the set under the stroke's start changes, and
+  // vertices where sets meet stay put.
+  bool faceSetAutoMask = false;
+  bool lockFaceSetBorders = false;
   // Dynamic topology (Ctrl+D): brushes add and remove triangles under the cursor so detail can go
   // anywhere. Not used by Grab and Mask.
   bool dyntopo = false;
@@ -97,7 +105,7 @@ struct FrameStats {
   double inputToDabMs = 0.0;    // OS input timestamp to dab applied.
   double inputToFrameMs = 0.0;  // OS input timestamp to the frame showing it being swapped.
   int dabsLastFrame = 0;
-  double maskOpMs = 0.0;        // Last whole-mesh mask operation (invert, clear, blur...).
+  double maskOpMs = 0.0;        // Last whole-mesh mask or face set operation (invert, blur, hide...).
   double topologyMs = 0.0;      // Dynamic topology part of the last dab.
 };
 
@@ -157,6 +165,14 @@ class App {
   // Whole-mesh mask operations on the selected object, undoable.
   void applyMask(MaskOp op);
   bool canEditMask() const;
+  // Whole-mesh face set operations (from mask, loose parts, clear, reveal all, invert
+  // visibility) on the selected object, undoable. Hide and Isolate act on the set under the
+  // cursor; see faceSetOpUnderCursor().
+  void applyFaceSets(FaceSetOp op);
+  // Hide or isolate the face set under the cursor, on the object under it.
+  void faceSetOpUnderCursor(FaceSetOp op);
+  // Masks the face set under the cursor (adds to the mask).
+  void maskFaceSetUnderCursor();
   bool strokeActive() const { return sculptor_.active(); }
   void importFile(const std::filesystem::path& path);
   void quit() { running_ = false; }
@@ -170,6 +186,10 @@ class App {
   void handleEvent(const SDL_Event& e);
   void handleShortcut(const SDL_KeyboardEvent& key);
   void updateHover();
+  // The surface under the mouse right now. Keys that act on the face under the cursor use this
+  // rather than hover_, which is from the last frame (or from before an orbit), while an undo or
+  // the end of a dynamic topology stroke since may have renumbered the faces.
+  std::optional<ScenePick> pickUnderMouse() const;
   void updateViewportRect();
   void drawUi();
   void drawGizmo();
@@ -192,6 +212,10 @@ class App {
   std::uint64_t sceneFingerprint() const;
   void initRecovery();
   void finishRecovery();
+  // The object a whole-mesh edit of `what` (mask, face sets) may change now, or nullptr with a
+  // status message saying why not.
+  SceneObject* editableObject(std::uint32_t id, const char* what);
+  void pushEdit(std::optional<SculptUndo> entry, const char* name, double ms);
 
   SDL_Window* window_ = nullptr;
   SDL_GLContext gl_ = nullptr;
@@ -245,6 +269,7 @@ class App {
   CreaseBrush creaseBrush_;
   MaskBrush maskBrush_;
   MaskSmoothBrush maskSmoothBrush_;  // Shift with the Mask brush smooths the mask.
+  FaceSetBrush faceSetBrush_;
   StrokeSampler sampler_;
   std::vector<StrokeSample> samples_;
   // Brush of the running stroke. Shift turns it into Smooth, except for Mask, which stays Mask and

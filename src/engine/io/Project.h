@@ -34,8 +34,11 @@ struct Project {
 // Chunks: "SETT" (settings text), "OBJS" (objects: name, transform, visibility, positions,
 // face sizes, face indices) and the optional "MASK" (u32 count, then per masked object: u32 object
 // index, u32 vertex count, u8 encoding (0 = f32), the values). MASK is written only when some
-// object has a non-zero mask. Readers skip unknown chunks, so later versions can add data that
-// older builds ignore (a build without masking opens a masked file and drops the mask).
+// object has a non-zero mask. The optional "FSET" has the same layout per object, with a u32 face
+// count and i32 face set values (encoding 0) in face order; it is written only for objects with a
+// face set other than the default or a hidden face. Readers skip unknown chunks, so later versions
+// can add data that older builds ignore (a build without masking opens a masked file and drops the
+// mask).
 // Little-endian.
 inline constexpr std::uint32_t kProjectVersion = 1;
 

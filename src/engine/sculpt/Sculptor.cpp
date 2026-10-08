@@ -9,13 +9,21 @@
 
 namespace plegl {
 
+namespace {
+// An auto-mask set no face has (ids stop at kMaxFaceSetId): the stroke finds nothing to change
+// on that side.
+constexpr std::int32_t kNoFaceSet = INT32_MAX;
+}  // namespace
+
 void Sculptor::beginStroke(SceneObject& object, const Brush& brush, const StrokeOptions& options, std::string label) {
   start(object, options, std::move(label));
   brush_ = &brush;
   maskStroke_ = brush.editsMask();
-  // Allocate before the first snapshot, so the before-state holds real (zero) values.
+  faceSetStroke_ = brush.editsFaceSets();
+  // Allocate before the first snapshot, so the before-state holds real (default) values.
   if (maskStroke_) object.mesh.ensureMask();
-  if (options.dyntopo && !maskStroke_ && object.mesh.faceCount() > 0) {
+  if (faceSetStroke_) object.mesh.ensureFaceSets();
+  if (options.dyntopo && !maskStroke_ && !faceSetStroke_ && object.mesh.faceCount() > 0) {
     dyntopo_ = std::make_unique<DyntopoSession>(object, options.dyntopoOptions);
     mergedClaims_ = 0;
   }
@@ -26,6 +34,11 @@ void Sculptor::start(SceneObject& object, const StrokeOptions& options, std::str
   object_ = &object;
   brush_ = nullptr;
   maskStroke_ = false;
+  faceSetStroke_ = false;
+  hidden_ = object.mesh.anyHidden();
+  faceSetsResolved_ = false;
+  onlySet_[0] = onlySet_[1] = 0;
+  paintSet_[0] = paintSet_[1] = 0;
   grabVerts_.clear();
   options_ = options;
   undo_ = SculptUndo{};
@@ -51,6 +64,8 @@ void Sculptor::snapshot(Index leaf) {
   s.leaf = leaf;
   if (maskStroke_) {
     s.mask.assign(m.mask.begin() + l.vertBegin, m.mask.begin() + l.vertEnd);
+  } else if (faceSetStroke_) {
+    s.faceSets.assign(m.faceSets.begin() + l.faceBegin, m.faceSets.begin() + l.faceEnd);
   } else {
     s.positions.assign(m.positions.begin() + l.vertBegin, m.positions.begin() + l.vertEnd);
     s.normals.assign(m.normals.begin() + l.vertBegin, m.normals.begin() + l.vertEnd);
@@ -59,7 +74,7 @@ void Sculptor::snapshot(Index leaf) {
   undo_.before.push_back(std::move(s));
 }
 
-bool Sculptor::computeArea(Dab& dab, std::span<const Index> leaves) const {
+bool Sculptor::computeArea(Dab& dab, std::span<const Index> leaves, const FaceSetFilter& filter) const {
   const Mesh& m = object_->mesh;
   const float r2 = dab.radius * dab.radius;
   Vec3 normalSum{0.0f}, centerSum{0.0f};
@@ -69,7 +84,7 @@ bool Sculptor::computeArea(Dab& dab, std::span<const Index> leaves) const {
     for (Index v = leaf.vertBegin; v < leaf.vertEnd; ++v) {
       const Vec3 d = m.positions[v] - dab.center;
       const float dist2 = glm::dot(d, d);
-      if (dist2 >= r2) continue;
+      if (dist2 >= r2 || !filter.allows(m, v)) continue;
       // Constant falloff would give rim vertices full say; a smooth weight keeps the plane stable.
       const float w = falloffWeight(Falloff::Smooth, std::sqrt(dist2) / dab.radius) + 1e-3f;
       normalSum += m.normals[v] * w;
@@ -94,7 +109,8 @@ bool Sculptor::dab(const Vec3& center, float radius, float strength, const DabTo
   d.strength = std::clamp(strength, 0.0f, 1.0f);
   d.falloff = options_.falloff;
   d.invert = options_.invert;
-  bool any = applyOne(d, topology);
+  if (!faceSetsResolved_) resolveFaceSets(center, radius);
+  bool any = applyOne(d, topology, 0);
   if (options_.symmetryX) {
     Dab mirrored = d;
     mirrored.center.x = -mirrored.center.x;
@@ -106,12 +122,45 @@ bool Sculptor::dab(const Vec3& center, float radius, float strength, const DabTo
         mirroredTopology.hintFace =
             object_->bvh.closestPoint(object_->mesh, mirrored.center, radius, hit) ? hit.face : kInvalid;
       }
-      any |= applyOne(mirrored, mirroredTopology);
+      any |= applyOne(mirrored, mirroredTopology, 1);
     }
   }
   lastDab_.totalMs = total.ms();
   if (any) ++dabCount_;
   return any;
+}
+
+void Sculptor::resolveFaceSets(const Vec3& center, float radius) {
+  faceSetsResolved_ = true;
+  const Mesh& m = object_->mesh;
+  const bool wantSet = options_.faceSetAutoMask || (faceSetStroke_ && options_.extendFaceSet);
+  std::int32_t under[2] = {0, 0};  // Set of the visible face under each side's first dab, 0 if none.
+  if (wantSet && !m.faceSets.empty()) {
+    for (int side = 0; side < 2; ++side) {
+      const Vec3 c = side == 0 ? center : Vec3{-center.x, center.y, center.z};
+      Bvh::ClosestHit hit;
+      if (object_->bvh.closestPoint(m, c, radius, hit, true)) under[side] = faceSetId(m.faceSets[hit.face]);
+    }
+  } else if (wantSet) {
+    under[0] = under[1] = kDefaultFaceSet;  // Every face is in the default set.
+  }
+  // 0 (paint nothing) once ids run out.
+  const std::int32_t fresh = faceSetStroke_ && !options_.extendFaceSet ? m.newFaceSetId() : 0;
+  for (int side = 0; side < 2; ++side) {
+    if (options_.faceSetAutoMask) onlySet_[side] = under[side] != 0 ? under[side] : kNoFaceSet;
+    if (faceSetStroke_) paintSet_[side] = options_.extendFaceSet ? under[side] : fresh;  // One new set for both sides.
+  }
+}
+
+FaceSetFilter Sculptor::filter(int side) const {
+  FaceSetFilter f;
+  const Mesh& m = object_->mesh;
+  if (m.faceSets.empty() || (!hidden_ && onlySet_[side] == 0 && !options_.lockFaceSetBoundaries)) return f;
+  f.faceSets = m.faceSets.data();
+  f.skipHidden = hidden_;
+  f.onlySet = onlySet_[side];
+  f.lockBoundaries = options_.lockFaceSetBoundaries;
+  return f;
 }
 
 void Sculptor::mergeClaims() {
@@ -164,25 +213,40 @@ void Sculptor::applyTopology(const Dab& dab, const DabTopology& topology) {
   lastDab_.topologyMs += t.ms();
 }
 
-bool Sculptor::applyOne(const Dab& dabIn, const DabTopology& topology) {
+bool Sculptor::applyOne(const Dab& dabIn, const DabTopology& topology, int side) {
   Mesh& m = object_->mesh;
   Bvh& bvh = object_->bvh;
   Dab dab = dabIn;
-  if (dyntopo_ && topology.detail > 0.0f) applyTopology(dab, topology);
+  if (faceSetStroke_ && paintSet_[side] == 0) return false;  // No set to continue on this side.
+  // The topology pass honours the face set limits too; with no set under this side's first dab
+  // there is nothing it may change.
+  if (dyntopo_ && topology.detail > 0.0f && onlySet_[side] != kNoFaceSet) {
+    DabTopology limited = topology;
+    limited.onlySet = onlySet_[side];
+    limited.lockFaceSetBorders = options_.lockFaceSetBoundaries;
+    applyTopology(dab, limited);
+  }
 
   leaves_.clear();
   bvh.querySphere(dab.center, dab.radius, leaves_);
   if (leaves_.empty()) return false;
-  if (brush_->needsArea() && !computeArea(dab, leaves_)) return false;  // No vertex inside the dab.
+  const FaceSetFilter faceSetFilter = filter(side);  // After the topology pass: it may grow the array.
+  if (brush_->needsArea() && !computeArea(dab, leaves_, faceSetFilter)) return false;  // No vertex inside the dab.
   for (Index l : leaves_) snapshot(l);
 
   Timer t;
-  BrushContext ctx{m, bvh, leaves_, dab};
+  BrushContext ctx{m, bvh, leaves_, dab, faceSetFilter, paintSet_[side]};
   brush_->apply(ctx);
   lastDab_.brushMs += t.ms();
 
-  if (maskStroke_) {  // Positions did not move: no normals, bounds or geometry upload.
-    for (Index l : leaves_) object_->markMaskDirty(l);
+  if (maskStroke_ || faceSetStroke_) {  // Positions did not move: no normals, bounds or geometry upload.
+    for (Index l : leaves_) {
+      if (maskStroke_) {
+        object_->markMaskDirty(l);
+      } else {
+        object_->markFaceSetDirty(l);
+      }
+    }
     lastDab_.leaves += static_cast<int>(leaves_.size());
     return true;
   }
@@ -272,6 +336,7 @@ bool Sculptor::beginGrab(SceneObject& object, const StrokeOptions& options, cons
   Mesh& m = object.mesh;
   const Bvh& bvh = object.bvh;
   const float strength = std::clamp(options.strength, 0.0f, 1.0f);
+  resolveFaceSets(center, radius);
 
   // Collect weights per vertex; a vertex can sit in both spheres when they overlap at the seam.
   std::unordered_map<Index, std::size_t> slot;
@@ -279,6 +344,7 @@ bool Sculptor::beginGrab(SceneObject& object, const StrokeOptions& options, cons
     leaves_.clear();
     bvh.querySphere(c, radius, leaves_);
     const float r2 = radius * radius;
+    const FaceSetFilter faceSetFilter = filter(mirror ? 1 : 0);
     for (Index li : leaves_) {
       const BvhLeaf& leaf = bvh.leaves()[li];
       for (Index v = leaf.vertBegin; v < leaf.vertEnd; ++v) {
@@ -287,7 +353,7 @@ bool Sculptor::beginGrab(SceneObject& object, const StrokeOptions& options, cons
         if (dist2 >= r2) continue;
         float w = strength * falloffWeight(options.falloff, std::sqrt(dist2) / radius);
         if (!m.mask.empty()) w *= 1.0f - m.mask[v];  // Fully masked vertices stay put.
-        if (w <= 0.0f) continue;
+        if (w <= 0.0f || !faceSetFilter.allows(m, v)) continue;
         auto [it, inserted] = slot.try_emplace(v, grabVerts_.size());
         if (inserted) grabVerts_.push_back({v, m.positions[v], 0.0f, 0.0f});
         (mirror ? grabVerts_[it->second].mirrorWeight : grabVerts_[it->second].weight) += w;
@@ -423,6 +489,22 @@ std::optional<StrokeUndo> Sculptor::endStroke() {
   }
   if (undo_.before.empty()) return std::nullopt;
   const Mesh& m = obj->mesh;
+  if (faceSetStroke_) {
+    // Drop leaves the brush passed over without repainting a face.
+    std::vector<LeafState> before;
+    for (LeafState& b : undo_.before) {
+      const BvhLeaf& l = obj->bvh.leaves()[b.leaf];
+      if (std::equal(b.faceSets.begin(), b.faceSets.end(), m.faceSets.begin() + l.faceBegin)) continue;
+      LeafState a;
+      a.leaf = b.leaf;
+      a.faceSets.assign(m.faceSets.begin() + l.faceBegin, m.faceSets.begin() + l.faceEnd);
+      undo_.after.push_back(std::move(a));
+      before.push_back(std::move(b));
+    }
+    if (before.empty()) return std::nullopt;
+    undo_.before = std::move(before);
+    return StrokeUndo{std::move(undo_)};
+  }
   if (maskStroke_) {
     // Drop leaves the mask brush passed over without changing (for example already fully masked).
     std::vector<LeafState> before;
