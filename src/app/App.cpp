@@ -427,6 +427,11 @@ void App::updateHover() {
   stats.raycastUs = stats.raycastUs == 0.0 ? us : stats.raycastUs * 0.9 + us * 0.1;
 }
 
+std::optional<ScenePick> App::pickUnderMouse() const {
+  if (!mouseInViewport_ || ImGui::GetIO().WantCaptureMouse) return std::nullopt;
+  return scene.pick(camera.rayThroughPixel(mouseX_ - vpX_, mouseY_ - vpY_));
+}
+
 void App::drawGizmo() {
   if (mode != Mode::Object) return;
   SceneObject* obj = scene.find(selectedId);
@@ -779,28 +784,30 @@ void App::applyFaceSets(FaceSetOp op) {
 }
 
 void App::faceSetOpUnderCursor(FaceSetOp op) {
-  if (!hover_) {
+  const std::optional<ScenePick> pick = pickUnderMouse();
+  if (!pick) {
     statusMessage = "Hover over a face set, then press H (Shift+H shows only that set).";
     return;
   }
-  SceneObject* obj = editableObject(hover_->objectId, "face sets");
+  SceneObject* obj = editableObject(pick->objectId, "face sets");
   if (!obj) return;
   selectedId = obj->id;
-  const std::int32_t set = faceSetId(obj->mesh.faceSetValue(hover_->localHit.face));
+  const std::int32_t set = faceSetId(obj->mesh.faceSetValue(pick->localHit.face));
   Timer t;
   auto entry = applyFaceSetOp(*obj, op, set);
   pushEdit(std::move(entry), faceSetOpName(op), t.ms());
 }
 
 void App::maskFaceSetUnderCursor() {
-  if (!hover_) {
+  const std::optional<ScenePick> pick = pickUnderMouse();
+  if (!pick) {
     statusMessage = "Hover over a face set, then press Shift+M to mask it.";
     return;
   }
-  SceneObject* obj = editableObject(hover_->objectId, "mask");
+  SceneObject* obj = editableObject(pick->objectId, "mask");
   if (!obj) return;
   selectedId = obj->id;
-  const std::int32_t set = faceSetId(obj->mesh.faceSetValue(hover_->localHit.face));
+  const std::int32_t set = faceSetId(obj->mesh.faceSetValue(pick->localHit.face));
   Timer t;
   auto entry = maskFaceSet(*obj, set);
   pushEdit(std::move(entry), "Mask Face Set", t.ms());

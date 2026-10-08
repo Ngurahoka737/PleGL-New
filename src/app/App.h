@@ -186,6 +186,10 @@ class App {
   void handleEvent(const SDL_Event& e);
   void handleShortcut(const SDL_KeyboardEvent& key);
   void updateHover();
+  // The surface under the mouse right now. Keys that act on the face under the cursor use this
+  // rather than hover_, which is from the last frame (or from before an orbit), while an undo or
+  // the end of a dynamic topology stroke since may have renumbered the faces.
+  std::optional<ScenePick> pickUnderMouse() const;
   void updateViewportRect();
   void drawUi();
   void drawGizmo();

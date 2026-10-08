@@ -254,6 +254,11 @@ std::int32_t Mesh::maxFaceSetId() const {
   return id;
 }
 
+std::int32_t Mesh::newFaceSetId() const {
+  const std::int32_t id = maxFaceSetId();
+  return id < kMaxFaceSetId ? id + 1 : 0;
+}
+
 bool Mesh::vertexVisible(Index v) const {
   if (vertHe[v] == kInvalid) return false;
   if (faceSets.empty()) return true;
@@ -470,7 +475,8 @@ ValidationResult validateImpl(const Mesh& m, bool live) {
   }
   if (!m.faceSets.empty() && static_cast<Index>(m.faceSets.size()) != nf) return fail("face set size mismatch");
   for (Index f = 0; f < static_cast<Index>(m.faceSets.size()); ++f) {
-    if (m.faceSets[f] == 0 && (!live || m.faceHe[f] != kInvalid)) return fail("face set 0 at face " + std::to_string(f));
+    if (!validFaceSetValue(m.faceSets[f]) && (!live || m.faceHe[f] != kInvalid))
+      return fail("face set value " + std::to_string(m.faceSets[f]) + " at face " + std::to_string(f));
   }
   if (static_cast<Index>(m.heTwin.size()) != nh || static_cast<Index>(m.heVert.size()) != nh ||
       static_cast<Index>(m.heFace.size()) != nh)

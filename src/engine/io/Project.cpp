@@ -243,7 +243,7 @@ bool readFaceSets(Reader& r, std::size_t size, std::vector<ProjectObject>& objec
     std::vector<std::int32_t> values;
     if (!r.getArray(values, faceCount)) return setError(error, "The face set data is cut off.");
     for (std::int32_t v : values)
-      if (v == 0 || v == INT32_MIN) return setError(error, "The face set data is damaged.");
+      if (!validFaceSetValue(v)) return setError(error, "The face set data is damaged.");
     objects[index].mesh.faceSets = std::move(values);
   }
   return true;

@@ -10,7 +10,8 @@
 namespace plegl {
 
 namespace {
-// An auto-mask set no face has: the stroke finds nothing to change on that side.
+// An auto-mask set no face has (ids stop at kMaxFaceSetId): the stroke finds nothing to change
+// on that side.
 constexpr std::int32_t kNoFaceSet = INT32_MAX;
 }  // namespace
 
@@ -143,7 +144,8 @@ void Sculptor::resolveFaceSets(const Vec3& center, float radius) {
   } else if (wantSet) {
     under[0] = under[1] = kDefaultFaceSet;  // Every face is in the default set.
   }
-  const std::int32_t fresh = faceSetStroke_ && !options_.extendFaceSet ? m.maxFaceSetId() + 1 : 0;
+  // 0 (paint nothing) once ids run out.
+  const std::int32_t fresh = faceSetStroke_ && !options_.extendFaceSet ? m.newFaceSetId() : 0;
   for (int side = 0; side < 2; ++side) {
     if (options_.faceSetAutoMask) onlySet_[side] = under[side] != 0 ? under[side] : kNoFaceSet;
     if (faceSetStroke_) paintSet_[side] = options_.extendFaceSet ? under[side] : fresh;  // One new set for both sides.
@@ -216,7 +218,14 @@ bool Sculptor::applyOne(const Dab& dabIn, const DabTopology& topology, int side)
   Bvh& bvh = object_->bvh;
   Dab dab = dabIn;
   if (faceSetStroke_ && paintSet_[side] == 0) return false;  // No set to continue on this side.
-  if (dyntopo_ && topology.detail > 0.0f) applyTopology(dab, topology);
+  // The topology pass honours the face set limits too; with no set under this side's first dab
+  // there is nothing it may change.
+  if (dyntopo_ && topology.detail > 0.0f && onlySet_[side] != kNoFaceSet) {
+    DabTopology limited = topology;
+    limited.onlySet = onlySet_[side];
+    limited.lockFaceSetBorders = options_.lockFaceSetBoundaries;
+    applyTopology(dab, limited);
+  }
 
   leaves_.clear();
   bvh.querySphere(dab.center, dab.radius, leaves_);

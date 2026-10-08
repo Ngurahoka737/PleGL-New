@@ -16,10 +16,16 @@ inline constexpr Vec3 kDeadPosition{1e18f, 1e18f, 1e18f};
 // Face sets: every face belongs to one numbered group, drawn in its own colour and used to limit
 // brushes and to hide parts of the mesh. A stored value v names set |v|; a negative value marks
 // the face hidden. 0 is never stored. Faces of a mesh without the array are in kDefaultFaceSet
-// and visible; that set is drawn without colour.
+// and visible; that set is drawn without colour. Ids stay at or below kMaxFaceSetId, so a new id
+// (the largest plus one) never overflows and INT32_MAX stays free for sentinels.
 inline constexpr std::int32_t kDefaultFaceSet = 1;
+inline constexpr std::int32_t kMaxFaceSetId = INT32_MAX - 1;
 inline std::int32_t faceSetId(std::int32_t value) { return value < 0 ? -value : value; }
 inline bool faceSetHidden(std::int32_t value) { return value < 0; }
+// True for a value that may be stored: a set id in [1, kMaxFaceSetId], negated when hidden.
+inline bool validFaceSetValue(std::int32_t value) {
+  return value != 0 && value >= -kMaxFaceSetId && value <= kMaxFaceSetId;
+}
 
 // Polygon mesh stored as an index-based half-edge structure with struct-of-arrays attributes.
 //
@@ -86,6 +92,8 @@ class Mesh {
   bool hasFaceSetData() const;
   // Largest face set id in use (kDefaultFaceSet when there are no face sets).
   std::int32_t maxFaceSetId() const;
+  // An id no face uses (the largest in use plus one), or 0 when the largest is kMaxFaceSetId.
+  std::int32_t newFaceSetId() const;
   // True if at least one face around v is visible. Vertices without faces count as hidden.
   bool vertexVisible(Index v) const;
 

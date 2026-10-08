@@ -150,14 +150,53 @@ TEST_CASE("a vertex is visible while any of its faces is") {
   CHECK_FALSE(m.vertexVisible(v));
 }
 
-TEST_CASE("validate rejects face sets of the wrong size or with a zero") {
+TEST_CASE("validate rejects face sets of the wrong size or out of range") {
   Mesh m = makeIcosphere(1);
   m.faceSets.assign(m.faceHe.size() - 1, 1);
   CHECK_FALSE(validate(m).ok);
   m.faceSets.assign(m.faceHe.size(), 1);
   CHECK(validate(m).ok);
-  m.faceSets[3] = 0;
-  CHECK_FALSE(validate(m).ok);
+  for (std::int32_t bad : {0, std::numeric_limits<std::int32_t>::max(), -std::numeric_limits<std::int32_t>::max(),
+                           std::numeric_limits<std::int32_t>::min()}) {
+    m.faceSets[3] = bad;
+    CHECK_FALSE(validate(m).ok);
+  }
+  m.faceSets[3] = -kMaxFaceSetId;
+  CHECK(validate(m).ok);
+}
+
+TEST_CASE("new face set ids stop at the largest valid id instead of overflowing") {
+  Scene scene;
+  SceneObject& obj = scene.add("S", makeQuadSphere(8));
+  Mesh& m = obj.mesh;
+  CHECK(m.newFaceSetId() == kDefaultFaceSet + 1);
+  m.ensureFaceSets();
+  m.faceSets[0] = kMaxFaceSetId - 1;
+  CHECK(m.newFaceSetId() == kMaxFaceSetId);
+  m.faceSets[0] = -kMaxFaceSetId;  // Hidden ids count too.
+  CHECK(m.newFaceSetId() == 0);
+  m.faceSets[0] = kMaxFaceSetId;
+  Bvh::ClosestHit under;
+  REQUIRE(obj.bvh.closestPoint(m, Vec3{0.0f, 0.0f, 1.0f}, 0.5f, under));
+  REQUIRE(under.face != 0);
+  m.faceSets[under.face] = 5;
+  // Face Set from Mask needs a new id and changes nothing.
+  m.mask.assign(m.positions.size(), 1.0f);
+  CHECK_FALSE(applyFaceSetOp(obj, FaceSetOp::FromMask));
+  // A new-set stroke paints nothing; continuing a set still works.
+  m.mask.clear();
+  const std::vector<std::int32_t> before = m.faceSets;
+  FaceSetBrush brush;
+  Sculptor sculptor;
+  sculptor.beginStroke(obj, brush, StrokeOptions{.strength = 1.0f}, "Face Set");
+  sculptor.dab(Vec3{0.0f, 0.0f, 1.0f}, 0.5f, 1.0f);
+  CHECK_FALSE(sculptor.endStroke());
+  CHECK(m.faceSets == before);
+  sculptor.beginStroke(obj, brush, StrokeOptions{.strength = 1.0f, .extendFaceSet = true}, "Face Set");
+  sculptor.dab(Vec3{0.0f, 0.0f, 1.0f}, 0.5f, 1.0f);
+  CHECK(sculptor.endStroke());
+  CHECK(m.faceSets != before);
+  CHECK(validate(m).ok);
 }
 
 TEST_CASE("splitting a face keeps both halves in its set, and compact keeps every set") {
@@ -276,8 +315,9 @@ TEST_CASE("damaged face set chunks are refused") {
     b[payload + 12] = 9;
     CHECK(refused(b));
   }
-  SUBCASE("a zero or the smallest integer as a value") {
-    for (std::int32_t bad : {0, std::numeric_limits<std::int32_t>::min()}) {
+  SUBCASE("values outside the id range") {
+    for (std::int32_t bad : {0, std::numeric_limits<std::int32_t>::min(), std::numeric_limits<std::int32_t>::max(),
+                             -std::numeric_limits<std::int32_t>::max()}) {
       auto b = good;
       std::memcpy(b.data() + payload + 13 + 4 * 3, &bad, 4);
       CHECK(refused(b));
@@ -611,6 +651,95 @@ TEST_CASE("dynamic topology leaves hidden faces and face set boundaries in place
   CHECK_FALSE(stack.undo(scene).empty());
   CHECK(obj.mesh.faceSets == before.faceSets);
   CHECK(obj.mesh.positions == before.positions);
+}
+
+// Positions of the vertices of every face whose set satisfies `pick`, sorted.
+template <typename F>
+std::vector<Vec3> faceCorners(const Mesh& m, F&& pick) {
+  std::vector<Vec3> out;
+  for (Index f = 0; f < m.faceCount(); ++f)
+    if (m.faceHe[f] != kInvalid && pick(m.faceSetValue(f))) m.forEachFaceVertex(f, [&](Index v) { out.push_back(m.positions[v]); });
+  std::sort(out.begin(), out.end(), [](const Vec3& a, const Vec3& b) { return std::tie(a.x, a.y, a.z) < std::tie(b.x, b.y, b.z); });
+  return out;
+}
+
+// Positions of the vertices where face sets meet, sorted.
+std::vector<Vec3> boundaryPoints(const Mesh& m) {
+  std::vector<Vec3> out;
+  for (Index v = 0; v < m.vertexCount(); ++v) {
+    std::set<std::int32_t> ids;
+    m.forEachOutgoing(v, [&](Index h) { ids.insert(faceSetId(m.faceSets[m.heFace[h]])); });
+    if (ids.size() > 1) out.push_back(m.positions[v]);
+  }
+  std::sort(out.begin(), out.end(), [](const Vec3& a, const Vec3& b) { return std::tie(a.x, a.y, a.z) < std::tie(b.x, b.y, b.z); });
+  return out;
+}
+
+TEST_CASE("dynamic topology changes only the auto-masked face set") {
+  Scene scene;
+  Mesh m = makeQuadSphere(16);
+  setFaceSets(m, [](const Vec3& c) -> std::int32_t { return c.z > 0.1f ? 2 : 3; });
+  SceneObject& obj = scene.add("A", std::move(m));
+  const std::vector<Vec3> otherBefore = faceCorners(obj.mesh, [](std::int32_t v) { return v == 3; });
+  Sculptor sculptor;
+  StrokeOptions opts;
+  opts.dyntopo = true;
+  opts.dyntopoOptions.timeBudgetMs = 0.0;
+  opts.faceSetAutoMask = true;
+  SmoothBrush smooth;
+  int splits = 0, collapses = 0;
+  std::vector<Vec3> centers;  // Starting in set 2, reaching well into set 3 (z < 0.1).
+  for (int i = 0; i < 4; ++i) centers.push_back(surfacePoint(obj, {0.3f * i - 0.45f, -0.8f, 0.35f}));
+  constexpr float radius = 0.8f;
+  int reached = 0;
+  for (Index f = 0; f < obj.mesh.faceCount(); ++f)
+    for (const Vec3& c : centers)
+      if (obj.mesh.faceSets[f] == 3 && glm::length(obj.mesh.faceCentroid(f) - c) < radius * 0.8f) {
+        ++reached;
+        break;
+      }
+  REQUIRE(reached > 50);
+  for (float detail : {0.03f, 0.3f}) {  // Refine, then coarsen, across both sets.
+    sculptor.beginStroke(obj, smooth, opts, "Dyntopo");
+    for (const Vec3& c : centers) sculptor.dab(c, radius, 0.0f, {.detail = detail});
+    REQUIRE(sculptor.endStroke());
+    splits += sculptor.lastStrokeTopology().splits;
+    collapses += sculptor.lastStrokeTopology().collapses;
+  }
+  CHECK(splits > 100);
+  CHECK(collapses > 100);
+  test::requireValid(obj.mesh);
+  // Set 3 has the same faces with the same corners; only set 2 was refined and coarsened.
+  CHECK(faceCorners(obj.mesh, [](std::int32_t v) { return v == 3; }) == otherBefore);
+}
+
+TEST_CASE("dynamic topology keeps locked face set boundaries point for point") {
+  Scene scene;
+  Mesh m = makeQuadSphere(16);
+  setFaceSets(m, [](const Vec3& c) -> std::int32_t { return c.y > 0.3f ? 2 : 3; });
+  SceneObject& obj = scene.add("A", std::move(m));
+  Sculptor sculptor;
+  StrokeOptions opts;
+  opts.dyntopo = true;
+  opts.dyntopoOptions.timeBudgetMs = 0.0;
+  SmoothBrush smooth;
+  auto stroke = [&](float detail) {
+    sculptor.beginStroke(obj, smooth, opts, "Dyntopo");
+    for (int i = 0; i < 6; ++i)
+      sculptor.dab(surfacePoint(obj, {0.1f * i - 0.3f, 0.3f, 1.0f}), 0.6f, 0.0f, {.detail = detail});
+    REQUIRE(sculptor.endStroke());
+    return sculptor.lastStrokeTopology().collapses;
+  };
+  stroke(0.02f);  // Refine: the boundary gains points.
+  const std::vector<Vec3> refined = boundaryPoints(obj.mesh);
+  opts.lockFaceSetBoundaries = true;
+  CHECK(stroke(0.4f) > 100);
+  test::requireValid(obj.mesh);
+  CHECK(boundaryPoints(obj.mesh) == refined);
+  // Unlocked, coarsening thins the boundary out (each remaining point lies on the old line).
+  opts.lockFaceSetBoundaries = false;
+  stroke(0.4f);
+  CHECK(boundaryPoints(obj.mesh).size() < refined.size());
 }
 
 // ----- Face set operations -----------------------------------------------------------------------
