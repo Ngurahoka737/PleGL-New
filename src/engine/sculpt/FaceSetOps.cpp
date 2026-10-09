@@ -119,7 +119,7 @@ std::optional<SculptUndo> applyFaceSetOp(SceneObject& object, FaceSetOp op, std:
   const bool any = !m.faceSets.empty();
   // Without face sets every face is in the default set and visible.
   if (!any && (op == FaceSetOp::Clear || op == FaceSetOp::RevealAll)) return std::nullopt;
-  if (op == FaceSetOp::FromMask && (!m.anyMasked() || m.newFaceSetId() == 0)) return std::nullopt;
+  if (op == FaceSetOp::FromMask && (!m.anyMasked() || object.newFaceSetId() == 0)) return std::nullopt;
   if ((op == FaceSetOp::Hide || op == FaceSetOp::Isolate) && faceSet <= 0) return std::nullopt;
   m.ensureFaceSets();
   const std::vector<std::int32_t> old = m.faceSets;
@@ -127,7 +127,7 @@ std::optional<SculptUndo> applyFaceSetOp(SceneObject& object, FaceSetOp op, std:
 
   switch (op) {
     case FaceSetOp::FromMask: {
-      const std::int32_t id = m.newFaceSetId();
+      const std::int32_t id = object.newFaceSetId();
       forEachLeafFace(bvh, [&](Index f) {
         if (sets[f] < 0) return;
         bool all = true;

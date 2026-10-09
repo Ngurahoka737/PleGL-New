@@ -27,11 +27,13 @@ struct SculptUndo {
   std::size_t bytes() const;
 };
 
-// A whole mesh with its BVH, as one topology state of an object.
+// A whole mesh with its BVH, as one topology state of an object, with the object's subdivision
+// levels if it had any (the mesh is then the active level).
 struct MeshState {
   Mesh mesh;
   Bvh bvh;
   std::uint64_t topologyVersion = 0;
+  std::shared_ptr<const Multires> multires;
   std::size_t bytes() const;
 };
 
@@ -68,6 +70,34 @@ void applySculptStates(SceneObject& object, const SculptUndo& entry, const std::
 // What a sculpt stroke leaves for undo.
 using StrokeUndo = std::variant<SculptUndo, DyntopoUndo>;
 
+// Multiresolution commands (see multires/MultiresOps.h). Every change of the active level is an
+// undo step of its own, so the history stays linear: a stroke is always undone on the level, leaf
+// layout and topology version it was recorded on.
+enum class MultiresOp : std::uint8_t {
+  Switch,        // Changed the active level.
+  Subdivide,     // Added a level on top and made it active.
+  DeleteHigher,  // Dropped the levels above the active one.
+  DeleteLower,   // Dropped the levels below the active one, which became the base.
+  AllLevels,     // Ran a mask or face set operation on every level.
+};
+
+struct MultiresUndo {
+  std::string label;
+  std::uint32_t objectId = 0;
+  MultiresOp op = MultiresOp::Switch;
+  int levelBefore = 0, levelAfter = 0;  // Active level on each side.
+  int countBefore = 0, countAfter = 0;  // Level count on each side; 0 for an object without levels.
+  std::uint64_t versionBefore = 0, versionAfter = 0;  // The object's topologyVersion on each side.
+  SyncDelta sync;                                     // Pending edits the command folded in.
+  std::vector<std::pair<int, SculptUndo>> perLevel;   // AllLevels: what changed on each level.
+  std::vector<MultiresLevel> held;                    // Levels that exist on one side only.
+  SubdivisionLinks heldLinks;                         // DeleteLower: the new base's old links.
+  std::shared_ptr<Multires> heldStack;                // The stack while the object has none.
+  std::size_t bytes() const;
+};
+
+struct SyncWorkspace;
+
 class UndoStack {
  public:
   explicit UndoStack(std::size_t maxBytes = std::size_t{1} << 30) : maxBytes_(maxBytes) {}
@@ -78,10 +108,16 @@ class UndoStack {
   void push(TopologyUndo entry);
   void push(DyntopoUndo entry);
   void push(StrokeUndo entry);
+  // Adds a multires entry. Level steps that follow each other with nothing in between merge into
+  // one entry (a step that ends where the first began disappears), so browsing levels does not
+  // flood the history.
+  void push(MultiresUndo entry);
 
   // Scratch memory for dynamic topology undo, shared with the sculptor so only one exists.
   // Without one the stack makes its own on first use.
   void setLayoutWorkspace(std::shared_ptr<LayoutWorkspace> workspace) { workspace_ = std::move(workspace); }
+  // Scratch memory for multires syncs, shared with the app's level commands.
+  void setSyncWorkspace(std::shared_ptr<SyncWorkspace> workspace) { syncWorkspace_ = std::move(workspace); }
 
   // Return the label of what was undone or redone, or empty when nothing applied.
   std::string undo(Scene& scene);
@@ -94,12 +130,13 @@ class UndoStack {
   void clear();
 
  private:
-  using Entry = std::variant<SculptUndo, TopologyUndo, DyntopoUndo>;
+  using Entry = std::variant<SculptUndo, TopologyUndo, DyntopoUndo, MultiresUndo>;
   void pushEntry(Entry entry);
   static std::size_t bytesOf(const Entry& e);
   static bool apply(Scene& scene, const SculptUndo& entry, const std::vector<LeafState>& states);
   static bool apply(Scene& scene, const TopologyUndo& entry, const MeshState& from, const MeshState& to);
   bool apply(Scene& scene, DyntopoUndo& entry, bool redo);
+  bool apply(Scene& scene, MultiresUndo& entry, bool redo);
   // Drops the oldest undoable entries while over budget.
   void trim();
 
@@ -108,6 +145,7 @@ class UndoStack {
   std::size_t bytes_ = 0;
   std::size_t maxBytes_;
   std::shared_ptr<LayoutWorkspace> workspace_;
+  std::shared_ptr<SyncWorkspace> syncWorkspace_;
 };
 
 }  // namespace plegl

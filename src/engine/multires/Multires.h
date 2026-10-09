@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include "mesh/Mesh.h"
@@ -86,6 +87,9 @@ struct MultiresLevel {
   std::uint64_t layoutHash = 0;  // layoutHash(bvh) when the level was created.
   bool boundsStale = false;      // Parked positions changed: refit when the level becomes active.
   std::vector<VertexRule> rule;  // Per live vertex.
+  // (vertex, outgoing half-edge) for every half-edge leaving a non-manifold vertex, sorted, so
+  // propagation reaches all of its fans (Mesh::forEachOutgoing walks one). Usually empty.
+  std::vector<std::pair<Index, Index>> nonManifoldFaces;
   CanonicalMap canon;
   SubdivisionLinks links;        // To the level below; empty on level 0.
   std::size_t bytes() const;

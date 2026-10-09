@@ -2,6 +2,8 @@
 
 #include <algorithm>
 
+#include "multires/MultiresOps.h"
+
 namespace plegl {
 
 std::size_t SculptUndo::bytes() const {
@@ -19,7 +21,7 @@ std::size_t MeshState::bytes() const {
          m.faceSets.size() * sizeof(std::int32_t) +
          (m.heNext.size() + m.heTwin.size() + m.heVert.size() + m.heFace.size() + m.vertHe.size() +
           m.faceHe.size()) * sizeof(Index) +
-         bvh.memoryBytes();
+         bvh.memoryBytes() + (multires ? multires->bytes() : 0);
 }
 
 std::size_t TopologyUndo::bytes() const {
@@ -28,6 +30,13 @@ std::size_t TopologyUndo::bytes() const {
 
 std::size_t DyntopoUndo::bytes() const {
   return delta.bytes() + before.bytes() + (after ? after->bytes() : 0);
+}
+
+std::size_t MultiresUndo::bytes() const {
+  std::size_t n = sizeof(MultiresUndo) + sync.bytes() + heldLinks.bytes() + (heldStack ? heldStack->bytes() : 0);
+  for (const auto& [level, entry] : perLevel) n += entry.bytes();
+  for (const MultiresLevel& l : held) n += l.bytes();
+  return n;
 }
 
 std::size_t UndoStack::bytesOf(const Entry& e) {
@@ -39,6 +48,26 @@ void UndoStack::push(TopologyUndo entry) { pushEntry(std::move(entry)); }
 void UndoStack::push(DyntopoUndo entry) { pushEntry(std::move(entry)); }
 void UndoStack::push(StrokeUndo entry) {
   std::visit([this](auto&& e) { pushEntry(std::move(e)); }, std::move(entry));
+}
+
+void UndoStack::push(MultiresUndo entry) {
+  if (entry.op == MultiresOp::Switch && entry.sync.empty() && cursor_ == entries_.size() && !entries_.empty()) {
+    auto* top = std::get_if<MultiresUndo>(&entries_.back());
+    if (top && top->op == MultiresOp::Switch && top->objectId == entry.objectId &&
+        top->levelAfter == entry.levelBefore && top->versionAfter == entry.versionBefore &&
+        top->countAfter == entry.countBefore) {
+      top->levelAfter = entry.levelAfter;
+      top->versionAfter = entry.versionAfter;
+      top->label = entry.label;
+      if (top->levelBefore == top->levelAfter && top->sync.empty()) {
+        bytes_ -= bytesOf(entries_.back());
+        entries_.pop_back();
+        cursor_ = entries_.size();
+      }
+      return;
+    }
+  }
+  pushEntry(std::move(entry));
 }
 
 void UndoStack::pushEntry(Entry entry) {
@@ -120,17 +149,20 @@ bool UndoStack::apply(Scene& scene, const SculptUndo& entry, const std::vector<L
 
 bool UndoStack::apply(Scene& scene, const TopologyUndo& entry, const MeshState& from, const MeshState& to) {
   SceneObject* obj = scene.find(entry.objectId);
-  if (!obj || obj->topologyVersion != from.topologyVersion) return false;
+  if (!obj || obj->topologyVersion != from.topologyVersion || (obj->multires != nullptr) != (from.multires != nullptr))
+    return false;
   obj->mesh = to.mesh;
   obj->bvh = to.bvh;
   obj->topologyVersion = to.topologyVersion;
+  // A copy with the same versions: the state stays intact for the next undo or redo.
+  obj->multires = to.multires ? std::shared_ptr<Multires>(to.multires->clone(false)) : nullptr;
   obj->clearDirty();
   return true;
 }
 
 bool UndoStack::apply(Scene& scene, DyntopoUndo& entry, bool redo) {
   SceneObject* obj = scene.find(entry.objectId);
-  if (!obj) return false;
+  if (!obj || obj->multires) return false;
   if (!workspace_) workspace_ = std::make_shared<LayoutWorkspace>();
   if (!redo) {
     if (obj->topologyVersion != entry.afterVersion) return false;
@@ -155,6 +187,15 @@ bool UndoStack::apply(Scene& scene, DyntopoUndo& entry, bool redo) {
   return true;
 }
 
+bool UndoStack::apply(Scene& scene, MultiresUndo& entry, bool redo) {
+  if (!syncWorkspace_) syncWorkspace_ = std::make_shared<SyncWorkspace>();
+  // Held levels move in and out of the entry, so its size changes.
+  const std::size_t before = entry.bytes();
+  if (!applyMultiresUndo(scene, entry, redo, *syncWorkspace_)) return false;
+  bytes_ = bytes_ - before + entry.bytes();
+  return true;
+}
+
 std::string UndoStack::undo(Scene& scene) {
   // Skip entries whose object is gone or was rebuilt; they can never apply again.
   while (cursor_ > 0) {
@@ -167,6 +208,12 @@ std::string UndoStack::undo(Scene& scene) {
       if (apply(scene, *d, false)) {
         std::string label = d->label;
         trim();  // The captured after side may push the stack over budget.
+        return label;
+      }
+    } else if (auto* m = std::get_if<MultiresUndo>(&entry)) {
+      if (apply(scene, *m, false)) {
+        std::string label = m->label;
+        trim();
         return label;
       }
     }
@@ -183,6 +230,12 @@ std::string UndoStack::redo(Scene& scene) {
       if (apply(scene, *t, *t->before, *t->after)) return t->label;
     } else if (auto* d = std::get_if<DyntopoUndo>(&entry)) {
       if (apply(scene, *d, true)) return d->label;
+    } else if (auto* m = std::get_if<MultiresUndo>(&entry)) {
+      if (apply(scene, *m, true)) {
+        std::string label = m->label;
+        trim();
+        return label;
+      }
     }
   }
   return {};

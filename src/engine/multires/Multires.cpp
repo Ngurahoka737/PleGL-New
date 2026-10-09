@@ -21,8 +21,8 @@ std::size_t SubdivisionLinks::bytes() const {
 }
 
 std::size_t MultiresLevel::bytes() const {
-  return meshBytes(mesh) + bvh.memoryBytes() + vecBytes(rule) + vecBytes(canon.vert) + vecBytes(canon.face) +
-         vecBytes(canon.faceStart) + links.bytes();
+  return meshBytes(mesh) + bvh.memoryBytes() + vecBytes(rule) + vecBytes(nonManifoldFaces) + vecBytes(canon.vert) +
+         vecBytes(canon.face) + vecBytes(canon.faceStart) + links.bytes();
 }
 
 std::size_t LevelReference::bytes() const { return vecBytes(positions) + vecBytes(mask) + vecBytes(faceSets); }

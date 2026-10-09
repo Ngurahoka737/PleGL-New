@@ -86,6 +86,11 @@ SceneObject* Scene::duplicate(std::uint32_t id) {
   obj->mesh = src->mesh;
   obj->bvh = src->bvh;  // Same vertex order, so the copy is valid as is.
   obj->topologyVersion = nextTopologyVersion();
+  if (src->multires) {
+    // Every level gets a new version; pending edits come along as they are.
+    obj->multires = std::shared_ptr<Multires>(src->multires->clone(true));
+    obj->topologyVersion = obj->multires->levels[static_cast<std::size_t>(obj->multires->active)].version;
+  }
   obj->transform = src->transform;
   obj->visible = src->visible;
   objects_.push_back(std::move(obj));
