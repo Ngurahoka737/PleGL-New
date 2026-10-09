@@ -100,7 +100,8 @@ struct SyncStamps {
   bool has(Index i) const { return mark[static_cast<std::size_t>(i)] == current; }
 };
 
-// Scratch memory for syncs, kept between them (grows to about 40 bytes per vertex of all levels).
+// Scratch memory for syncs, kept between them (grows to about 70 bytes per vertex of all levels;
+// replace it with a fresh one to give that back).
 struct SyncWorkspace {
   template <class T>
   struct Overlay {

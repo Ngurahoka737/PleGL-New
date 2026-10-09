@@ -489,6 +489,7 @@ void App::newScene() {
   if (sculptor_.active()) endStroke();  // Never act on a mesh in the middle of a stroke.
   scene.clear();
   undoStack.clear();
+  releaseSyncScratch();
   selectedId = 0;
   hover_.reset();
   projectPath_.clear();
@@ -498,7 +499,10 @@ void App::newScene() {
 
 void App::deleteSelected() {
   if (sculptor_.active()) endStroke();  // Never act on a mesh in the middle of a stroke.
+  const SceneObject* obj = scene.find(selectedId);
+  const bool hadLevels = obj && obj->multires;
   if (selectedId && scene.remove(selectedId)) {
+    if (hadLevels) releaseSyncScratch();
     statusMessage = "Deleted object";
     selectedId = 0;
     hover_.reset();
@@ -536,6 +540,11 @@ void App::bumpUnderCursor() {
   }
   SceneObject* obj = editableObject(hover_->objectId, "mesh");
   if (!obj) return;
+  if (obj->multires) {
+    // The bump has no undo entry, and undoing a level switch would lose it or stop it spreading.
+    statusMessage = "The bump test is not available on objects with subdivision levels.";
+    return;
+  }
   Timer t;
   Mesh& m = obj->mesh;
   const Vec3 center = hover_->localHit.position;
@@ -924,6 +933,11 @@ void App::requestRemesh() {
 void App::requestSubdivide() {
   SceneObject* obj = editableObject(selectedId, "levels");
   if (!obj || waitForJob(0, "subdividing")) return;
+  // Refuse before stepping to the top, so a refused command leaves the level alone.
+  if (std::string why = subdivideRefusal(*obj); !why.empty()) {
+    statusMessage = "Cannot subdivide " + obj->name + ": " + why;
+    return;
+  }
   if (obj->multires && obj->multires->active != obj->multires->top()) {
     // New levels go on top, so step there first (its own undo step).
     setLevel(obj->multires->top());
@@ -1011,6 +1025,7 @@ void App::deleteHigherLevels() {
   if (!obj || !obj->multires) return;
   Timer t;
   pushEdit(plegl::deleteHigherLevels(*obj), "Delete Higher Levels", t.ms());
+  releaseSyncScratch();
 }
 
 void App::deleteLowerLevels() {
@@ -1018,6 +1033,12 @@ void App::deleteLowerLevels() {
   if (!obj || !obj->multires) return;
   Timer t;
   pushEdit(plegl::deleteLowerLevels(*obj), "Delete Lower Levels", t.ms());
+  releaseSyncScratch();
+}
+
+void App::releaseSyncScratch() {
+  // The undo stack shares the workspace, so replace its contents rather than the pointer.
+  *syncWorkspace_ = SyncWorkspace{};
 }
 
 // ---- Files ---------------------------------------------------------------------------------

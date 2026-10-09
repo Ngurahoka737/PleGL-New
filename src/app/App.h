@@ -233,7 +233,8 @@ class App {
   void pushEdit(std::optional<MultiresUndo> entry, const char* name, double ms);
   // "Wait for the remesh to finish before <action>." when `id` is the busy object (0: any).
   bool waitForJob(std::uint32_t id, const std::string& action);
-  void pushLevelEdit(SceneObject& obj, std::optional<MultiresUndo> entry, const char* failure, double ms);
+  // Gives back the sync scratch, which grows with the largest levels ever synced.
+  void releaseSyncScratch();
 
   SDL_Window* window_ = nullptr;
   SDL_GLContext gl_ = nullptr;

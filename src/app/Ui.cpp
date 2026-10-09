@@ -162,8 +162,12 @@ void App::drawUi() {
       const SceneObject* sel = scene.find(selectedId);
       const Multires* levels = sel ? sel->multires.get() : nullptr;
       const bool can = canEditMask();
-      if (ImGui::MenuItem(job() == Job::Subdivide ? "Subdividing..." : "Subdivide", "Ctrl+PgUp", false, can && !busy()))
+      const std::string refusal = sel ? subdivideRefusal(*sel) : std::string();
+      if (ImGui::MenuItem(job() == Job::Subdivide ? "Subdividing..." : "Subdivide", "Ctrl+PgUp", false,
+                          can && !busy() && refusal.empty()))
         requestSubdivide();
+      if (!refusal.empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("%s", refusal.c_str());
       ImGui::Separator();
       const bool canSwitch = can && levels;
       if (ImGui::MenuItem("Level Up", "PgUp", false, canSwitch && levels->active < levels->top())) stepLevel(1);
@@ -559,14 +563,19 @@ void App::drawUi() {
         } else {
           ImGui::TextDisabled("None. Subdivide to add a level.");
         }
-        ImGui::BeginDisabled(!can || busy());
+        const std::string refusal = subdivideRefusal(*still);
+        ImGui::BeginDisabled(!can || busy() || !refusal.empty());
         if (ImGui::Button(job() == Job::Subdivide ? "Subdividing..." : "Subdivide (Ctrl+Page Up)", ImVec2(-1, 0)))
           requestSubdivide();
         ImGui::EndDisabled();
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-          ImGui::SetTooltip("Adds a level on top: every face splits into four, smoothly (Catmull-Clark).\n"
-                            "Shape on low levels, detail on high ones; edits carry across levels.\n"
-                            "Page Up / Page Down switch levels.");
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+          if (!refusal.empty())
+            ImGui::SetTooltip("%s", refusal.c_str());
+          else
+            ImGui::SetTooltip("Adds a level on top: every face splits into four, smoothly (Catmull-Clark).\n"
+                              "Shape on low levels, detail on high ones; edits carry across levels.\n"
+                              "Page Up / Page Down switch levels.");
+        }
         if (const Multires* levels = still->multires.get()) {
           const float half = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
           ImGui::BeginDisabled(!can || levels->active == levels->top());

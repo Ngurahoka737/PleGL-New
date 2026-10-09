@@ -31,8 +31,8 @@ void forEachLeafFace(const Bvh& bvh, Fn&& fn) {
   });
 }
 
-// Builds the undo entry for the leaves whose face sets differ from `old`, and marks them for
-// upload: colours always, index data where a face was hidden or shown.
+}  // namespace
+
 std::optional<SculptUndo> recordFaceSets(SceneObject& object, const std::vector<std::int32_t>& old, const char* label) {
   const Mesh& m = object.mesh;
   const auto& leaves = object.bvh.leaves();
@@ -73,9 +73,12 @@ std::optional<SculptUndo> recordFaceSets(SceneObject& object, const std::vector<
   return entry;
 }
 
+namespace {
+
 // Gives every connected part of the mesh (faces joined across edges) its own set, starting at
-// `first`, keeping each face's visibility.
-void assignLooseParts(Mesh& m, const Bvh& bvh, std::int32_t first) {
+// `first`, keeping each face's visibility. Returns false, changing nothing, when the ids would
+// pass kMaxFaceSetId.
+bool assignLooseParts(Mesh& m, const Bvh& bvh, std::int32_t first) {
   const Index nf = m.faceCount();
   std::vector<std::int32_t> part(static_cast<std::size_t>(nf), 0);
   std::vector<Index> stack;
@@ -84,6 +87,7 @@ void assignLooseParts(Mesh& m, const Bvh& bvh, std::int32_t first) {
   for (const BvhLeaf& leaf : leaves) {
     for (Index seed = leaf.faceBegin; seed < leaf.faceEnd; ++seed) {
       if (part[seed] != 0 || m.faceHe[seed] == kInvalid) continue;
+      if (next > kMaxFaceSetId) return false;
       const std::int32_t id = next++;
       part[seed] = id;
       stack.assign(1, seed);
@@ -109,6 +113,7 @@ void assignLooseParts(Mesh& m, const Bvh& bvh, std::int32_t first) {
   forEachLeafFace(bvh, [&](Index f) {
     if (part[f] != 0) m.faceSets[f] = m.faceSets[f] < 0 ? -part[f] : part[f];
   });
+  return true;
 }
 
 }  // namespace
@@ -136,9 +141,16 @@ std::optional<SculptUndo> applyFaceSetOp(SceneObject& object, FaceSetOp op, std:
       });
       break;
     }
-    case FaceSetOp::FromLooseParts:
-      assignLooseParts(m, bvh, kDefaultFaceSet + 1);  // Every part gets a colour.
+    case FaceSetOp::FromLooseParts: {
+      // Every part gets a colour. With subdivision levels the ids must be new on every level, or
+      // finer levels that keep an id under an unchanged coarse face would share it with a part.
+      const std::int32_t first = object.multires ? object.newFaceSetId() : kDefaultFaceSet + 1;
+      if (first == 0 || !assignLooseParts(m, bvh, first)) {
+        m.faceSets = old;
+        return std::nullopt;
+      }
       break;
+    }
     case FaceSetOp::Clear:
       forEachLeafFace(bvh, [&](Index f) { sets[f] = sets[f] < 0 ? -kDefaultFaceSet : kDefaultFaceSet; });
       break;

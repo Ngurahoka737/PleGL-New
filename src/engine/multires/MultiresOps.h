@@ -35,7 +35,11 @@ struct SubdivideJob {
   std::string error;
 };
 
-// Refuses (with a message) when the object is not at its top level or has 8 levels.
+// Why the object cannot get another level (8 levels already, or the next would be too big), or
+// empty when it can. Looks at the top level whichever level is active.
+std::string subdivideRefusal(const SceneObject& object);
+// Refuses (with a message) when the object is not at its top level, subdivideRefusal() says no,
+// or a position is not finite.
 std::optional<SubdivideJob> prepareSubdivide(const SceneObject& object, std::string* error = nullptr);
 // Worker-safe.
 void runSubdivideJob(SubdivideJob& job);
@@ -61,7 +65,8 @@ std::optional<MultiresUndo> deleteLowerLevels(SceneObject& object);
 // Runs a mask operation on every level, so mask that exists only on one level is cleared too.
 // For Clear, Fill and Invert (Blur and Sharpen act on the active level and propagate).
 std::optional<MultiresUndo> applyMaskOpAllLevels(SceneObject& object, MaskOp op, SyncWorkspace& ws);
-// Runs a face set operation on every level. For Clear, RevealAll and InvertVisibility.
+// Runs a face set operation on every level. For Clear, RevealAll and InvertVisibility (which
+// inverts the top level; lower levels follow their children, as syncs would).
 std::optional<MultiresUndo> applyFaceSetOpAllLevels(SceneObject& object, FaceSetOp op, SyncWorkspace& ws);
 
 // Undoes or redoes a multires entry. Returns false (changing nothing) when the object is not in

@@ -813,3 +813,135 @@ TEST_CASE("levels: normals stay a pure function of positions after strokes") {
     CHECK(sameArray(stored, m.normals));
   }
 }
+
+TEST_CASE("levels: Invert Visibility keeps coarse faces hidden only when all children are") {
+  Scene scene;
+  SyncWorkspace ws;
+  SceneObject& obj = addLeveled(scene, ws, 2, 4);
+  // Hide two of the four children of some level 1 faces on level 2.
+  REQUIRE(obj.multires->active == 2);
+  const SubdivisionLinks& L2 = obj.multires->levels[2].links;
+  const Mesh& c1 = obj.multires->levels[1].mesh;
+  obj.mesh.ensureFaceSets();
+  for (Index f = 0; f < c1.faceCount(); f += 3) {
+    const Index h = c1.faceHe[f];
+    obj.mesh.faceSets[L2.childFace[h]] = -kDefaultFaceSet;
+    obj.mesh.faceSets[L2.childFace[c1.heNext[h]]] = -kDefaultFaceSet;
+  }
+  UndoStack undo;
+  step(obj, 1, undo, ws);
+  auto rule = [&](int k) {
+    const Mesh& coarse = levelMesh(obj, k);
+    const Mesh& fine = levelMesh(obj, k + 1);
+    const SubdivisionLinks& L = obj.multires->levels[static_cast<std::size_t>(k + 1)].links;
+    int broken = 0;
+    for (Index f = 0; f < coarse.faceCount(); ++f) {
+      bool all = true;
+      const Index start = coarse.faceHe[f];
+      Index h = start;
+      do {
+        all &= fine.faceHidden(L.childFace[h]);
+        h = coarse.heNext[h];
+      } while (h != start);
+      broken += coarse.faceHidden(f) != all;
+    }
+    return broken;
+  };
+  REQUIRE(rule(0) == 0);
+  REQUIRE(rule(1) == 0);
+  auto inv = applyFaceSetOpAllLevels(obj, FaceSetOp::InvertVisibility, ws);
+  REQUIRE(inv);
+  CHECK(rule(0) == 0);
+  CHECK(rule(1) == 0);
+  // Painting an id on a visible child must not change any visibility below.
+  std::vector<std::int32_t> l1 = obj.mesh.faceSets;
+  step(obj, 2, undo, ws);
+  for (Index f = 0; f < obj.mesh.faceCount(); ++f)
+    if (!obj.mesh.faceHidden(f)) {
+      obj.mesh.faceSets[f] = 5;
+      break;
+    }
+  step(obj, 1, undo, ws);
+  for (Index f = 0; f < obj.mesh.faceCount(); ++f) CHECK(obj.mesh.faceHidden(f) == faceSetHidden(l1[f]));
+  requireValidLevels(obj);
+}
+
+TEST_CASE("levels: loose parts take ids no level uses") {
+  // Two separate spheres.
+  std::vector<Vec3> pos;
+  std::vector<Index> idx, sizes;
+  for (float x : {-1.5f, 1.5f}) {
+    const Mesh s = makeQuadSphere(3);
+    const Index base = static_cast<Index>(pos.size());
+    for (const Vec3& p : s.positions) pos.push_back(p + Vec3{x, 0.0f, 0.0f});
+    for (Index f = 0; f < s.faceCount(); ++f) {
+      Index n = 0;
+      s.forEachFaceVertex(f, [&](Index v) {
+        idx.push_back(base + v);
+        ++n;
+      });
+      sizes.push_back(n);
+    }
+  }
+  Scene scene;
+  SyncWorkspace ws;
+  SceneObject& obj = scene.add("Pair", buildMesh(std::move(pos), idx, sizes));
+  REQUIRE(subdivideObject(obj, ws));
+  // A set on one level 1 face only, which loses the vote on level 0.
+  obj.mesh.ensureFaceSets();
+  const std::int32_t stray = obj.newFaceSetId();
+  obj.mesh.faceSets[0] = stray;
+  REQUIRE(setActiveLevel(obj, 0, ws));
+  auto parts = applyFaceSetOp(obj, FaceSetOp::FromLooseParts);
+  REQUIRE(parts);
+  REQUIRE(setActiveLevel(obj, 1, ws));
+  // Every level 1 face now has its parent's id, and no part id is the stray one.
+  const Mesh& coarse = obj.multires->levels[0].mesh;
+  const SubdivisionLinks& L = obj.multires->levels[1].links;
+  for (Index f = 0; f < obj.mesh.faceCount(); ++f) {
+    const std::int32_t id = faceSetId(obj.mesh.faceSetValue(f));
+    CHECK(id == faceSetId(coarse.faceSetValue(coarse.heFace[L.parentHalfEdge[f]])));
+    CHECK(id > stray);
+  }
+}
+
+TEST_CASE("levels: undoing a subdivide does not drop older history") {
+  // Bytes before and after undoing the last Subdivide, with no budget.
+  auto run = [](std::size_t budget, std::size_t* before, std::size_t* after) {
+    Scene scene;
+    SyncWorkspace ws;
+    UndoStack undo(budget);
+    SceneObject& obj = scene.add("Head", makeQuadSphere(8));
+    undo.push(std::move(*subdivideObject(obj, ws)));
+    for (int i = 0; i < 3; ++i) undo.push(std::move(*stroke(obj, {0.2f * float(i), 1, 0}, 0.3f)));
+    undo.push(std::move(*subdivideObject(obj, ws)));
+    if (before) *before = undo.bytes();
+    CHECK(undo.undo(scene) == "Subdivide");
+    if (after) *after = undo.bytes();
+    int more = 0;
+    while (!undo.undo(scene).empty()) ++more;
+    return more;
+  };
+  std::size_t before = 0, after = 0;
+  CHECK(run(std::size_t{1} << 40, &before, &after) == 4);
+  REQUIRE(after > before);
+  // A budget between the two: the held level must not push the strokes out.
+  CHECK(run((before + after) / 2, nullptr, nullptr) == 4);
+}
+
+TEST_CASE("levels: a full stack refuses to subdivide from any level without switching") {
+  Scene scene;
+  SyncWorkspace ws;
+  SceneObject& obj = scene.add("Cube", makeCube(1));
+  for (int i = 0; i < kMaxMultiresLevels - 1; ++i) REQUIRE(subdivideObject(obj, ws));
+  REQUIRE(obj.multires->levelCount() == kMaxMultiresLevels);
+  CHECK(!subdivideRefusal(obj).empty());
+  REQUIRE(setActiveLevel(obj, 2, ws));
+  CHECK(subdivideRefusal(obj).find("most levels") != std::string::npos);
+  CHECK(obj.multires->active == 2);
+  Scene small;
+  SceneObject& two = small.add("Cube", makeCube(1));
+  REQUIRE(subdivideObject(two, ws));
+  REQUIRE(setActiveLevel(two, 0, ws));
+  CHECK(subdivideRefusal(two).empty());
+}

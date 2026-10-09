@@ -1,6 +1,7 @@
 #include "multires/MultiresOps.h"
 
 #include <algorithm>
+#include <cmath>
 #include <iterator>
 
 namespace plegl {
@@ -107,21 +108,24 @@ void dropLower(SceneObject& obj, MultiresUndo& u) {
   if (s.levelCount() == 1) u.heldStack = std::exchange(obj.multires, nullptr);
 }
 
+// Runs op(level as an object, k) on every level, from the top down when `topDown` is set (so a
+// level can read the finished level above it).
 template <class Op>
-std::optional<MultiresUndo> allLevels(SceneObject& obj, std::string label, SyncWorkspace& ws, Op&& op) {
+std::optional<MultiresUndo> allLevels(SceneObject& obj, std::string label, SyncWorkspace& ws, bool topDown, Op&& op) {
   if (!obj.multires) return std::nullopt;
   Multires& s = *obj.multires;
   MultiresUndo u = makeEntry(obj, MultiresOp::AllLevels, std::move(label));
   u.sync = syncPending(obj, ws);
   applyDelta(s, u.sync, true, ws);
   growBound(obj);
-  for (int k = 0; k < s.levelCount(); ++k) {
+  for (int i = 0; i < s.levelCount(); ++i) {
+    const int k = topDown ? s.top() - i : i;
     std::optional<SculptUndo> r;
     if (k == s.active) {
-      r = op(obj);
+      r = op(obj, k);
     } else {
       ParkedObject parked(obj, s.levels[static_cast<std::size_t>(k)]);
-      r = op(parked.obj);
+      r = op(parked.obj, k);
     }
     if (r) u.perLevel.emplace_back(k, std::move(*r));
   }
@@ -154,18 +158,26 @@ void applyLevelStates(SceneObject& obj, MultiresUndo& u, bool redo) {
 
 }  // namespace
 
+std::string subdivideRefusal(const SceneObject& o) {
+  const Multires* s = o.multires.get();
+  const Mesh& top = s && s->active != s->top() ? s->levels[static_cast<std::size_t>(s->top())].mesh : o.mesh;
+  if (top.faceCount() == 0) return "The object has no faces.";
+  if (s && s->levelCount() >= kMaxMultiresLevels) return "The object already has the most levels (8).";
+  if (top.halfEdgeCount() > kMaxMultiresFaces) return "The next level would have more than 8.4 million faces.";
+  return {};
+}
+
 std::optional<SubdivideJob> prepareSubdivide(const SceneObject& o, std::string* error) {
-  auto fail = [&](const char* message) -> std::optional<SubdivideJob> {
-    if (error) *error = message;
+  auto fail = [&](std::string message) -> std::optional<SubdivideJob> {
+    if (error) *error = std::move(message);
     return std::nullopt;
   };
-  if (o.mesh.faceCount() == 0) return fail("The object has no faces.");
-  if (o.multires) {
-    const Multires& s = *o.multires;
-    if (s.active != s.top()) return fail("Subdivide works from the highest level.");
-    if (s.levelCount() >= kMaxMultiresLevels) return fail("The object already has the most levels (8).");
-  }
-  if (o.mesh.halfEdgeCount() > kMaxMultiresFaces) return fail("The next level would have more than 8.4 million faces.");
+  if (o.multires && o.multires->active != o.multires->top()) return fail("Subdivide works from the highest level.");
+  if (std::string why = subdivideRefusal(o); !why.empty()) return fail(std::move(why));
+  // NaN or infinity would spread into every new level and make the project unsaveable.
+  for (const Vec3& p : o.mesh.positions)
+    if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z))
+      return fail("The mesh has vertices with invalid coordinates.");
   SubdivideJob job;
   job.objectId = o.id;
   job.version = o.topologyVersion;
@@ -290,11 +302,38 @@ std::optional<MultiresUndo> deleteLowerLevels(SceneObject& obj) {
 }
 
 std::optional<MultiresUndo> applyMaskOpAllLevels(SceneObject& obj, MaskOp op, SyncWorkspace& ws) {
-  return allLevels(obj, maskOpName(op), ws, [&](SceneObject& o) { return applyMaskOp(o, op); });
+  return allLevels(obj, maskOpName(op), ws, false, [&](SceneObject& o, int) { return applyMaskOp(o, op); });
 }
 
 std::optional<MultiresUndo> applyFaceSetOpAllLevels(SceneObject& obj, FaceSetOp op, SyncWorkspace& ws) {
-  return allLevels(obj, faceSetOpName(op), ws, [&](SceneObject& o) { return applyFaceSetOp(o, op); });
+  if (op != FaceSetOp::InvertVisibility)
+    return allLevels(obj, faceSetOpName(op), ws, false, [&](SceneObject& o, int) { return applyFaceSetOp(o, op); });
+  // Syncs keep a coarse face hidden exactly when all its children are. Inverting every level on
+  // its own would break that for coarse faces whose children were partly hidden, and the next
+  // face set change below them would flip them back. So invert the top level and let each level
+  // below follow its children, keeping its ids.
+  const Multires& s = *obj.multires;
+  return allLevels(obj, faceSetOpName(op), ws, true, [&](SceneObject& o, int k) -> std::optional<SculptUndo> {
+    if (k == s.top()) return applyFaceSetOp(o, op);
+    const Mesh& fine = k + 1 == s.active ? obj.mesh : s.levels[static_cast<std::size_t>(k + 1)].mesh;
+    const SubdivisionLinks& L = s.levels[static_cast<std::size_t>(k + 1)].links;
+    Mesh& m = o.mesh;
+    if (fine.faceSets.empty() && m.faceSets.empty()) return std::nullopt;
+    m.ensureFaceSets();
+    const std::vector<std::int32_t> old = m.faceSets;
+    for (Index f = 0; f < m.faceCount(); ++f) {
+      bool allHidden = true;
+      const Index start = m.faceHe[f];
+      Index h = start;
+      do {
+        allHidden &= fine.faceHidden(L.childFace[h]);
+        h = m.heNext[h];
+      } while (h != start);
+      const std::int32_t id = faceSetId(m.faceSets[f]);
+      m.faceSets[f] = allHidden ? -id : id;
+    }
+    return recordFaceSets(o, old, faceSetOpName(op));
+  });
 }
 
 bool applyMultiresUndo(Scene& scene, MultiresUndo& u, bool redo, SyncWorkspace& ws) {

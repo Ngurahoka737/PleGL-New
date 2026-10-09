@@ -211,11 +211,9 @@ std::string UndoStack::undo(Scene& scene) {
         return label;
       }
     } else if (auto* m = std::get_if<MultiresUndo>(&entry)) {
-      if (apply(scene, *m, false)) {
-        std::string label = m->label;
-        trim();
-        return label;
-      }
+      // No trim: levels an undo or redo moves into the entry were in the object a moment ago, so
+      // memory did not grow, and trimming would throw away older history to pay for redo data.
+      if (apply(scene, *m, false)) return m->label;
     }
   }
   return {};
@@ -231,11 +229,7 @@ std::string UndoStack::redo(Scene& scene) {
     } else if (auto* d = std::get_if<DyntopoUndo>(&entry)) {
       if (apply(scene, *d, true)) return d->label;
     } else if (auto* m = std::get_if<MultiresUndo>(&entry)) {
-      if (apply(scene, *m, true)) {
-        std::string label = m->label;
-        trim();
-        return label;
-      }
+      if (apply(scene, *m, true)) return m->label;
     }
   }
   return {};

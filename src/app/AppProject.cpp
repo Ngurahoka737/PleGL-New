@@ -387,6 +387,7 @@ void App::applyProject(Project project, const std::filesystem::path& path, bool 
   if (sculptor_.active()) endStroke();
   scene.clear();
   undoStack.clear();
+  releaseSyncScratch();
   hover_.reset();
   std::size_t vertices = 0;
   for (ProjectObject& po : project.objects) {

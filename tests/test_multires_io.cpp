@@ -8,6 +8,7 @@
 #include "mesh/Primitives.h"
 #include "multires/MultiresIo.h"
 #include "multires/MultiresOps.h"
+#include "multires/Subdivide.h"
 #include "scene/Scene.h"
 #include "sculpt/Sculptor.h"
 
@@ -242,6 +243,77 @@ TEST_CASE("a non-manifold base reloads with identical twins") {
   requireSameCanonical(obj, *loaded->objects()[0]);
 }
 
+TEST_CASE("a base face that repeats a corner is refused at any active level") {
+  // A hexagon a b x b a y with no twins passes every twin and fan check, and its level 1 quads
+  // all have distinct corners, so only the corner check catches it. Saving again from level 0
+  // would fail, because buildMesh drops the hexagon.
+  Mesh base;
+  base.positions = {{0, 0, 0}, {1, 0, 0}, {2, 1, 0}, {0, 2, 0}};
+  base.heVert = {0, 1, 2, 1, 0, 3};
+  base.heNext = {1, 2, 3, 4, 5, 0};
+  base.heFace.assign(6, 0);
+  base.heTwin.assign(6, kInvalid);
+  base.faceHe = {0};
+  base.vertHe = {0, 1, 2, 5};
+  base.computeNormals();
+  MultiresFileData d;
+  d.active = 1;
+  d.baseVertices = 4;
+  d.baseSizes = {6};
+  d.baseCorners = {0, 1, 2, 1, 0, 3};
+  d.baseTwins.assign(6, kInvalid);
+  d.baseVertHe = {0, 1, 2, 5};
+  std::vector<Mesh> meshes{base};
+  std::vector<CanonicalMap> canons{identityCanonicalMap(base)};
+  std::vector<std::vector<VertexRule>> rules{classifyVertices(base)};
+  for (int k = 1; k < 3; ++k) {
+    SubdivideOptions o;
+    o.buildBvh = false;
+    auto r = subdivide(meshes.back(), canons.back(), rules.back(), o);
+    REQUIRE(r);
+    meshes.push_back(std::move(r->mesh));
+    canons.push_back(std::move(r->canon));
+    rules.push_back(std::move(r->rule));
+  }
+  Mesh objs;
+  for (int k = 0; k < 3; ++k) {
+    const Mesh& m = meshes[static_cast<std::size_t>(k)];
+    const CanonicalMap& c = canons[static_cast<std::size_t>(k)];
+    MultiresFileLevel l;
+    l.vertices = static_cast<std::uint32_t>(m.vertexCount());
+    l.faces = static_cast<std::uint32_t>(m.faceCount());
+    std::vector<Vec3> cp(m.positions.size());
+    for (Index v = 0; v < m.vertexCount(); ++v) cp[static_cast<std::size_t>(c.vert[v])] = m.positions[v];
+    if (k == d.active) {
+      std::vector<std::uint32_t> sizes, corners;
+      canonicalPolygons(m, c, sizes, corners);
+      const std::vector<Index> idx(corners.begin(), corners.end()), sz(sizes.begin(), sizes.end());
+      objs = buildMesh(cp, idx, sz);
+      REQUIRE(objs.faceCount() == m.faceCount());
+    } else {
+      l.channels = kLevelPositions;
+      l.positions = std::move(cp);
+    }
+    d.levels.push_back(std::move(l));
+  }
+  Bvh bvh;
+  std::shared_ptr<Multires> stack;
+  std::string error;
+  CHECK_FALSE(restoreLevels(d, objs, bvh, stack, &error));
+  CHECK(error.find("base face corners") != std::string::npos);
+}
+
+TEST_CASE("a mesh with non-finite positions is not subdivided") {
+  Scene scene;
+  SyncWorkspace ws;
+  SceneObject& obj = scene.add("Head", makeQuadSphere(4));
+  obj.mesh.positions[3].z = std::numeric_limits<float>::quiet_NaN();
+  std::string error;
+  CHECK_FALSE(prepareSubdivide(obj, &error));
+  CHECK(error.find("invalid coordinates") != std::string::npos);
+  CHECK(!obj.multires);
+}
+
 TEST_CASE("damaged level data is refused") {
   Scene scene;
   SyncWorkspace ws;
@@ -369,5 +441,8 @@ TEST_CASE("damaged level data is refused") {
       m = std::move(rebuilt);
     });
     refused("active size", [](MultiresFileData&, Mesh& m) { m.positions.push_back(Vec3{0}), m.vertHe.push_back(kInvalid); });
+    refused("active NaN", [](MultiresFileData&, Mesh& m) { m.positions[7].y = std::numeric_limits<float>::quiet_NaN(); });
+    refused("active infinity", [](MultiresFileData&, Mesh& m) { m.positions[0].x = std::numeric_limits<float>::infinity(); });
+    refused("repeated base corner", [](MultiresFileData& d, Mesh&) { d.baseCorners[1] = d.baseCorners[0]; });
   }
 }

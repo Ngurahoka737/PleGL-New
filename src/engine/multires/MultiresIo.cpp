@@ -1,6 +1,7 @@
 #include "multires/MultiresIo.h"
 
 #include <algorithm>
+#include <cmath>
 #include <numeric>
 
 #include "multires/Propagate.h"
@@ -139,11 +140,17 @@ bool restoreLevels(const MultiresFileData& data, Mesh& mesh, Bvh& bvh, std::shar
     if (c >= V0) return fail("base corner");
   std::vector<Index> heNext(H0), heFace(H0), faceStart(F0 + 1);
   {
+    // A face never uses a vertex twice (buildMesh drops such faces, so the base could not be
+    // saved again from level 0).
+    std::vector<std::uint32_t> seenIn(V0, std::uint32_t(-1));
     Index h = 0;
     for (std::size_t f = 0; f < F0; ++f) {
       faceStart[f] = h;
       const Index n = static_cast<Index>(data.baseSizes[f]);
       for (Index i = 0; i < n; ++i) {
+        const std::uint32_t c = data.baseCorners[static_cast<std::size_t>(h + i)];
+        if (seenIn[c] == f) return fail("base face corners");
+        seenIn[c] = static_cast<std::uint32_t>(f);
         heNext[static_cast<std::size_t>(h + i)] = h + (i + 1) % n;
         heFace[static_cast<std::size_t>(h + i)] = static_cast<Index>(f);
       }
@@ -202,6 +209,10 @@ bool restoreLevels(const MultiresFileData& data, Mesh& mesh, Bvh& bvh, std::shar
   const MultiresFileLevel& activeLevel = data.levels[static_cast<std::size_t>(active)];
   if (std::uint64_t(mesh.vertexCount()) != activeLevel.vertices || std::uint64_t(mesh.faceCount()) != activeLevel.faces)
     return fail("active level size");
+  // The reader checks every other level's positions; NaN here would spread into them on the first
+  // switch and make the next save unopenable.
+  for (const Vec3& p : mesh.positions)
+    if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) return fail("active level positions");
 
   // Values of level k in canonical order: the object's own for the active level.
   auto positionsOf = [&](int k) -> const std::vector<Vec3>& {
