@@ -204,6 +204,19 @@ TEST_CASE("levels: consecutive level steps merge") {
   CHECK(undo.undo(scene) == "Draw");
   CHECK(undo.undo(scene) == "Switch to Level 2");
   CHECK(obj.multires->active == 3);
+
+  // Only a switch that starts where the last one ended merges: same level index but another
+  // version (the stack changed without an entry) stays separate.
+  UndoStack fresh;
+  MultiresUndo a;
+  a.objectId = obj.id;
+  a.levelBefore = 1, a.levelAfter = 2, a.countBefore = a.countAfter = 4;
+  a.versionBefore = 10, a.versionAfter = 11;
+  MultiresUndo b = a;
+  b.levelBefore = 2, b.levelAfter = 1, b.versionBefore = 99, b.versionAfter = 10;
+  fresh.push(std::move(a));
+  fresh.push(std::move(b));
+  CHECK(fresh.size() == 2);
 }
 
 TEST_CASE("levels: a stroke undoes after leaving and returning to its level") {
@@ -545,8 +558,17 @@ TEST_CASE("propagation: mask travels both ways and 1.0 stays exact") {
   const SubdivisionLinks& L2 = obj.multires->levels[2].links;
   const Mesh& c1 = obj.multires->levels[1].mesh;
   for (Index v = 0; v < c1.vertexCount(); ++v) CHECK(l2.mask[L2.vertexChild[v]] == l1[v]);
-  for (Index h = 0; h < c1.halfEdgeCount(); ++h)
-    if (l1[c1.heVert[h]] == 1.0f && l1[c1.heTarget(h)] == 1.0f) CHECK(l2.mask[L2.edgeChild[h]] == 1.0f);
+  int halfway = 0;
+  for (Index h = 0; h < c1.halfEdgeCount(); ++h) {
+    const float a = l1[c1.heVert[h]], b = l1[c1.heTarget(h)];
+    if (a == 1.0f && b == 1.0f) CHECK(l2.mask[L2.edgeChild[h]] == 1.0f);
+    // The level had no mask before, so an edge child gets half its parents' change.
+    if (a != b) {
+      CHECK(l2.mask[L2.edgeChild[h]] == 0.5f);
+      ++halfway;
+    }
+  }
+  CHECK(halfway > 0);
   // Down: injection.
   for (int k = 0; k < 3; ++k) {
     const Mesh& coarse = levelMesh(obj, k);

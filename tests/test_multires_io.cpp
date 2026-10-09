@@ -270,6 +270,26 @@ TEST_CASE("damaged level data is refused") {
       CHECK(error.find("subdivision level data") != std::string::npos);
     }
   }
+  SUBCASE("two entries for one object") {
+    // Repeat the only entry: count 2, then the same bytes twice.
+    std::uint64_t size = 0;
+    std::memcpy(&size, good.data() + at + 4, 8);
+    const std::vector<std::uint8_t> entry(good.begin() + static_cast<std::ptrdiff_t>(body + 4),
+                                          good.begin() + static_cast<std::ptrdiff_t>(body + size));
+    std::vector<std::uint8_t> bytes(good.begin(), good.begin() + static_cast<std::ptrdiff_t>(at + 4));
+    const std::uint64_t newSize = 4 + 2 * entry.size();
+    const std::uint32_t two = 2;
+    bytes.insert(bytes.end(), reinterpret_cast<const std::uint8_t*>(&newSize),
+                 reinterpret_cast<const std::uint8_t*>(&newSize) + 8);
+    bytes.insert(bytes.end(), reinterpret_cast<const std::uint8_t*>(&two), reinterpret_cast<const std::uint8_t*>(&two) + 4);
+    bytes.insert(bytes.end(), entry.begin(), entry.end());
+    bytes.insert(bytes.end(), entry.begin(), entry.end());
+    bytes.insert(bytes.end(), good.begin() + static_cast<std::ptrdiff_t>(body + size), good.end());
+    fixChecksum(bytes);
+    std::string error;
+    CHECK(!parseProject(bytes.data(), bytes.size(), &error));
+    CHECK(error.find("subdivision level data") != std::string::npos);
+  }
   SUBCASE("truncated chunk") {
     std::vector<std::uint8_t> bytes = good;
     // Claim a huge base face count: the reader must refuse before allocating.
@@ -307,6 +327,12 @@ TEST_CASE("damaged level data is refused") {
     refused("corner range", [](MultiresFileData& d, Mesh&) { d.baseCorners[3] = d.baseVertices; });
     refused("twin not involutive", [](MultiresFileData& d, Mesh&) { std::swap(d.baseTwins[0], d.baseTwins[1]); });
     refused("twin of itself", [](MultiresFileData& d, Mesh&) { d.baseTwins[d.baseTwins[5]] = 5, d.baseTwins[5] = 5; });
+    refused("one-sided twin", [](MultiresFileData& d, Mesh&) {
+      // Keeps every endpoint and the edge count right; only the missing way back is wrong.
+      std::size_t h = 0;
+      while (d.baseTwins[h] <= std::int32_t(h)) ++h;
+      d.baseTwins[h] = kInvalid;
+    });
     refused("fan start", [](MultiresFileData& d, Mesh&) { d.baseVertHe[0] = d.baseVertHe[1]; });
     refused("unused fan start", [](MultiresFileData& d, Mesh&) { d.baseVertHe[4] = kInvalid; });
     refused("level count", [](MultiresFileData& d, Mesh&) { d.levels[2].vertices += 1; });
@@ -321,6 +347,12 @@ TEST_CASE("damaged level data is refused") {
       std::swap(d.pendingPosIndex[0], d.pendingPosIndex[1]);
     });
     refused("pending range", [](MultiresFileData& d, Mesh&) { d.pendingSetIndex.back() = 1u << 30; });
+    refused("pending at the end", [](MultiresFileData& d, Mesh&) {
+      d.pendingPosIndex.back() = d.levels[static_cast<std::size_t>(d.active)].vertices;
+    });
+    refused("face set pending at the end", [](MultiresFileData& d, Mesh&) {
+      d.pendingSetIndex.back() = d.levels[static_cast<std::size_t>(d.active)].faces;
+    });
     refused("active polygons", [](MultiresFileData&, Mesh& m) {
       // Same counts, other corners: rotate one face's corner order.
       std::vector<Index> idx, sizes;

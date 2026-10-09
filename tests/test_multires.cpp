@@ -192,6 +192,22 @@ TEST_CASE("open borders follow the cubic B-spline and corners stay put") {
     const Vec3 mid = (m.positions[m.heVert[h]] + m.positions[m.heTarget(h)]) * 0.5f;
     CHECK(sameBits(r.mesh.positions[r.links.edgeChild[h]], mid));
   }
+  // On an evenly spaced border every rule that keeps straight lines gives the same point, so
+  // check the weights on a bent, unevenly spaced one.
+  Mesh bent = m;
+  for (Index v = 0; v < bent.vertexCount(); ++v) bent.positions[v] += Vec3{0.05f * std::sin(1.7f * float(v)), 0.1f * std::cos(2.3f * float(v)), 0.0f};
+  const SubdivisionResult rb = subdivideFlat(bent);
+  int checked = 0;
+  for (Index v = 0; v < bent.vertexCount(); ++v) {
+    if (rules[v] != VertexRule::Boundary) continue;
+    Index a, b;
+    borderNeighbours(bent, v, a, b);
+    const Vec3 expected = bent.positions[v] * 0.75f + (bent.positions[a] + bent.positions[b]) * 0.125f;
+    CHECK(glm::length(rb.mesh.positions[v] - expected) < 1e-6f);
+    CHECK(glm::length(rb.mesh.positions[v] - bent.positions[v]) > 1e-4f);
+    ++checked;
+  }
+  CHECK(checked == 8);
 }
 
 TEST_CASE("non-manifold and isolated vertices are pinned") {
