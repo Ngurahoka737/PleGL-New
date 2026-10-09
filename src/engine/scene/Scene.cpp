@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <cstdio>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtx/matrix_decompose.hpp>
@@ -29,9 +30,16 @@ std::uint64_t nextTopologyVersion() {
 }
 
 void SceneObject::rebuildSpatial() {
+  assert(!multires && "levels keep their BVH layout for life");
   bvh.build(mesh);
   clearDirty();
   topologyVersion = nextTopologyVersion();
+}
+
+std::int32_t SceneObject::newFaceSetId() const {
+  std::int32_t largest = mesh.maxFaceSetId();
+  if (multires) largest = std::max(largest, multires->faceSetIdBound);
+  return largest < kMaxFaceSetId ? largest + 1 : 0;
 }
 
 void SceneObject::markVisibilityDirty(Index leaf) {
@@ -77,6 +85,7 @@ SceneObject* Scene::duplicate(std::uint32_t id) {
   obj->name = uniqueName(src->name);
   obj->mesh = src->mesh;
   obj->bvh = src->bvh;  // Same vertex order, so the copy is valid as is.
+  obj->topologyVersion = nextTopologyVersion();
   obj->transform = src->transform;
   obj->visible = src->visible;
   objects_.push_back(std::move(obj));

@@ -67,9 +67,8 @@ void UndoStack::clear() {
   bytes_ = 0;
 }
 
-bool UndoStack::apply(Scene& scene, const SculptUndo& entry, const std::vector<LeafState>& states) {
-  SceneObject* obj = scene.find(entry.objectId);
-  if (!obj || obj->topologyVersion != entry.topologyVersion) return false;
+void applySculptStates(SceneObject& object, const SculptUndo& entry, const std::vector<LeafState>& states) {
+  SceneObject* obj = &object;
   Mesh& m = obj->mesh;
   std::vector<Index> leaves;
   leaves.reserve(states.size() + entry.refit.size());
@@ -110,6 +109,12 @@ bool UndoStack::apply(Scene& scene, const SculptUndo& entry, const std::vector<L
     for (Index l : entry.refit) leaves.push_back(l);
     obj->bvh.refitLeaves(m, leaves);
   }
+}
+
+bool UndoStack::apply(Scene& scene, const SculptUndo& entry, const std::vector<LeafState>& states) {
+  SceneObject* obj = scene.find(entry.objectId);
+  if (!obj || obj->topologyVersion != entry.topologyVersion) return false;
+  applySculptStates(*obj, entry, states);
   return true;
 }
 

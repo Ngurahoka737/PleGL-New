@@ -27,6 +27,12 @@ inline bool validFaceSetValue(std::int32_t value) {
   return value != 0 && value >= -kMaxFaceSetId && value <= kMaxFaceSetId;
 }
 
+// Old index of every face and vertex after Mesh::reorder() (new -> old).
+struct ReorderMap {
+  std::vector<Index> faceOld;
+  std::vector<Index> vertOld;
+};
+
 // Polygon mesh stored as an index-based half-edge structure with struct-of-arrays attributes.
 //
 // Topology arrays hold 32-bit indices only, so a mesh can be copied, serialized or handed to
@@ -123,6 +129,11 @@ class Mesh {
   Vec3 faceCentroid(Index f) const;
   Aabb bounds() const;
 
+  // Area-weighted normal of vertex v: the sum of faceAreaNormal() over its faces in
+  // forEachOutgoing() order, normalized ((0, 0, 1) when the sum is zero). Every normal the engine
+  // writes comes from this one function, so normals are a pure function of positions and
+  // topology and recomputing them always reproduces the same bits.
+  Vec3 vertexNormal(Index v) const;
   // Recomputes area-weighted vertex normals for every vertex (parallel).
   void computeNormals();
   // Recomputes normals for a contiguous range of vertices only.
@@ -133,9 +144,12 @@ class Mesh {
 
   // Reorders faces into `faceOrder` (a permutation of all face indices) and renumbers vertices
   // by first use in that order, so faces that are adjacent in the new order also own adjacent
-  // vertices. Half-edges are laid out face by face. Returns, for each new face index f, the
-  // number of distinct vertices first used by faces before f (size faceCount() + 1).
-  std::vector<Index> reorder(std::span<const Index> faceOrder);
+  // vertices. Half-edges are laid out face by face, each face starting at its old faceHe, and
+  // vertHe keeps pointing at the same half-edge, so face corner order and vertex fan order are
+  // unchanged. Returns, for each new face index f, the number of distinct vertices first used by
+  // faces before f (size faceCount() + 1). `map`, if given, receives the old index of every new
+  // face and vertex.
+  std::vector<Index> reorder(std::span<const Index> faceOrder, ReorderMap* map = nullptr);
 
   void clear();
 };

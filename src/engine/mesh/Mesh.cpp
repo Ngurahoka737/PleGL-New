@@ -79,8 +79,15 @@ static Vec3 safeNormalize(const Vec3& n) {
   return len2 > 1e-30f ? n / std::sqrt(len2) : Vec3{0.0f, 0.0f, 1.0f};
 }
 
+Vec3 Mesh::vertexNormal(Index v) const {
+  Vec3 n{0.0f};
+  forEachOutgoing(v, [&](Index h) { n += faceAreaNormal(heFace[h]); });
+  return safeNormalize(n);
+}
+
 void Mesh::computeNormals() {
   normals.resize(positions.size());
+  // Same sums in the same order as vertexNormal(), with each face normal computed once.
   std::vector<Vec3> faceN(faceHe.size());
   parallelFor(0, faceHe.size(), 4096, [&](std::size_t b, std::size_t e) {
     for (std::size_t f = b; f < e; ++f) faceN[f] = faceAreaNormal(static_cast<Index>(f));
@@ -96,11 +103,7 @@ void Mesh::computeNormals() {
 
 void Mesh::computeNormals(Index vertBegin, Index vertEnd) {
   normals.resize(positions.size());
-  for (Index v = vertBegin; v < vertEnd; ++v) {
-    Vec3 n{0.0f};
-    forEachOutgoing(v, [&](Index h) { n += faceAreaNormal(heFace[h]); });
-    normals[v] = safeNormalize(n);
-  }
+  for (Index v = vertBegin; v < vertEnd; ++v) normals[v] = vertexNormal(v);
 }
 
 Index Mesh::edgeCount() const {
@@ -111,7 +114,7 @@ Index Mesh::edgeCount() const {
   return n;
 }
 
-std::vector<Index> Mesh::reorder(std::span<const Index> faceOrder) {
+std::vector<Index> Mesh::reorder(std::span<const Index> faceOrder, ReorderMap* map) {
   const Index nf = faceCount();
   const Index nv = vertexCount();
   const Index nh = halfEdgeCount();
@@ -190,6 +193,10 @@ std::vector<Index> Mesh::reorder(std::span<const Index> faceOrder) {
   heTwin = std::move(newTwin);
   heVert = std::move(newVert);
   heFace = std::move(newFace);
+  if (map) {
+    map->faceOld.assign(faceOrder.begin(), faceOrder.end());
+    map->vertOld = std::move(vertOld);
+  }
   return firstVertex;
 }
 

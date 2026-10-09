@@ -60,6 +60,11 @@ struct DyntopoUndo {
   std::size_t bytes() const;
 };
 
+// Copies the channels `states` recorded into `object` leaf by leaf, marks the changed GPU ranges
+// and refits the moved leaves (plus entry.refit). The caller checks that the entry belongs to
+// this object and topology version.
+void applySculptStates(SceneObject& object, const SculptUndo& entry, const std::vector<LeafState>& states);
+
 // What a sculpt stroke leaves for undo.
 using StrokeUndo = std::variant<SculptUndo, DyntopoUndo>;
 

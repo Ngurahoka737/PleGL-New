@@ -321,10 +321,7 @@ void Sculptor::recomputeNormals(std::span<const Index> verts) {
   parallelFor(0, verts.size(), 2048, [&](std::size_t b, std::size_t e) {
     for (std::size_t i = b; i < e; ++i) {
       const Index v = verts[i];
-      Vec3 n{0.0f};
-      m.forEachOutgoing(v, [&](Index h) { n += m.faceAreaNormal(m.heFace[h]); });
-      const float len = glm::length(n);
-      if (len > 1e-20f) m.normals[v] = n / len;
+      m.normals[v] = m.vertexNormal(v);
     }
   });
 }
