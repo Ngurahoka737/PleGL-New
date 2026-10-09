@@ -25,6 +25,11 @@ const char* faceSetOpName(FaceSetOp op);
 // nothing if nothing changed. Leaves the topology and the vertices alone.
 std::optional<SculptUndo> applyFaceSetOp(SceneObject& object, FaceSetOp op, std::int32_t faceSet = 0);
 
+// Builds the undo entry for the leaves whose face sets differ from `old` (the whole array before
+// the change) and marks them for upload: colours always, index data where a face was hidden or
+// shown. Nothing when no value changed.
+std::optional<SculptUndo> recordFaceSets(SceneObject& object, const std::vector<std::int32_t>& old, const char* label);
+
 // Masks (mask 1) every vertex that a visible face of `faceSet` uses, leaving other values alone.
 // Returns a mask undo entry, or nothing if no value changed.
 std::optional<SculptUndo> maskFaceSet(SceneObject& object, std::int32_t faceSet);

@@ -165,10 +165,10 @@ TEST_CASE("undoing a remesh restores the mesh and earlier sculpt undo still appl
   TopologyUndo entry;
   entry.label = "Remesh";
   entry.objectId = obj.id;
-  entry.before = std::make_shared<MeshState>(MeshState{obj.mesh, obj.bvh, obj.topologyVersion});
+  entry.before = std::make_shared<MeshState>(MeshState{obj.mesh, obj.bvh, obj.topologyVersion, nullptr});
   obj.mesh = std::move(*remeshed);
   obj.rebuildSpatial();
-  entry.after = std::make_shared<MeshState>(MeshState{obj.mesh, obj.bvh, obj.topologyVersion});
+  entry.after = std::make_shared<MeshState>(MeshState{obj.mesh, obj.bvh, obj.topologyVersion, nullptr});
   stack.push(std::move(entry));
   CHECK(obj.topologyVersion != sculptedVersion);
   const Index remeshedVerts = obj.mesh.vertexCount();

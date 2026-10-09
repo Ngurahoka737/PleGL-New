@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "mesh/Mesh.h"
+#include "multires/Multires.h"
 #include "spatial/Bvh.h"
 
 namespace plegl {
@@ -53,8 +54,16 @@ struct SceneObject {
   std::vector<Index> topoDirtyLeaves;
   // topologyVersion at which the mesh was last found free of non-manifold vertices.
   std::uint64_t manifoldCheckedVersion = 0;
+  // Subdivision levels, or null for a plain object. While set, `mesh` and `bvh` hold the active
+  // level and the stack holds the others (see multires/Multires.h). Never shared between objects:
+  // the pointer is shared only so background work can keep a stack alive.
+  std::shared_ptr<Multires> multires;
 
-  // Rebuilds the BVH (which reorders the mesh) and bumps topologyVersion.
+  // A face set id no face uses on any level, or 0 when ids have run out.
+  std::int32_t newFaceSetId() const;
+
+  // Rebuilds the BVH (which reorders the mesh) and bumps topologyVersion. Not for objects with
+  // subdivision levels, whose layouts are frozen.
   void rebuildSpatial();
   void markLeafDirty(Index leaf) { dirtyLeaves.push_back(leaf); }
   void markMaskDirty(Index leaf) { maskDirtyLeaves.push_back(leaf); }
@@ -71,6 +80,10 @@ struct SceneObject {
     faceSetDirtyAll = true;
     faceSetDirtyLeaves.clear();
   }
+  // Asks for every leaf's positions, mask, face sets and triangles again. For a mesh swapped back
+  // in under a version the renderer may already hold with other values (a subdivision level that
+  // left and came back within one frame).
+  void markAllDirty();
   // Drops pending partial uploads; for use after a topology change, which re-uploads everything.
   void clearDirty() {
     dirtyLeaves.clear();

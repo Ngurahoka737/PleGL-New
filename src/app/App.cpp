@@ -109,6 +109,8 @@ bool App::init(std::string* error) {
   const auto workspace = std::make_shared<LayoutWorkspace>();
   sculptor_.setLayoutWorkspace(workspace);
   undoStack.setLayoutWorkspace(workspace);
+  syncWorkspace_ = std::make_shared<SyncWorkspace>();
+  undoStack.setSyncWorkspace(syncWorkspace_);
   rendererReady_ = true;
 
   initRecovery();
@@ -345,9 +347,15 @@ void App::handleShortcut(const SDL_KeyboardEvent& key) {
     if (key.key == SDLK_E) requestExport();
     if (key.key == SDLK_N) requestNewScene();
     if (key.key == SDLK_R) requestRemesh();
+    if (key.key == SDLK_PAGEUP) {
+      requestSubdivide();
+      ImGui::SetWindowFocus(nullptr);  // Panels would also scroll on Page Up.
+    }
     if (key.key == SDLK_D && mode == Mode::Sculpt) {
       sculpt.dyntopo = !sculpt.dyntopo;
       statusMessage = sculpt.dyntopo ? "Dynamic topology on" : "Dynamic topology off";
+      const SceneObject* obj = scene.find(selectedId);
+      if (sculpt.dyntopo && obj && obj->multires) statusMessage += " (not on objects with subdivision levels)";
     }
     return;
   }
@@ -361,6 +369,14 @@ void App::handleShortcut(const SDL_KeyboardEvent& key) {
     case SDLK_KP_PERIOD:
       frameScene();
       break;
+    case SDLK_PAGEUP:
+    case SDLK_PAGEDOWN: {
+      const bool up = key.key == SDLK_PAGEUP;
+      if (shift) setLevel(up ? kMaxMultiresLevels : 0);
+      else stepLevel(up ? 1 : -1);
+      ImGui::SetWindowFocus(nullptr);  // Panels would also scroll on Page Up and Page Down.
+      break;
+    }
     default:
       break;
   }
@@ -473,6 +489,7 @@ void App::newScene() {
   if (sculptor_.active()) endStroke();  // Never act on a mesh in the middle of a stroke.
   scene.clear();
   undoStack.clear();
+  releaseSyncScratch();
   selectedId = 0;
   hover_.reset();
   projectPath_.clear();
@@ -482,7 +499,10 @@ void App::newScene() {
 
 void App::deleteSelected() {
   if (sculptor_.active()) endStroke();  // Never act on a mesh in the middle of a stroke.
+  const SceneObject* obj = scene.find(selectedId);
+  const bool hadLevels = obj && obj->multires;
   if (selectedId && scene.remove(selectedId)) {
+    if (hadLevels) releaseSyncScratch();
     statusMessage = "Deleted object";
     selectedId = 0;
     hover_.reset();
@@ -518,8 +538,13 @@ void App::bumpUnderCursor() {
     statusMessage = "Hover over a mesh, then press B";
     return;
   }
-  SceneObject* obj = scene.find(hover_->objectId);
+  SceneObject* obj = editableObject(hover_->objectId, "mesh");
   if (!obj) return;
+  if (obj->multires) {
+    // The bump has no undo entry, and undoing a level switch would lose it or stop it spreading.
+    statusMessage = "The bump test is not available on objects with subdivision levels.";
+    return;
+  }
   Timer t;
   Mesh& m = obj->mesh;
   const Vec3 center = hover_->localHit.position;
@@ -561,10 +586,7 @@ void App::beginStroke(float x, float y, std::uint64_t timestampNs) {
   SceneObject* obj = scene.find(hover_->objectId);
   if (!obj) return;
   selectedId = obj->id;
-  if (obj->id == remeshObjectId_) {
-    statusMessage = "Wait for the remesh to finish before sculpting this object.";
-    return;
-  }
+  if (waitForJob(obj->id, "sculpting this object")) return;
   const SDL_Keymod mods = SDL_GetModState();
   const bool shift = (mods & SDL_KMOD_SHIFT) != 0, ctrl = (mods & SDL_KMOD_CTRL) != 0;
   const bool masking = sculpt.brush == BrushKind::Mask;
@@ -668,6 +690,8 @@ void App::applySamples(std::uint64_t timestampNs) {
 }
 
 void App::endStroke() {
+  const SceneObject* obj = sculptor_.object();
+  const bool levels = obj && obj->multires;
   auto entry = sculptor_.endStroke();
   const StrokeTopologyStats& topo = sculptor_.lastStrokeTopology();
   if (entry) {
@@ -685,6 +709,9 @@ void App::endStroke() {
     ++editCounter_;
     statusMessage = "Stroke could not be recorded for undo; earlier history was cut";
   }
+  if (sculpt.dyntopo && levels && entry && strokeBrush_ != BrushKind::Grab && strokeBrush_ != BrushKind::Mask &&
+      strokeBrush_ != BrushKind::FaceSet)
+    statusMessage += " (dynamic topology is off on objects with subdivision levels)";
   if (topo.outOfRoom) statusMessage += " (dynamic topology stopped: stroke too large)";
   if (topo.faulted) statusMessage += " (dynamic topology stopped on a damaged area)";
 }
@@ -712,11 +739,9 @@ const Brush* App::brushFor(BrushKind kind) const {
 
 void App::undo() {
   if (sculptor_.active()) return;
-  if (remeshing()) {
-    // The remesh result is built from the mesh as it was, so it would bring this change back.
-    statusMessage = "Wait for the remesh to finish before undoing.";
-    return;
-  }
+  // A remesh or subdivision result is built from the mesh as it was, so it would bring this change
+  // back.
+  if (waitForJob(0, "undoing")) return;
   const std::string label = undoStack.undo(scene);
   if (!label.empty()) ++editCounter_;
   statusMessage = label.empty() ? "Nothing to undo" : "Undo " + label;
@@ -724,10 +749,7 @@ void App::undo() {
 
 void App::redo() {
   if (sculptor_.active()) return;
-  if (remeshing()) {
-    statusMessage = "Wait for the remesh to finish before redoing.";
-    return;
-  }
+  if (waitForJob(0, "redoing")) return;
   const std::string label = undoStack.redo(scene);
   if (!label.empty()) ++editCounter_;
   statusMessage = label.empty() ? "Nothing to redo" : "Redo " + label;
@@ -735,7 +757,14 @@ void App::redo() {
 
 bool App::canEditMask() const {
   const SceneObject* obj = scene.find(selectedId);
-  return obj && !sculptor_.active() && obj->id != remeshObjectId_;
+  return obj && !sculptor_.active() && !(busy() && obj->id == jobObjectId_);
+}
+
+bool App::waitForJob(std::uint32_t id, const std::string& action) {
+  if (!busy() || (id != 0 && id != jobObjectId_)) return false;
+  statusMessage = std::string("Wait for the ") + (job_ == Job::Remesh ? "remesh" : "subdivision") +
+                  " to finish before " + action + ".";
+  return true;
 }
 
 SceneObject* App::editableObject(std::uint32_t id, const char* what) {
@@ -745,11 +774,8 @@ SceneObject* App::editableObject(std::uint32_t id, const char* what) {
     return nullptr;
   }
   if (sculptor_.active()) return nullptr;
-  if (obj->id == remeshObjectId_) {
-    // The remesh result is built from the mesh as it was, so this edit would be lost.
-    statusMessage = std::string("Wait for the remesh to finish before editing this object's ") + what + ".";
-    return nullptr;
-  }
+  // The job's result is built from the mesh as it was, so this edit would be lost.
+  if (waitForJob(obj->id, std::string("editing this object's ") + what)) return nullptr;
   return obj;
 }
 
@@ -766,11 +792,32 @@ void App::pushEdit(std::optional<SculptUndo> entry, const char* name, double ms)
   statusMessage = buf;
 }
 
+void App::pushEdit(std::optional<MultiresUndo> entry, const char* name, double ms) {
+  stats.maskOpMs = ms;
+  if (!entry) {
+    statusMessage = std::string(name) + ": nothing to change";
+    return;
+  }
+  ++editCounter_;
+  undoStack.push(std::move(*entry));
+  hover_.reset();
+  char buf[96];
+  std::snprintf(buf, sizeof(buf), "%s (%.1f ms)", name, ms);
+  statusMessage = buf;
+}
+
 void App::applyMask(MaskOp op) {
   SceneObject* obj = editableObject(selectedId, "mask");
   if (!obj) return;
   const bool filter = op == MaskOp::Blur || op == MaskOp::Sharpen;
   Timer t;
+  if (obj->multires && !filter) {
+    // Clear, Fill and Invert act on every level at once; mask made on one level only would
+    // otherwise survive on the others.
+    auto entry = applyMaskOpAllLevels(*obj, op, *syncWorkspace_);
+    pushEdit(std::move(entry), maskOpName(op), t.ms());
+    return;
+  }
   auto entry = applyMaskOp(*obj, op, filter ? std::clamp(sculpt.maskFilterSteps, 1, 10) : 1);
   pushEdit(std::move(entry), maskOpName(op), t.ms());
 }
@@ -779,6 +826,11 @@ void App::applyFaceSets(FaceSetOp op) {
   SceneObject* obj = editableObject(selectedId, "face sets");
   if (!obj) return;
   Timer t;
+  if (obj->multires && (op == FaceSetOp::Clear || op == FaceSetOp::RevealAll || op == FaceSetOp::InvertVisibility)) {
+    auto entry = applyFaceSetOpAllLevels(*obj, op, *syncWorkspace_);
+    pushEdit(std::move(entry), faceSetOpName(op), t.ms());
+    return;
+  }
   auto entry = applyFaceSetOp(*obj, op);
   pushEdit(std::move(entry), faceSetOpName(op), t.ms());
 }
@@ -819,8 +871,9 @@ void App::requestRemesh() {
     statusMessage = "Select an object to remesh.";
     return;
   }
-  if (remeshing() || sculptor_.active()) return;
-  remeshObjectId_ = obj->id;
+  if (sculptor_.active() || waitForJob(0, "remeshing")) return;
+  job_ = Job::Remesh;
+  jobObjectId_ = obj->id;
   statusMessage = "Remeshing " + obj->name + "...";
   // The worker gets its own copy; the scene is only touched on the main thread.
   auto input = std::make_shared<Mesh>(obj->mesh);
@@ -837,7 +890,8 @@ void App::requestRemesh() {
     const double ms = t.ms();
     std::lock_guard lock(asyncMutex_);
     asyncResults_.push_back([this, id, version, remeshStats, error, result, bvh, ms] {
-      remeshObjectId_ = 0;
+      job_ = Job::None;
+      jobObjectId_ = 0;
       SceneObject* target = scene.find(id);
       if (!*result) {
         statusMessage = "Remesh failed: " + *error;
@@ -850,13 +904,17 @@ void App::requestRemesh() {
       TopologyUndo entry;
       entry.label = "Remesh";
       entry.objectId = id;
-      entry.before = std::make_shared<MeshState>(
-          MeshState{std::move(target->mesh), std::move(target->bvh), target->topologyVersion});
+      // The new topology has no subdivision levels; undo brings them back.
+      const bool hadLevels = target->multires != nullptr;
+      entry.before = std::make_shared<MeshState>(MeshState{std::move(target->mesh), std::move(target->bvh),
+                                                           target->topologyVersion, std::move(target->multires)});
+      target->multires.reset();
       target->mesh = std::move(**result);
       target->bvh = std::move(*bvh);
       target->topologyVersion = nextTopologyVersion();
       target->clearDirty();
-      entry.after = std::make_shared<MeshState>(MeshState{target->mesh, target->bvh, target->topologyVersion});
+      entry.after =
+          std::make_shared<MeshState>(MeshState{target->mesh, target->bvh, target->topologyVersion, nullptr});
       undoStack.push(std::move(entry));
       const int* res = remeshStats->voxel.resolution;
       char buf[256];
@@ -865,8 +923,122 @@ void App::requestRemesh() {
                     res[0], res[1], res[2], ms);
       lastRemeshInfo = buf;
       statusMessage = "Remeshed " + target->name + ": " + lastRemeshInfo;
+      if (hadLevels) statusMessage += " (subdivision levels removed; undo restores them)";
     });
   });
+}
+
+// ---- Subdivision levels --------------------------------------------------------------------
+
+void App::requestSubdivide() {
+  SceneObject* obj = editableObject(selectedId, "levels");
+  if (!obj || waitForJob(0, "subdividing")) return;
+  // Refuse before stepping to the top, so a refused command leaves the level alone.
+  if (std::string why = subdivideRefusal(*obj); !why.empty()) {
+    statusMessage = "Cannot subdivide " + obj->name + ": " + why;
+    return;
+  }
+  if (obj->multires && obj->multires->active != obj->multires->top()) {
+    // New levels go on top, so step there first (its own undo step).
+    setLevel(obj->multires->top());
+    if (!obj->multires || obj->multires->active != obj->multires->top()) return;
+  }
+  std::string error;
+  std::optional<SubdivideJob> prepared = prepareSubdivide(*obj, &error);
+  if (!prepared) {
+    statusMessage = "Cannot subdivide " + obj->name + ": " + error;
+    return;
+  }
+  // The worker gets a copy of the top level; the scene is only touched on the main thread.
+  auto job = std::make_shared<SubdivideJob>(std::move(*prepared));
+  job_ = Job::Subdivide;
+  jobObjectId_ = obj->id;
+  statusMessage = "Subdividing " + obj->name + "...";
+  workers_.emplace_back([this, job] {
+    Timer t;
+    runSubdivideJob(*job);
+    const double ms = t.ms();
+    std::lock_guard lock(asyncMutex_);
+    asyncResults_.push_back([this, job, ms] {
+      job_ = Job::None;
+      jobObjectId_ = 0;
+      if (!job->result) {
+        statusMessage = "Subdivide failed: " + job->error;
+        return;
+      }
+      SceneObject* target = scene.find(job->objectId);
+      Timer finish;
+      std::optional<MultiresUndo> entry;
+      if (target) entry = finishSubdivide(*target, *job, *syncWorkspace_);
+      if (!entry) {
+        statusMessage = "Subdivide discarded: the object changed while it ran.";
+        return;
+      }
+      undoStack.push(std::move(*entry));
+      ++editCounter_;
+      hover_.reset();
+      char buf[160];
+      std::snprintf(buf, sizeof(buf), "Subdivided %s: level %d of %d, %d faces (%.0f ms)", target->name.c_str(),
+                    target->multires->active, target->multires->top(), target->mesh.faceCount(), ms + finish.ms());
+      statusMessage = buf;
+    });
+  });
+}
+
+void App::setLevel(int level) {
+  SceneObject* obj = editableObject(selectedId, "levels");
+  if (!obj) return;
+  if (!obj->multires) {
+    statusMessage = obj->name + " has no subdivision levels. Ctrl+Page Up subdivides.";
+    return;
+  }
+  const Multires& s = *obj->multires;
+  level = std::clamp(level, 0, s.top());
+  if (level == s.active) {
+    statusMessage = level == s.top() ? "Already at the highest level. Ctrl+Page Up adds one."
+                                     : "Already at the lowest level.";
+    return;
+  }
+  Timer t;
+  auto entry = setActiveLevel(*obj, level, *syncWorkspace_);
+  const double ms = t.ms();
+  if (!entry) {
+    statusMessage = "Could not switch levels.";
+    return;
+  }
+  undoStack.push(std::move(*entry));
+  ++editCounter_;
+  hover_.reset();  // The surface under the cursor moved.
+  char buf[128];
+  std::snprintf(buf, sizeof(buf), "Level %d of %d, %d faces (%.0f ms)", obj->multires->active, obj->multires->top(),
+                obj->mesh.faceCount(), ms);
+  statusMessage = buf;
+}
+
+void App::stepLevel(int delta) {
+  const SceneObject* obj = scene.find(selectedId);
+  setLevel(obj && obj->multires ? obj->multires->active + delta : 0);
+}
+
+void App::deleteHigherLevels() {
+  SceneObject* obj = editableObject(selectedId, "levels");
+  if (!obj || !obj->multires) return;
+  Timer t;
+  pushEdit(plegl::deleteHigherLevels(*obj), "Delete Higher Levels", t.ms());
+  releaseSyncScratch();
+}
+
+void App::deleteLowerLevels() {
+  SceneObject* obj = editableObject(selectedId, "levels");
+  if (!obj || !obj->multires) return;
+  Timer t;
+  pushEdit(plegl::deleteLowerLevels(*obj), "Delete Lower Levels", t.ms());
+  releaseSyncScratch();
+}
+
+void App::releaseSyncScratch() {
+  // The undo stack shares the workspace, so replace its contents rather than the pointer.
+  *syncWorkspace_ = SyncWorkspace{};
 }
 
 // ---- Files ---------------------------------------------------------------------------------
@@ -975,10 +1147,14 @@ void App::exportFile(const std::filesystem::path& requested) {
   for (Vec3& p : baked.positions) p = Vec3(m * Vec4(p, 1.0f));
   for (Vec3& n : baked.normals) n = glm::normalize(nm * n);
   std::string err;
-  if (exportObj(baked, path, &err))
+  if (exportObj(baked, path, &err)) {
     statusMessage = "Exported " + path.filename().string();
-  else
+    if (obj->multires)
+      statusMessage += " (level " + std::to_string(obj->multires->active) + " of " +
+                       std::to_string(obj->multires->top()) + ")";
+  } else {
     statusMessage = "Export failed: " + err;
+  }
 }
 
 }  // namespace plegl

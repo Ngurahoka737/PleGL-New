@@ -52,7 +52,7 @@ bool rayTriangle(const Ray& ray, const Vec3& a, const Vec3& b, const Vec3& c, fl
 
 }  // namespace
 
-void Bvh::build(Mesh& mesh, const Params& params) {
+void Bvh::build(Mesh& mesh, const Params& params, ReorderMap* map) {
   nodes_.clear();
   leaves_.clear();
   leafNode_.clear();
@@ -61,7 +61,14 @@ void Bvh::build(Mesh& mesh, const Params& params) {
   const Index maxLeaf = std::max(params.maxLeafFaces, 1);
   maxLeafFaces_ = maxLeaf;
   const Index nf = mesh.faceCount();
-  if (nf == 0) return;
+  if (nf == 0) {
+    if (map) {
+      map->faceOld.clear();
+      map->vertOld.resize(mesh.positions.size());
+      std::iota(map->vertOld.begin(), map->vertOld.end(), 0);
+    }
+    return;
+  }
 
   std::vector<Vec3> centroids(nf);
   parallelFor(0, static_cast<std::size_t>(nf), 8192, [&](std::size_t b, std::size_t e) {
@@ -105,7 +112,7 @@ void Bvh::build(Mesh& mesh, const Params& params) {
 
   // Leaves were emitted left to right over `order`, so their face ranges are already
   // contiguous in it. Reorder the mesh to match and record each leaf's vertex range.
-  const std::vector<Index> firstVertex = mesh.reorder(order);
+  const std::vector<Index> firstVertex = mesh.reorder(order, map);
   // reorder() lays half-edges out face by face, so faceHe[f] is the first half-edge of face f.
   const Index nh = mesh.halfEdgeCount();
   for (BvhLeaf& leaf : leaves_) {

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <cstdio>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtx/matrix_decompose.hpp>
@@ -29,9 +30,16 @@ std::uint64_t nextTopologyVersion() {
 }
 
 void SceneObject::rebuildSpatial() {
+  assert(!multires && "levels keep their BVH layout for life");
   bvh.build(mesh);
   clearDirty();
   topologyVersion = nextTopologyVersion();
+}
+
+std::int32_t SceneObject::newFaceSetId() const {
+  std::int32_t largest = mesh.maxFaceSetId();
+  if (multires) largest = std::max(largest, multires->faceSetIdBound);
+  return largest < kMaxFaceSetId ? largest + 1 : 0;
 }
 
 void SceneObject::markVisibilityDirty(Index leaf) {
@@ -46,6 +54,19 @@ void SceneObject::markVisibilityDirty(Index leaf) {
     topoDirtyLeaves.push_back(other);
     last = other;
   }
+}
+
+void SceneObject::markAllDirty() {
+  clearDirty();
+  const auto count = static_cast<Index>(bvh.leaves().size());
+  dirtyLeaves.reserve(static_cast<std::size_t>(count));
+  topoDirtyLeaves.reserve(static_cast<std::size_t>(count));
+  for (Index l = 0; l < count; ++l) {
+    dirtyLeaves.push_back(l);
+    topoDirtyLeaves.push_back(l);
+  }
+  maskDirtyAll = true;
+  faceSetDirtyAll = true;
 }
 
 SceneObject& Scene::add(std::string name, Mesh mesh) {
@@ -77,6 +98,12 @@ SceneObject* Scene::duplicate(std::uint32_t id) {
   obj->name = uniqueName(src->name);
   obj->mesh = src->mesh;
   obj->bvh = src->bvh;  // Same vertex order, so the copy is valid as is.
+  obj->topologyVersion = nextTopologyVersion();
+  if (src->multires) {
+    // Every level gets a new version; pending edits come along as they are.
+    obj->multires = std::shared_ptr<Multires>(src->multires->clone(true));
+    obj->topologyVersion = obj->multires->levels[static_cast<std::size_t>(obj->multires->active)].version;
+  }
   obj->transform = src->transform;
   obj->visible = src->visible;
   objects_.push_back(std::move(obj));
