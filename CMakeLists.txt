@@ -41,6 +41,7 @@ add_library(plegl_engine STATIC
   src/engine/multires/Subdivide.cpp
   src/engine/multires/Propagate.cpp
   src/engine/multires/MultiresOps.cpp
+  src/engine/multires/MultiresIo.cpp
   src/engine/sculpt/Brush.cpp
   src/engine/sculpt/Dyntopo.cpp
   src/engine/sculpt/MaskOps.cpp
@@ -89,6 +90,7 @@ if(PLEGL_BUILD_TESTS)
     tests/test_facesets.cpp
     tests/test_multires.cpp
     tests/test_multires_levels.cpp
+    tests/test_multires_io.cpp
     tests/test_project.cpp
     tests/test_bvh.cpp
     tests/test_leaflayout.cpp
