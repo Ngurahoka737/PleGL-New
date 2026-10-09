@@ -1,7 +1,11 @@
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "TestUtil.h"
 #include "io/Project.h"
