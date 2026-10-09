@@ -365,20 +365,17 @@ void App::loadProjectAsync(const std::filesystem::path& path, bool recovered) {
     Timer t;
     auto error = std::make_shared<std::string>();
     auto project = std::make_shared<std::optional<Project>>(loadProject(path, error.get()));
-    auto bvhs = std::make_shared<std::vector<Bvh>>();
-    if (*project) {
-      bvhs->resize((*project)->objects.size());
-      for (std::size_t i = 0; i < bvhs->size(); ++i) (*bvhs)[i].build((*project)->objects[i].mesh);
-    }
+    // BVHs and subdivision levels; level data that does not fit refuses the whole file.
+    if (*project && !buildProject(**project, error.get())) project->reset();
     const double ms = t.ms();
     std::lock_guard lock(asyncMutex_);
-    asyncResults_.push_back([this, path, recovered, error, project, bvhs, ms] {
+    asyncResults_.push_back([this, path, recovered, error, project, ms] {
       --pendingImports_;
       if (!*project) {
         statusMessage = "Could not open " + pathToUtf8(path.filename()) + ": " + *error;
         return;
       }
-      applyProject(std::move(**project), std::move(*bvhs), path, recovered);
+      applyProject(std::move(**project), path, recovered);
       char buf[64];
       std::snprintf(buf, sizeof(buf), " in %.0f ms", ms);
       statusMessage += buf;
@@ -386,19 +383,15 @@ void App::loadProjectAsync(const std::filesystem::path& path, bool recovered) {
   });
 }
 
-void App::applyProject(Project project, std::vector<Bvh> bvhs, const std::filesystem::path& path, bool recovered) {
+void App::applyProject(Project project, const std::filesystem::path& path, bool recovered) {
   if (sculptor_.active()) endStroke();
   scene.clear();
   undoStack.clear();
   hover_.reset();
   std::size_t vertices = 0;
-  for (std::size_t i = 0; i < project.objects.size(); ++i) {
-    ProjectObject& po = project.objects[i];
+  for (ProjectObject& po : project.objects) {
     vertices += po.mesh.positions.size();
-    SceneObject& obj = scene.add(po.name, std::move(po.mesh), std::move(bvhs[i]));
-    obj.name = po.name;  // Keep names exactly, even duplicates.
-    obj.transform = po.transform;
-    obj.visible = po.visible;
+    addProjectObject(scene, po);
   }
   applySettings(project.settings);
   if (recovered) {

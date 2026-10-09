@@ -80,6 +80,10 @@ struct SceneObject {
     faceSetDirtyAll = true;
     faceSetDirtyLeaves.clear();
   }
+  // Asks for every leaf's positions, mask, face sets and triangles again. For a mesh swapped back
+  // in under a version the renderer may already hold with other values (a subdivision level that
+  // left and came back within one frame).
+  void markAllDirty();
   // Drops pending partial uploads; for use after a topology change, which re-uploads everything.
   void clearDirty() {
     dirtyLeaves.clear();

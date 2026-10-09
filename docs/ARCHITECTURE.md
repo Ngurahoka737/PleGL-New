@@ -117,6 +117,18 @@ Dengan dynamic topology (Ctrl+D di Sculpt mode), setiap dab mengubah topologi di
 
 **GPU.** Setiap dab menandai daun yang segitiga atau edge-nya berubah (`SceneObject::topoDirtyLeaves`), dan renderer hanya menulis ulang blok indeks daun itu, ditambah rentang vertex dan mask daun yang berubah. Di akhir stroke versi topologi berubah, jadi mesh diunggah penuh sekali dengan indeks yang dibuat paralel per daun. Statistik mesh (persentase quad, valence 4) dihitung paralel satu frame kemudian, tidak pernah di tengah stroke.
 
+## Multiresolution (`multires/`)
+
+Objek bisa punya beberapa level subdivisi (paling banyak 8, termasuk base). Subdivide menambah satu level di atas dengan Catmull-Clark: setiap face dengan n sudut jadi n quad. Artis bisa membentuk bentuk besar di level rendah dan detail di level tinggi, dan perubahan di satu level menyebar ke level lain.
+
+- **Data** (`Multires.h`): setiap level adalah `Mesh` dan `Bvh` lengkap dengan layout beku. BVH dibangun sekali, lalu hanya di-refit, dan setiap level punya `topologyVersion` sendiri seumur hidupnya. Level aktif ada di `SceneObject::mesh`/`bvh`, jadi brush, renderer, picking, mask, dan face set bekerja seperti biasa. Level lain diparkir di `SceneObject::multires`. Dynamic topology mati untuk objek yang punya level.
+- **Penomoran kanonik**: urutan vertex dan face di memori mengikuti BVH, jadi bisa berbeda antar build. Karena itu setiap level juga menyimpan nomor kanonik yang hanya bergantung pada topologi base. Anak vertex memakai nomor vertex induknya, anak edge memakai nV + peringkat half-edge pemilik kanonik, dan anak face memakai nV + nE + nomor face induknya. Topologi level k+1 ditulis dalam bentuk tertutup dari level k: quad q(h) bersudut [vc(v), ec(h), fc(f), ec(prev h)], dan twin-nya dihitung langsung dari twin level k. Kernel subdivisi hanya mengumpulkan nilai (gather), dan titik edge dihitung sebagai (a+b)+(Fl+Fr), jadi hasilnya bit-exact untuk urutan memori dan jumlah thread mana pun (dicek di test).
+- **Aturan vertex**: vertex yang terisolasi, non-manifold, atau berada di fan dengan terlalu sedikit face disematkan (Pinned) dan tidak bergerak. Vertex di border terbuka memakai aturan kurva border, dan sisanya memakai aturan Catmull-Clark biasa. Anak mewarisi aturan induknya.
+- **Sinkronisasi** (`Propagate.h`): saat level diganti, `diffActive` membandingkan level aktif bit demi bit dengan referensi yang diambil waktu level itu diaktifkan. Hanya vertex yang berubah yang disebarkan. Ke atas, perubahan di-subdivisi ulang lewat ring Φ0/Φ1/Φ2, dan detail level tinggi dibawa dalam frame lokal (normal dan tangen), jadi detail ikut berputar saat bentuk dasarnya digeser. Ke bawah, perubahan diturunkan dengan restriksi tenda, misalnya untuk vertex biasa (4Δvc + 2ΣΔec + ΣΔfc) / (4 + 3n). Mask naik dengan interpolasi dan turun dengan injeksi. Face set naik apa adanya. Saat turun, induk mengambil id mayoritas anaknya (seri dimenangkan anak pertama), dan hanya tersembunyi kalau semua anaknya tersembunyi.
+- **Undo**: `MultiresUndo` mencatat Switch, Subdivide, DeleteHigher, DeleteLower, dan AllLevels (Clear/Fill/Invert mask, Clear/Reveal All/Invert Visibility face set di semua level), termasuk delta sinkronisasinya. Switch berturut-turut digabung jadi satu langkah. Stroke tetap bisa di-undo setelah pindah level lalu kembali, karena versi topologi level itu tidak berubah.
+- **Di aplikasi**: Subdivide berjalan di worker thread. Selama itu objek tidak bisa diedit dan undo ditahan, sama seperti remesh. Remesh menghapus semua level, dan undo mengembalikannya. Pindah level membuat level yang datang diunggah ulang ke GPU. Kalau level pergi dan kembali dalam satu frame, semua daunnya ditandai kotor, jadi GPU tidak pernah memakai data lama.
+- **Penyimpanan**: chunk `MRES` (lihat Project file).
+
 ## Quad remesh (`remesh/QuadRemesh.h`)
 
 Pipeline: `voxelRemesh` pada **2× target edge** → beberapa ronde (default 3) optimasi → subdivisi 1 level ke target edge → relaksasi.
@@ -141,6 +153,7 @@ Format `.psculpt` adalah container biner kecil: magic `PSCULPT\x1A`, versi, lalu
 - `OBJS` menyimpan tiap objek: nama, transform, visibilitas, posisi vertex (float, bit-exact), ukuran face, dan index face. Topologi half-edge dibangun ulang saat dibuka, dan BVH dibangun di worker thread.
 - `MASK` (opsional, hanya kalau ada objek yang punya mask) menyimpan per objek: index objek di `OBJS`, jumlah vertex, encoding (0 = float32), lalu nilai mask. File dengan chunk `MASK` yang index objeknya salah, jumlah vertex-nya tidak cocok, encoding-nya tidak dikenal, atau terpotong ditolak ("The mask data is damaged."), sama seperti chunk lain yang rusak. Encoding baru nanti butuh versi format baru atau tag chunk baru. Nilai di luar [0, 1] atau NaN dijepit.
 - `FSET` (opsional, hanya kalau ada objek dengan face set atau face tersembunyi) menyimpan per objek: index objek, jumlah face, encoding (0 = int32), lalu nilai face set dengan tanda tersembunyi. Jumlah face yang tidak cocok dengan mesh yang dibangun, encoding yang tidak dikenal, nilai 0, atau data terpotong ditolak dengan pesan bahwa data face set rusak atau terpotong.
+- `MRES` (opsional, hanya kalau ada objek dengan level subdivisi) menyimpan per objek: topologi base dalam urutan kanonik (ukuran face, sudut, twin, dan awal fan setiap vertex), nilai setiap level yang tidak aktif, dan edit level aktif yang belum disebarkan. Untuk objek seperti itu, `OBJS`, `MASK`, dan `FSET` berisi level aktif dalam urutan kanonik, jadi build lama yang melewati `MRES` tetap membuka level yang sedang dipahat. Saat dibuka, semua level dibangun ulang dengan subdivisi dari base, lalu jumlah elemen dan poligon level aktif harus cocok persis dengan `OBJS`. Kalau tidak cocok, file ditolak ("The subdivision level data is damaged"). Hasilnya bit-exact, termasuk edit yang belum disebarkan (dicek di test).
 - `SETT` menyimpan setelan aplikasi sebagai baris `key value`: brush, radius, strength per brush, falloff, tekanan pen, simetri, kamera, viewport, remesh, mode, dan objek terpilih. Engine menyimpannya apa adanya, jadi setelan baru tidak perlu mengubah format. Kunci yang tidak ada memakai nilai default.
 - Pembaca melewati chunk yang tidak dikenal (kompatibel ke depan) dan menolak file yang terpotong, rusak (checksum salah), atau dari versi format yang lebih baru, dengan pesan yang jelas. Setiap jumlah dan index diperiksa sebelum dipakai.
 - Penyimpanan bersifat atomik: data ditulis ke `<nama>.tmp` lalu di-rename, jadi crash saat menyimpan tidak merusak project yang ada. Serialisasi berjalan di thread utama (cepat, cuma salin memori), penulisan file di worker.
@@ -248,3 +261,16 @@ Kualitas dibanding voxel remesh biasa pada target edge yang sama (tes `quad reme
 | Dua bola tumpang tindih | 52% → 99,1% | 0,22 → 0,17 | 0,022 → 0,012 |
 
 Volume berubah kurang dari 1% dibanding hasil voxel. Rusuk kubus lebih bulat daripada voxel remesh biasa karena layout dibangun di 2× edge; penjagaan fitur tajam belum ada.
+
+## Hasil multiresolution (Phase 6d)
+
+`plegl_bench`, mesin yang sama (4 worker thread). Base quad sphere 13.824 face, brush Draw radius 0,15. "Ganti level" diukur tanpa edit yang menunggu. "Sinkron turun" adalah pindah satu level ke bawah setelah stroke 200 dab di level teratas, termasuk menyebarkan stroke itu ke semua level:
+
+| Face | Level | Subdivide (worker) | Ganti level | Dab rata-rata | Sinkron turun | Simpan | Buka | Memori level lain |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 55K | 1 | 14 ms | 0,1 ms | 0,16 ms | 0,8 ms | 8 ms | 34 ms | 3 MB |
+| 221K | 2 | 64 ms | 0,3 ms | 0,36 ms | 2,7 ms | 29 ms | 0,18 s | 16 MB |
+| 885K | 3 | 0,39 s | 1,7 ms | 0,81 ms | 9,0 ms | 0,11 s | 0,86 s | 67 MB |
+| 3,5M | 4 | 1,8 s | 5,6 ms | 1,3 ms | 33 ms | 0,57 s | 4,0 s | 269 MB |
+
+Bagian subdivide di thread utama di bawah 7 ms. Menyimpan objek 3,5M face dengan level hanya sekitar 0,12 s lebih lama daripada mesh biasa dengan jumlah face yang sama (0,42 s). Membuka file berjalan di worker thread.

@@ -158,6 +158,25 @@ void App::drawUi() {
       ImGui::MenuItem("Show Face Sets", nullptr, &view.showFaceSets);
       ImGui::EndMenu();
     }
+    if (ImGui::BeginMenu("Multires")) {
+      const SceneObject* sel = scene.find(selectedId);
+      const Multires* levels = sel ? sel->multires.get() : nullptr;
+      const bool can = canEditMask();
+      if (ImGui::MenuItem(job() == Job::Subdivide ? "Subdividing..." : "Subdivide", "Ctrl+PgUp", false, can && !busy()))
+        requestSubdivide();
+      ImGui::Separator();
+      const bool canSwitch = can && levels;
+      if (ImGui::MenuItem("Level Up", "PgUp", false, canSwitch && levels->active < levels->top())) stepLevel(1);
+      if (ImGui::MenuItem("Level Down", "PgDn", false, canSwitch && levels->active > 0)) stepLevel(-1);
+      if (ImGui::MenuItem("Highest Level", "Shift+PgUp", false, canSwitch && levels->active < levels->top()))
+        setLevel(kMaxMultiresLevels);
+      if (ImGui::MenuItem("Lowest Level", "Shift+PgDn", false, canSwitch && levels->active > 0)) setLevel(0);
+      ImGui::Separator();
+      if (ImGui::MenuItem("Delete Higher Levels", nullptr, false, canSwitch && levels->active < levels->top()))
+        deleteHigherLevels();
+      if (ImGui::MenuItem("Delete Lower Levels", nullptr, false, canSwitch && levels->active > 0)) deleteLowerLevels();
+      ImGui::EndMenu();
+    }
     if (ImGui::BeginMenu("View")) {
       ImGui::MenuItem("Wireframe", nullptr, &view.wireframe);
       ImGui::MenuItem("Grid", nullptr, &view.grid);
@@ -179,6 +198,9 @@ void App::drawUi() {
       ImGui::TextUnformatted("Alt + M             Clear mask (Alt+Shift+M: mask all)");
       ImGui::TextUnformatted("Alt + B             Blur mask (Alt+Shift+B: sharpen)");
       ImGui::TextUnformatted("Alt + H             Reveal all hidden faces");
+      ImGui::TextUnformatted("Ctrl + Page Up      Subdivide (add a level on top)");
+      ImGui::TextUnformatted("Page Up / Down      Higher / lower subdivision level");
+      ImGui::TextUnformatted("Shift + Page Up/Dn  Highest / lowest level");
       ImGui::Separator();
       ImGui::TextUnformatted("Sculpt mode:");
       ImGui::TextUnformatted("M                   Mask brush (Ctrl+drag erases, Shift+drag smooths)");
@@ -284,8 +306,12 @@ void App::drawUi() {
       ImGui::SetNextItemWidth(-1);
       if (ImGui::Combo("##refine", &rm, kRefine, 3)) sculpt.dyntopoRefine = static_cast<DyntopoRefine>(rm);
       ImGui::EndDisabled();
-      if (sculpt.dyntopo && (sculpt.brush == BrushKind::Grab || sculpt.brush == BrushKind::Mask ||
-                             sculpt.brush == BrushKind::FaceSet)) {
+      if (const SceneObject* sel = scene.find(selectedId); sculpt.dyntopo && sel && sel->multires) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextWrapped("Off on this object: it has subdivision levels.");
+        ImGui::PopStyleColor();
+      } else if (sculpt.dyntopo && (sculpt.brush == BrushKind::Grab || sculpt.brush == BrushKind::Mask ||
+                                    sculpt.brush == BrushKind::FaceSet)) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
         ImGui::TextWrapped("%s does not change topology.", kBrushLabels[static_cast<int>(sculpt.brush)]);
         ImGui::PopStyleColor();
@@ -371,9 +397,14 @@ void App::drawUi() {
       ImGui::Checkbox("Optimize quads", &remesh.optimizeQuads);
       if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Raise valence-4 vertices, even out edge lengths and fit the original surface.");
-      ImGui::BeginDisabled(remeshing() || strokeActive() || !scene.find(selectedId));
+      ImGui::BeginDisabled(busy() || strokeActive() || !scene.find(selectedId));
       if (ImGui::Button(remeshing() ? "Remeshing..." : "Remesh (Ctrl+R)", ImVec2(-1, 0))) requestRemesh();
       ImGui::EndDisabled();
+      if (const SceneObject* sel = scene.find(selectedId); sel && sel->multires) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextWrapped("Remeshing removes the subdivision levels (undo brings them back).");
+        ImGui::PopStyleColor();
+      }
       if (!lastRemeshInfo.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
         ImGui::TextWrapped("Last: %s", lastRemeshInfo.c_str());
@@ -381,11 +412,11 @@ void App::drawUi() {
       }
 
       sectionHeader("History");
-      ImGui::BeginDisabled(!undoStack.canUndo() || strokeActive() || remeshing());
+      ImGui::BeginDisabled(!undoStack.canUndo() || strokeActive() || busy());
       if (ImGui::Button("Undo")) undo();
       ImGui::EndDisabled();
       ImGui::SameLine();
-      ImGui::BeginDisabled(!undoStack.canRedo() || strokeActive() || remeshing());
+      ImGui::BeginDisabled(!undoStack.canRedo() || strokeActive() || busy());
       if (ImGui::Button("Redo")) redo();
       ImGui::EndDisabled();
       ImGui::SameLine();
@@ -451,7 +482,11 @@ void App::drawUi() {
         ImGui::PushID(static_cast<int>(o->id));
         ImGui::Checkbox("##vis", &o->visible);
         ImGui::SameLine();
-        if (ImGui::Selectable(o->name.c_str(), o->id == selectedId)) selectedId = o->id;
+        std::string label = o->name;
+        if (o->multires)
+          label += "  L" + std::to_string(o->multires->active) + "/" + std::to_string(o->multires->top());
+        label += "##object";  // The id stays the same when the level changes.
+        if (ImGui::Selectable(label.c_str(), o->id == selectedId)) selectedId = o->id;
         if (ImGui::BeginPopupContextItem()) {
           if (ImGui::MenuItem("Duplicate")) {
             selectedId = o->id;
@@ -504,6 +539,49 @@ void App::drawUi() {
         if (info.interior > 0)
           ImGui::Text("Valence 4  %.2f%%", 100.0f * info.valence4 / info.interior);
         ImGui::Text("BVH leaves %zu", still->bvh.leaves().size());
+
+        sectionHeader("Subdivision levels");
+        const bool can = canEditMask();
+        if (const Multires* levels = still->multires.get()) {
+          ImGui::BeginDisabled(!can);
+          for (int k = levels->top(); k >= 0; --k) {
+            const Mesh& lm = k == levels->active ? still->mesh : levels->levels[static_cast<std::size_t>(k)].mesh;
+            char row[64];
+            std::snprintf(row, sizeof(row), "Level %d%s##level%d", k, k == 0 ? " (base)" : "", k);
+            ImGui::PushID(k);
+            if (ImGui::Selectable(row, k == levels->active, ImGuiSelectableFlags_AllowOverlap) && k != levels->active)
+              setLevel(k);
+            ImGui::SameLine(ImGui::GetContentRegionAvail().x * 0.55f);
+            ImGui::TextDisabled("%d faces", lm.faceCount());
+            ImGui::PopID();
+          }
+          ImGui::EndDisabled();
+        } else {
+          ImGui::TextDisabled("None. Subdivide to add a level.");
+        }
+        ImGui::BeginDisabled(!can || busy());
+        if (ImGui::Button(job() == Job::Subdivide ? "Subdividing..." : "Subdivide (Ctrl+Page Up)", ImVec2(-1, 0)))
+          requestSubdivide();
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+          ImGui::SetTooltip("Adds a level on top: every face splits into four, smoothly (Catmull-Clark).\n"
+                            "Shape on low levels, detail on high ones; edits carry across levels.\n"
+                            "Page Up / Page Down switch levels.");
+        if (const Multires* levels = still->multires.get()) {
+          const float half = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+          ImGui::BeginDisabled(!can || levels->active == levels->top());
+          if (ImGui::Button("Delete Higher", ImVec2(half, 0))) deleteHigherLevels();
+          ImGui::EndDisabled();
+          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("Removes the levels above the current one.");
+          ImGui::SameLine();
+          ImGui::BeginDisabled(!can || levels->active == 0);
+          if (ImGui::Button("Delete Lower", ImVec2(half, 0))) deleteLowerLevels();
+          ImGui::EndDisabled();
+          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("Makes the current level the base and removes the ones below it.");
+          ImGui::TextDisabled("Other levels  %.0f MB", static_cast<double>(levels->bytes()) / (1024.0 * 1024.0));
+        }
       }
     }
 
@@ -555,11 +633,15 @@ void App::drawUi() {
   ImGui::SetNextWindowSize(ImVec2(vp->Size.x, statusH));
   if (ImGui::Begin("Status", nullptr, panelFlags | ImGuiWindowFlags_NoScrollbar)) {
     ImGui::TextUnformatted(statusMessage.c_str());
-    const char* hint = mode == Mode::Object ? "Object mode  |  Alt+drag navigate  |  G R S transform  |  Tab sculpt"
-                                            : "Sculpt mode  |  Alt+drag navigate  |  M mask  |  H hide  |  Ctrl+D dyntopo  |  Tab object";
-    const float w = ImGui::CalcTextSize(hint).x;
+    std::string hint;
+    if (const SceneObject* sel = scene.find(selectedId); sel && sel->multires)
+      hint = "Level " + std::to_string(sel->multires->active) + "/" + std::to_string(sel->multires->top()) + ", " +
+             std::to_string(sel->mesh.faceCount()) + " faces  |  PgUp/PgDn level  |  ";
+    hint += mode == Mode::Object ? "Object mode  |  Alt+drag navigate  |  G R S transform  |  Tab sculpt"
+                                 : "Sculpt mode  |  Alt+drag navigate  |  M mask  |  H hide  |  Ctrl+D dyntopo  |  Tab object";
+    const float w = ImGui::CalcTextSize(hint.c_str()).x;
     ImGui::SameLine(std::max(ImGui::GetCursorPosX() + 20.0f, ImGui::GetWindowWidth() - w - 12.0f * scale));
-    ImGui::TextDisabled("%s", hint);
+    ImGui::TextDisabled("%s", hint.c_str());
   }
   ImGui::End();
 

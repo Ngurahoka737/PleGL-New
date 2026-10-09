@@ -20,6 +20,7 @@
 #include "sculpt/Sculptor.h"
 #include "sculpt/StrokeSampler.h"
 #include "io/Project.h"
+#include "multires/MultiresOps.h"
 #include "sculpt/Undo.h"
 
 namespace plegl {
@@ -137,9 +138,22 @@ class App {
 
   void addPrimitive(const std::string& name, Mesh mesh);
   void newScene();
-  // Voxel remesh of the selected object on a worker thread (Ctrl+R).
+  // Voxel remesh of the selected object on a worker thread (Ctrl+R). Drops subdivision levels.
   void requestRemesh();
-  bool remeshing() const { return remeshObjectId_ != 0; }
+  // Background work on one object (remesh, subdivide). Only one runs at a time; the object can not
+  // be edited meanwhile, and undo waits.
+  enum class Job { None, Remesh, Subdivide };
+  Job job() const { return job_; }
+  bool busy() const { return job_ != Job::None; }
+  bool remeshing() const { return job_ == Job::Remesh; }
+  // Subdivision levels (multiresolution) of the selected object. Subdivide adds a Catmull-Clark
+  // level on top (on a worker thread; from a lower level it first steps to the top).
+  void requestSubdivide();
+  // Makes `level` the active one (clamped); edits since the last switch spread to every level.
+  void setLevel(int level);
+  void stepLevel(int delta);
+  void deleteHigherLevels();
+  void deleteLowerLevels();
   void requestImport();
   void requestExport();
   // Project files (.psculpt). New, Open and Quit ask about unsaved changes first.
@@ -205,7 +219,7 @@ class App {
   // Serializes on the main thread and writes on a worker. `then` runs on the main thread after a
   // successful write.
   void saveProjectTo(const std::filesystem::path& path, std::function<void()> then = {});
-  void applyProject(Project project, std::vector<Bvh> bvhs, const std::filesystem::path& path, bool recovered);
+  void applyProject(Project project, const std::filesystem::path& path, bool recovered);
   void loadProjectAsync(const std::filesystem::path& path, bool recovered);
   void autosaveTick();
   void updateWindowTitle();
@@ -216,6 +230,10 @@ class App {
   // status message saying why not.
   SceneObject* editableObject(std::uint32_t id, const char* what);
   void pushEdit(std::optional<SculptUndo> entry, const char* name, double ms);
+  void pushEdit(std::optional<MultiresUndo> entry, const char* name, double ms);
+  // "Wait for the remesh to finish before <action>." when `id` is the busy object (0: any).
+  bool waitForJob(std::uint32_t id, const std::string& action);
+  void pushLevelEdit(SceneObject& obj, std::optional<MultiresUndo> entry, const char* failure, double ms);
 
   SDL_Window* window_ = nullptr;
   SDL_GLContext gl_ = nullptr;
@@ -239,7 +257,8 @@ class App {
   std::mutex asyncMutex_;
   std::deque<std::function<void()>> asyncResults_;
   std::vector<std::jthread> workers_;
-  std::uint32_t remeshObjectId_ = 0;  // Object being remeshed, 0 when idle.
+  Job job_ = Job::None;
+  std::uint32_t jobObjectId_ = 0;  // Object the job works on.
   int pendingImports_ = 0;
 
   std::uint64_t lastFrameNs_ = 0;
@@ -260,6 +279,8 @@ class App {
 
   // Sculpting.
   Sculptor sculptor_;
+  // Scratch for spreading edits between subdivision levels, shared with the undo stack.
+  std::shared_ptr<SyncWorkspace> syncWorkspace_;
   const Brush* brushFor(BrushKind kind) const;  // nullptr for Grab, which has its own stroke path.
   DrawBrush drawBrush_;
   ClayBrush clayBrush_;

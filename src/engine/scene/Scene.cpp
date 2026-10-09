@@ -56,6 +56,19 @@ void SceneObject::markVisibilityDirty(Index leaf) {
   }
 }
 
+void SceneObject::markAllDirty() {
+  clearDirty();
+  const auto count = static_cast<Index>(bvh.leaves().size());
+  dirtyLeaves.reserve(static_cast<std::size_t>(count));
+  topoDirtyLeaves.reserve(static_cast<std::size_t>(count));
+  for (Index l = 0; l < count; ++l) {
+    dirtyLeaves.push_back(l);
+    topoDirtyLeaves.push_back(l);
+  }
+  maskDirtyAll = true;
+  faceSetDirtyAll = true;
+}
+
 SceneObject& Scene::add(std::string name, Mesh mesh) {
   auto obj = std::make_unique<SceneObject>();
   obj->id = nextId_++;

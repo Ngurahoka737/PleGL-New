@@ -199,10 +199,10 @@ TEST_CASE("levels: consecutive level steps merge") {
   step(obj, 1, undo, ws);
   step(obj, 0, undo, ws);
   CHECK(undo.size() == 3);  // Step, stroke, two steps merged into one.
-  CHECK(undo.undo(scene) == "Level 0");
+  CHECK(undo.undo(scene) == "Switch to Level 0");
   CHECK(obj.multires->active == 2);
   CHECK(undo.undo(scene) == "Draw");
-  CHECK(undo.undo(scene) == "Level 2");
+  CHECK(undo.undo(scene) == "Switch to Level 2");
   CHECK(obj.multires->active == 3);
 }
 
@@ -250,7 +250,7 @@ TEST_CASE("levels: undoing a level step brings the pending edits back") {
   // The edit reached the parked levels.
   CHECK_FALSE(sameArray(obj.multires->levels[3].mesh.positions, before.levels[3].pos));
   CHECK_FALSE(sameArray(obj.mesh.positions, before.levels[1].pos));
-  CHECK(undo.undo(scene) == "Level 1");
+  CHECK(undo.undo(scene) == "Switch to Level 1");
   CHECK(obj.multires->active == 2);
   CHECK(sameArray(obj.mesh.positions, sculpted));
   for (int k : {0, 1, 3}) {

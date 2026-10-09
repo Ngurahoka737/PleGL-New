@@ -38,7 +38,9 @@ void unpark(SceneObject& obj, int k) {
   obj.topologyVersion = l.version;
   s.active = k;
   takeReference(obj);
-  obj.clearDirty();
+  // Usually the version differs from what the renderer holds and it uploads everything anyway;
+  // when the level left and came back within one frame, its values may still have changed.
+  obj.markAllDirty();
   ++s.serial;
 }
 
@@ -259,7 +261,7 @@ std::optional<MultiresUndo> setActiveLevel(SceneObject& obj, int target, SyncDel
   if (!obj.multires || target < 0 || target >= obj.multires->levelCount() || target == obj.multires->active)
     return std::nullopt;
   Multires& s = *obj.multires;
-  MultiresUndo u = makeEntry(obj, MultiresOp::Switch, "Level " + std::to_string(target));
+  MultiresUndo u = makeEntry(obj, MultiresOp::Switch, "Switch to Level " + std::to_string(target));
   applyDelta(s, sync, true, ws);
   growBound(obj);
   park(obj);
