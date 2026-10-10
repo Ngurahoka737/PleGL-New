@@ -181,6 +181,7 @@ void App::drawUi() {
       if (ImGui::MenuItem("Delete Lower Levels", nullptr, false, canSwitch && levels->active > 0)) deleteLowerLevels();
       ImGui::EndMenu();
     }
+    drawLayersMenu();
     if (ImGui::BeginMenu("View")) {
       ImGui::MenuItem("Wireframe", nullptr, &view.wireframe);
       ImGui::MenuItem("Grid", nullptr, &view.grid);
@@ -205,6 +206,8 @@ void App::drawUi() {
       ImGui::TextUnformatted("Ctrl + Page Up      Subdivide (add a level on top)");
       ImGui::TextUnformatted("Page Up / Down      Higher / lower subdivision level");
       ImGui::TextUnformatted("Shift + Page Up/Dn  Highest / lowest level");
+      ImGui::TextUnformatted("Ctrl + L            New sculpt layer");
+      ImGui::TextUnformatted("Alt + click an eye  Show only that layer (again: show all)");
       ImGui::Separator();
       ImGui::TextUnformatted("Sculpt mode:");
       ImGui::TextUnformatted("M                   Mask brush (Ctrl+drag erases, Shift+drag smooths)");
@@ -213,6 +216,8 @@ void App::drawUi() {
       ImGui::TextUnformatted("H / Shift + H       Hide / show only the face set under the cursor");
       ImGui::TextUnformatted("Shift + M           Mask the face set under the cursor");
       ImGui::TextUnformatted("Ctrl + D            Dynamic topology on / off");
+      ImGui::TextUnformatted("L                   Show / hide the active sculpt layer");
+      ImGui::TextUnformatted("E                   Erase Layer brush");
       ImGui::TextUnformatted("F / R + move        Brush radius / detail size");
       ImGui::EndMenu();
     }
@@ -240,13 +245,25 @@ void App::drawUi() {
       sectionHeader("Brush");
       // Two columns of brush buttons; the active one is highlighted.
       const float bw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+      const SceneObject* target = scene.find(selectedId);
+      const bool onLayer = target && target->mesh.layers.active != 0;
       for (int i = 0; i < kBrushCount; ++i) {
         if (i % 2 == 1) ImGui::SameLine();
         const bool active = static_cast<int>(sculpt.brush) == i;
+        // Erase Layer takes detail out of a layer, so it needs one to be the target.
+        const bool erase = static_cast<BrushKind>(i) == BrushKind::EraseLayer;
+        ImGui::BeginDisabled(erase && !onLayer && !active);
         if (active) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
         if (ImGui::Button(kBrushLabels[i], ImVec2(bw, 0))) sculpt.brush = static_cast<BrushKind>(i);
         if (active) ImGui::PopStyleColor();
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Shortcut: %s", kBrushKeys[i]);
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+          if (erase)
+            ImGui::SetTooltip("Shortcut: E\nRemoves the active sculpt layer's detail where you paint.%s",
+                              onLayer ? "" : "\nPick a layer under Sculpt layers first.");
+          else
+            ImGui::SetTooltip("Shortcut: %s", kBrushKeys[i]);
+        }
       }
 
       ImGui::SetNextItemWidth(-1);
@@ -263,12 +280,22 @@ void App::drawUi() {
         ImGui::TextWrapped("Each stroke paints a new face set. Ctrl+drag: grow the set under the cursor. "
                            "Lower strength paints a smaller core.");
         ImGui::PopStyleColor();
+      } else if (sculpt.brush == BrushKind::EraseLayer) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextWrapped("Takes the active layer's detail back out. The base and other layers stay.");
+        ImGui::PopStyleColor();
       } else if (sculpt.brush != BrushKind::Smooth && sculpt.brush != BrushKind::Grab) {
         int inv = sculpt.invert ? 1 : 0;
         ImGui::RadioButton("Add", &inv, 0);
         ImGui::SameLine();
         ImGui::RadioButton("Subtract", &inv, 1);
         sculpt.invert = inv != 0;
+      }
+      if (sculpt.brush == BrushKind::Smooth && onLayer) {
+        ImGui::Checkbox("This layer only", &sculpt.smoothLayerOnly);
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("Smooths only the active layer's own detail, also with Shift+drag.\n"
+                            "Off: smooths the shape you see and keeps the result on this layer.");
       }
       static const char* kFalloffs[] = {"Smooth falloff", "Sharp falloff", "Linear falloff", "Constant falloff"};
       int f = static_cast<int>(sculpt.falloff);
@@ -291,7 +318,8 @@ void App::drawUi() {
       sectionHeader("Dynamic topology");
       ImGui::Checkbox("Enabled (Ctrl+D)", &sculpt.dyntopo);
       if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Brushes add triangles where detail is needed and merge them where it is not.");
+        ImGui::SetTooltip("Brushes add triangles where detail is needed and merge them where it is not.\n"
+                          "Apply or delete all sculpt layers to use it on an object with layers.");
       ImGui::BeginDisabled(!sculpt.dyntopo);
       static const char* kDetailModes[] = {"Relative (pixels)", "Constant (units)"};
       int dm = static_cast<int>(sculpt.detailMode);
@@ -313,6 +341,10 @@ void App::drawUi() {
       if (const SceneObject* sel = scene.find(selectedId); sculpt.dyntopo && sel && sel->multires) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
         ImGui::TextWrapped("Off on this object: it has subdivision levels.");
+        ImGui::PopStyleColor();
+      } else if (sculpt.dyntopo && sel && !sel->mesh.layers.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.8f, 0.4f, 1.0f));
+        ImGui::TextWrapped("This object has sculpt layers, so strokes are refused. Turn this off or apply all layers.");
         ImGui::PopStyleColor();
       } else if (sculpt.dyntopo && (sculpt.brush == BrushKind::Grab || sculpt.brush == BrushKind::Mask ||
                                     sculpt.brush == BrushKind::FaceSet)) {
@@ -407,6 +439,10 @@ void App::drawUi() {
       if (const SceneObject* sel = scene.find(selectedId); sel && sel->multires) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
         ImGui::TextWrapped("Remeshing removes the subdivision levels (undo brings them back).");
+        ImGui::PopStyleColor();
+      } else if (sel && !sel->mesh.layers.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextWrapped("Remeshing bakes the sculpt layers into the mesh (undo brings them back).");
         ImGui::PopStyleColor();
       }
       if (!lastRemeshInfo.empty()) {
@@ -556,7 +592,11 @@ void App::drawUi() {
             if (ImGui::Selectable(row, k == levels->active, ImGuiSelectableFlags_AllowOverlap) && k != levels->active)
               setLevel(k);
             ImGui::SameLine(ImGui::GetContentRegionAvail().x * 0.55f);
-            ImGui::TextDisabled("%d faces", lm.faceCount());
+            if (lm.layers.empty())
+              ImGui::TextDisabled("%d faces", lm.faceCount());
+            else
+              ImGui::TextDisabled("%d faces, %zu layer%s", lm.faceCount(), lm.layers.list.size(),
+                                  lm.layers.list.size() == 1 ? "" : "s");
             ImGui::PopID();
           }
           ImGui::EndDisabled();
@@ -591,6 +631,7 @@ void App::drawUi() {
             ImGui::SetTooltip("Makes the current level the base and removes the ones below it.");
           ImGui::TextDisabled("Other levels  %.0f MB", static_cast<double>(levels->bytes()) / (1024.0 * 1024.0));
         }
+        drawLayerPanel(*still);
       }
     }
 
@@ -648,8 +689,32 @@ void App::drawUi() {
              std::to_string(sel->mesh.faceCount()) + " faces  |  PgUp/PgDn level  |  ";
     hint += mode == Mode::Object ? "Object mode  |  Alt+drag navigate  |  G R S transform  |  Tab sculpt"
                                  : "Sculpt mode  |  Alt+drag navigate  |  M mask  |  H hide  |  Ctrl+D dyntopo  |  Tab object";
-    const float w = ImGui::CalcTextSize(hint.c_str()).x;
+    // The stroke target on objects with sculpt layers, in amber when strokes would be refused.
+    std::string layerText;
+    bool refused = false;
+    if (const SceneObject* sel = scene.find(selectedId); mode == Mode::Sculpt && sel && !sel->mesh.layers.empty()) {
+      const SculptLayer* layer = sel->mesh.layers.find(sel->mesh.layers.active);
+      char buf[128];
+      if (layer)
+        std::snprintf(buf, sizeof(buf), "Layer: %s (%.0f %%)", layer->name.c_str(), layer->strength * 100.0f);
+      else
+        std::snprintf(buf, sizeof(buf), "Layer: Base");
+      layerText = buf;
+      refused = !layerStrokeHint().empty();
+      if (refused && layer && !layer->visible) layerText += " - hidden, strokes refused";
+      else if (refused) layerText += " - strokes refused";
+      layerText += "  |  ";
+    }
+    const float w = ImGui::CalcTextSize(hint.c_str()).x + ImGui::CalcTextSize(layerText.c_str()).x;
     ImGui::SameLine(std::max(ImGui::GetCursorPosX() + 20.0f, ImGui::GetWindowWidth() - w - 12.0f * scale));
+    if (!layerText.empty()) {
+      if (refused)
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "%s", layerText.c_str());
+      else
+        ImGui::TextDisabled("%s", layerText.c_str());
+      if (refused && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", layerStrokeHint().c_str());
+      ImGui::SameLine(0.0f, 0.0f);
+    }
     ImGui::TextDisabled("%s", hint.c_str());
   }
   ImGui::End();
@@ -663,6 +728,187 @@ void App::drawUi() {
   vpW_ = std::max(1.0f, vp->Size.x - leftW - rightW);
   vpH_ = bodyH;
   updateViewportRect();
+}
+
+void App::drawLayersMenu() {
+  if (!ImGui::BeginMenu("Layers")) return;
+  const SceneObject* sel = scene.find(selectedId);
+  const LayerStack* stack = sel ? &sel->mesh.layers : nullptr;
+  const SculptLayer* layer = stack ? stack->find(stack->active) : nullptr;
+  const bool can = canEditLayers();
+  const bool any = can && stack && !stack->empty();
+  const bool one = can && layer;
+  if (ImGui::MenuItem("New Layer", "Ctrl+L", false, can && sel)) addLayer();
+  if (ImGui::MenuItem("Duplicate Layer", nullptr, false, one)) duplicateLayer();
+  if (ImGui::MenuItem("Delete Layer", nullptr, false, one)) deleteLayer();
+  ImGui::Separator();
+  if (ImGui::MenuItem("Merge Down", nullptr, false, one && stack->indexOf(layer->id) > 0)) mergeLayerDown();
+  if (ImGui::MenuItem("Apply Layer", nullptr, false, one)) applyLayer();
+  if (ImGui::MenuItem("Apply All Layers", nullptr, false, any)) applyAllLayers();
+  if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+    ImGui::SetTooltip("Makes the shape you see the mesh and removes every layer, hidden ones too.");
+  ImGui::Separator();
+  if (ImGui::MenuItem("Invert Layer", nullptr, false, one)) invertLayer();
+  if (ImGui::MenuItem("Mask from Layer", nullptr, false, one)) maskFromLayer();
+  ImGui::Separator();
+  if (ImGui::MenuItem(layer && !layer->visible ? "Show Layer" : "Hide Layer", "L", false, one))
+    toggleActiveLayerVisible();
+  if (ImGui::MenuItem("Solo Layer", "Alt+click eye", false, one)) soloLayer(layer->id);
+  if (ImGui::MenuItem("Show All Layers", nullptr, false, any)) setAllLayersVisible(true);
+  if (ImGui::MenuItem("Hide All Layers", nullptr, false, any)) setAllLayersVisible(false);
+  ImGui::EndMenu();
+}
+
+void App::drawLayerPanel(SceneObject& obj) {
+  const float scale = ImGui::GetStyle().FontScaleDpi > 0 ? ImGui::GetStyle().FontScaleDpi : 1.0f;
+  if (obj.multires) {
+    const std::string title = "Sculpt layers - level " + std::to_string(obj.multires->active);
+    sectionHeader(title.c_str());
+  } else {
+    sectionHeader("Sculpt layers");
+  }
+  const LayerStack& stack = obj.mesh.layers;
+  const SculptLayer* active = stack.find(stack.active);
+  const bool can = canEditLayers();
+  ImGui::BeginDisabled(!can);
+
+  // Add, Duplicate and Delete, with the reason when Add or Duplicate cannot run.
+  std::string full;
+  if (stack.list.size() >= static_cast<std::size_t>(kMaxLayers))
+    full = "An object (or subdivision level) can have at most " + std::to_string(kMaxLayers) + " sculpt layers.";
+  else if (objectLayerBytes(obj) + (stack.empty() ? 2 : 1) * obj.mesh.positions.size() * sizeof(Vec3) > kMaxObjectLayerBytes)
+    full = "The sculpt layers of one object may use at most 1 GB.";
+  const float third = (ImGui::GetContentRegionAvail().x - 2.0f * ImGui::GetStyle().ItemSpacing.x) / 3.0f;
+  ImGui::BeginDisabled(!full.empty());
+  if (ImGui::Button("Add", ImVec2(third, 0))) addLayer();
+  ImGui::EndDisabled();
+  if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+    ImGui::SetTooltip("%s", full.empty() ? "A new empty layer on top (Ctrl+L). Strokes go into it." : full.c_str());
+  ImGui::SameLine();
+  ImGui::BeginDisabled(!active || !full.empty());
+  if (ImGui::Button("Duplicate", ImVec2(third, 0))) duplicateLayer();
+  ImGui::EndDisabled();
+  if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+    ImGui::SetTooltip("%s", !full.empty() ? full.c_str() : "A hidden copy of the active layer.");
+  ImGui::SameLine();
+  ImGui::BeginDisabled(!active);
+  if (ImGui::Button("Delete##layer", ImVec2(third, 0))) deleteLayer();
+  ImGui::EndDisabled();
+
+  if (stack.empty()) {
+    ImGui::EndDisabled();
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    ImGui::TextWrapped("No sculpt layers. Strokes change the mesh directly.");
+    if (obj.multires) ImGui::TextWrapped("Each subdivision level has its own layers.");
+    ImGui::PopStyleColor();
+    return;
+  }
+
+  // One row per layer, top layer first: eye, name, strength.
+  static std::uint32_t renaming = 0, renamingObject = 0;
+  static std::string renameText;
+  static bool focusRename = false;
+  std::uint32_t contextLayer = 0;
+  for (int k = static_cast<int>(stack.list.size()) - 1; k >= 0; --k) {
+    const SculptLayer& layer = stack.list[static_cast<std::size_t>(k)];
+    const std::uint32_t id = layer.id;
+    ImGui::PushID(static_cast<int>(id));
+    bool visible = layer.visible;
+    if (ImGui::Checkbox("##eye", &visible)) {
+      if (ImGui::GetIO().KeyAlt)
+        soloLayer(id);
+      else
+        setLayerVisible(id, visible);
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show or hide (L). Alt+click: show only this layer.");
+    ImGui::SameLine();
+    const float nameW = ImGui::GetContentRegionAvail().x * 0.48f;
+    if (renaming == id && renamingObject == obj.id) {
+      ImGui::SetNextItemWidth(nameW);
+      if (focusRename) {
+        ImGui::SetKeyboardFocusHere();
+        focusRename = false;
+      }
+      const bool enter = ImGui::InputText("##rename", &renameText,
+                                          ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
+      if (enter) renameLayer(id, renameText);
+      if (enter || ImGui::IsItemDeactivated()) renaming = 0;  // Esc or clicking away cancels.
+    } else {
+      if (!layer.visible) ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+      const std::string label = layer.name + "##name";
+      if (ImGui::Selectable(label.c_str(), id == stack.active, ImGuiSelectableFlags_AllowDoubleClick,
+                            ImVec2(nameW, 0))) {
+        selectLayer(id);
+        if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+          renaming = id;
+          renamingObject = obj.id;
+          renameText = layer.name;
+          focusRename = true;
+        }
+      }
+      if (!layer.visible) ImGui::PopStyleColor();
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Click: sculpt on this layer. Double-click: rename. Right-click: more.");
+      if (ImGui::BeginPopupContextItem("##layerMenu")) {
+        contextLayer = id;
+        ImGui::EndPopup();
+      }
+    }
+    ImGui::SameLine();
+    // Strength in percent: dragging moves the shape live and becomes one undo step; Ctrl+click
+    // types an exact value (up to 1000 %).
+    float percent = layer.strength * 100.0f;
+    ImGui::SetNextItemWidth(-1);
+    const bool changed = ImGui::SliderFloat("##strength", &percent, -100.0f, 100.0f, "%.0f %%");
+    if (ImGui::IsItemActivated()) beginLayerStrengthDrag(id);
+    if (changed) updateLayerStrengthDrag(percent / 100.0f);
+    if (ImGui::IsItemDeactivated()) endLayerStrengthDrag();
+    ImGui::PopID();
+  }
+  // Right-click menu of a layer row; it acts on that layer, so it becomes the target first.
+  if (contextLayer != 0) ImGui::OpenPopup("layerActions");
+  static std::uint32_t menuLayer = 0;
+  if (contextLayer != 0) menuLayer = contextLayer;
+  if (ImGui::BeginPopup("layerActions")) {
+    const int index = stack.indexOf(menuLayer);
+    const SculptLayer* layer = index >= 0 ? &stack.list[static_cast<std::size_t>(index)] : nullptr;
+    if (!layer) {
+      ImGui::CloseCurrentPopup();
+    } else {
+      ImGui::TextDisabled("%s", layer->name.c_str());
+      ImGui::Separator();
+      auto onLayer = [&](void (App::*op)()) {
+        selectLayer(menuLayer);
+        (this->*op)();
+      };
+      if (ImGui::MenuItem("Duplicate", nullptr, false, full.empty())) onLayer(&App::duplicateLayer);
+      if (ImGui::MenuItem("Merge Down", nullptr, false, index > 0)) onLayer(&App::mergeLayerDown);
+      if (ImGui::MenuItem("Apply")) onLayer(&App::applyLayer);
+      if (ImGui::MenuItem("Invert")) onLayer(&App::invertLayer);
+      if (ImGui::MenuItem("Mask from Layer")) onLayer(&App::maskFromLayer);
+      if (ImGui::MenuItem("Rename")) {
+        renaming = menuLayer;
+        renamingObject = obj.id;
+        renameText = layer->name;
+        focusRename = true;
+      }
+      ImGui::Separator();
+      if (ImGui::MenuItem("Delete")) onLayer(&App::deleteLayer);
+    }
+    ImGui::EndPopup();
+  }
+  // The base: strokes on it change the mesh under every layer.
+  ImGui::Dummy(ImVec2(ImGui::GetFrameHeight(), 0));
+  ImGui::SameLine();
+  if (ImGui::Selectable("Base##layers", stack.active == 0)) selectLayer(0);
+  if (ImGui::IsItemHovered()) ImGui::SetTooltip("Sculpt the mesh under all layers.");
+  ImGui::EndDisabled();
+
+  ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+  ImGui::Text("Sculpting on: %s", active ? active->name.c_str() : "Base");
+  if (obj.multires) ImGui::TextWrapped("Each subdivision level has its own layers.");
+  ImGui::Text("Layers use %.1f MB", static_cast<double>(objectLayerBytes(obj)) / (1024.0 * 1024.0));
+  ImGui::PopStyleColor();
+  (void)scale;
 }
 
 }  // namespace plegl

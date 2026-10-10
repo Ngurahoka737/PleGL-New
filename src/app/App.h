@@ -21,6 +21,7 @@
 #include "sculpt/StrokeSampler.h"
 #include "io/Project.h"
 #include "multires/MultiresOps.h"
+#include "sculpt/LayerOps.h"
 #include "sculpt/Undo.h"
 
 namespace plegl {
@@ -50,13 +51,13 @@ struct PrimitiveSettings {
 
 // Projects store the brush as its index here, so new brushes go at the end. Names are also
 // settings keys, so they have no spaces; labels are what the panel shows.
-enum class BrushKind { Draw, Clay, Smooth, Grab, Inflate, Flatten, Crease, Mask, FaceSet };
-inline constexpr int kBrushCount = 9;
-inline constexpr const char* kBrushNames[kBrushCount] = {"Draw",    "Clay",    "Smooth", "Grab",   "Inflate",
-                                                         "Flatten", "Crease", "Mask",   "FaceSet"};
-inline constexpr const char* kBrushLabels[kBrushCount] = {"Draw",    "Clay",    "Smooth", "Grab",    "Inflate",
-                                                          "Flatten", "Crease", "Mask",   "Face Set"};
-inline constexpr const char* kBrushKeys[kBrushCount] = {"D", "C", "S", "G", "I", "T", "Shift+C", "M", "P"};
+enum class BrushKind { Draw, Clay, Smooth, Grab, Inflate, Flatten, Crease, Mask, FaceSet, EraseLayer };
+inline constexpr int kBrushCount = 10;
+inline constexpr const char* kBrushNames[kBrushCount] = {"Draw",    "Clay",   "Smooth", "Grab",    "Inflate",
+                                                         "Flatten", "Crease", "Mask",   "FaceSet", "EraseLayer"};
+inline constexpr const char* kBrushLabels[kBrushCount] = {"Draw",    "Clay",   "Smooth", "Grab",     "Inflate",
+                                                          "Flatten", "Crease", "Mask",   "Face Set", "Erase Layer"};
+inline constexpr const char* kBrushKeys[kBrushCount] = {"D", "C", "S", "G", "I", "T", "Shift+C", "M", "P", "E"};
 enum class PressureMap { Strength, Radius, Both, None };
 // How the dynamic topology detail size is given: in screen pixels at the cursor (so zooming in
 // adds detail), or as a fixed edge length in object units.
@@ -65,7 +66,7 @@ enum class DetailMode { Relative, Constant };
 struct SculptSettings {
   BrushKind brush = BrushKind::Draw;
   float radiusPx = 60.0f;      // Screen-space radius, like most sculpting tools.
-  float strength[kBrushCount] = {0.5f, 0.5f, 0.5f, 1.0f, 0.5f, 0.5f, 0.5f, 1.0f, 1.0f};  // Per brush.
+  float strength[kBrushCount] = {0.5f, 0.5f, 0.5f, 1.0f, 0.5f, 0.5f, 0.5f, 1.0f, 1.0f, 0.5f};  // Per brush.
   Falloff falloff = Falloff::Smooth;
   bool invert = false;         // Brushes subtract instead of add (Ctrl flips it per stroke).
   PressureMap pressure = PressureMap::Strength;
@@ -76,6 +77,8 @@ struct SculptSettings {
   // vertices where sets meet stay put.
   bool faceSetAutoMask = false;
   bool lockFaceSetBorders = false;
+  // Smooth (and Shift+drag) on a sculpt layer smooths only that layer's own detail.
+  bool smoothLayerOnly = false;
   // Dynamic topology (Ctrl+D): brushes add and remove triangles under the cursor so detail can go
   // anywhere. Not used by Grab and Mask.
   bool dyntopo = false;
@@ -188,6 +191,33 @@ class App {
   // Masks the face set under the cursor (adds to the mask).
   void maskFaceSetUnderCursor();
   bool strokeActive() const { return sculptor_.active(); }
+  // Sculpt layers of the selected object (on an object with levels, of the active level). Each is
+  // undoable; refusals go to the status line.
+  void addLayer();
+  void duplicateLayer();
+  void deleteLayer();
+  void renameLayer(std::uint32_t id, const std::string& name);
+  void setLayerVisible(std::uint32_t id, bool visible);
+  void toggleActiveLayerVisible();  // L
+  void soloLayer(std::uint32_t id);
+  void setAllLayersVisible(bool visible);
+  void invertLayer();
+  void mergeLayerDown();
+  void applyLayer();
+  void applyAllLayers();
+  void maskFromLayer();
+  void selectLayer(std::uint32_t id);  // 0: the base.
+  // Typed strengths (Ctrl+click on the slider); drags go through the three calls below.
+  void setLayerStrength(std::uint32_t id, float strength);
+  // A strength slider drag: positions follow every frame, the whole drag is one undo step.
+  void beginLayerStrengthDrag(std::uint32_t id);
+  void updateLayerStrengthDrag(float strength);
+  void endLayerStrengthDrag();
+  bool layerStrengthDragActive() const { return strengthDrag_.active(); }
+  // Why a stroke on the selected object would be refused right now (empty when it would run).
+  std::string layerStrokeHint() const;
+  // Whether layer edits on the selected object can run now (no stroke, no job on it).
+  bool canEditLayers() const { return canEditMask(); }
   void importFile(const std::filesystem::path& path);
   void quit() { running_ = false; }
   const RenderStats& renderStats() const { return renderer_.stats(); }
@@ -206,6 +236,8 @@ class App {
   std::optional<ScenePick> pickUnderMouse() const;
   void updateViewportRect();
   void drawUi();
+  void drawLayersMenu();
+  void drawLayerPanel(SceneObject& obj);
   void drawGizmo();
   void processAsyncResults();
   void beginStroke(float x, float y, std::uint64_t timestampNs);
@@ -231,9 +263,18 @@ class App {
   SceneObject* editableObject(std::uint32_t id, const char* what);
   void pushEdit(std::optional<SculptUndo> entry, const char* name, double ms);
   void pushEdit(std::optional<MultiresUndo> entry, const char* name, double ms);
+  // A layer operation's result: the entry, or the refusal in `error` (empty: nothing changed).
+  void pushEdit(std::optional<LayerUndo> entry, const char* name, const std::string& error, double ms);
+  // The selected object, if a layer edit may change it now (see editableObject). Ends a running
+  // strength drag first.
+  SceneObject* layerObject();
+  // The active layer of the selected object, or nullptr with a status message.
+  const SculptLayer* activeLayer(SceneObject*& obj);
+  // Ends a running strength drag and records it (before any other edit, undo, save...).
+  void finishLayerStrengthDrag();
   // "Wait for the remesh to finish before <action>." when `id` is the busy object (0: any).
   bool waitForJob(std::uint32_t id, const std::string& action);
-  // Gives back the sync scratch, which grows with the largest levels ever synced.
+  // Gives back the sync and layer scratch, which grow with the largest meshes ever edited.
   void releaseSyncScratch();
 
   SDL_Window* window_ = nullptr;
@@ -282,6 +323,9 @@ class App {
   Sculptor sculptor_;
   // Scratch for spreading edits between subdivision levels, shared with the undo stack.
   std::shared_ptr<SyncWorkspace> syncWorkspace_;
+  // Scratch for layer operations, also shared with the undo stack.
+  std::shared_ptr<LayerWorkspace> layerWorkspace_;
+  StrengthDrag strengthDrag_;
   const Brush* brushFor(BrushKind kind) const;  // nullptr for Grab, which has its own stroke path.
   DrawBrush drawBrush_;
   ClayBrush clayBrush_;
@@ -292,6 +336,7 @@ class App {
   MaskBrush maskBrush_;
   MaskSmoothBrush maskSmoothBrush_;  // Shift with the Mask brush smooths the mask.
   FaceSetBrush faceSetBrush_;
+  EraseLayerBrush eraseLayerBrush_;
   StrokeSampler sampler_;
   std::vector<StrokeSample> samples_;
   // Brush of the running stroke. Shift turns it into Smooth, except for Mask, which stays Mask and

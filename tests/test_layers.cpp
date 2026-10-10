@@ -362,7 +362,7 @@ TEST_CASE("layers: refused strokes say why and do not start") {
   o.layerTarget = l.id;
   o.dyntopo = true;
   CHECK(layerStrokeRefusal(obj, &draw, o) ==
-        "Dynamic topology is off while this object has sculpt layers. Use Layers > Apply All Layers to sculpt with it.");
+        "Dynamic topology does not work on objects with sculpt layers. Turn it off (Ctrl+D), or use Layers > Apply All Layers.");
   CHECK(layerStrokeRefusal(obj, nullptr, o).empty());  // Grab never runs dynamic topology.
   CHECK(layerStrokeRefusal(obj, &mask, o).empty());
 }

@@ -190,6 +190,7 @@ std::string App::settingsText() const {
   w.put("mask.filter_steps", sculpt.maskFilterSteps);
   w.put("face_sets.automask", sculpt.faceSetAutoMask);
   w.put("face_sets.lock_borders", sculpt.lockFaceSetBorders);
+  w.put("layers.smooth_layer_only", sculpt.smoothLayerOnly);
   w.put("dyntopo.enabled", sculpt.dyntopo);
   w.put("dyntopo.refine", static_cast<int>(sculpt.dyntopoRefine));
   w.put("dyntopo.detail_mode", static_cast<int>(sculpt.detailMode));
@@ -244,6 +245,7 @@ void App::applySettings(const std::string& text) {
   r.get("mask.filter_steps", sculpt.maskFilterSteps);
   r.get("face_sets.automask", sculpt.faceSetAutoMask);
   r.get("face_sets.lock_borders", sculpt.lockFaceSetBorders);
+  r.get("layers.smooth_layer_only", sculpt.smoothLayerOnly);
   sculpt.maskFilterSteps = std::clamp(sculpt.maskFilterSteps, 1, 10);
   sculpt.radiusPx = std::clamp(sculpt.radiusPx, 2.0f, 2000.0f);
   sculpt.spacing = std::clamp(sculpt.spacing, 0.01f, 1.0f);
@@ -311,6 +313,7 @@ void App::saveProjectTo(const std::filesystem::path& requested, std::function<vo
     return;
   }
   if (sculptor_.active()) endStroke();
+  finishLayerStrengthDrag();
   std::filesystem::path path = requested;
   if (path.extension() != ".psculpt") path += ".psculpt";
   // Remember the path before serializing, so the file's own settings point at itself.
@@ -391,6 +394,7 @@ void App::loadProjectAsync(const std::filesystem::path& path, bool recovered) {
 
 void App::applyProject(Project project, const std::filesystem::path& path, bool recovered) {
   if (sculptor_.active()) endStroke();
+  finishLayerStrengthDrag();
   scene.clear();
   undoStack.clear();
   releaseSyncScratch();
@@ -500,7 +504,8 @@ void App::autosaveTick() {
   const std::uint64_t now = SDL_GetTicksNS();
   if (dataDir_.empty() || projectSettings.autosaveMinutes <= 0.0f || autosaveRunning_ || offerRecovery_) return;
   if (now - lastAutosaveNs_ < static_cast<std::uint64_t>(projectSettings.autosaveMinutes * 60.0e9)) return;
-  if (sculptor_.active()) return;  // Never in the middle of a stroke; retried next frame.
+  // Never in the middle of a stroke or a strength drag; retried next frame.
+  if (sculptor_.active() || strengthDrag_.active()) return;
   lastAutosaveNs_ = now;
   const std::uint64_t fingerprint = sceneFingerprint();
   if (fingerprint == savedFingerprint_ || fingerprint == autosavedFingerprint_) return;

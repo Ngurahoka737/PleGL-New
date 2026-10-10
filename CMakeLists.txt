@@ -76,6 +76,7 @@ if(PLEGL_BUILD_APP)
     src/app/main.cpp
     src/app/App.cpp
     src/app/AppProject.cpp
+    src/app/AppLayers.cpp
     src/app/Camera.cpp
     src/app/Renderer.cpp
     src/app/Ui.cpp

@@ -37,8 +37,8 @@ std::string layerTargetRefusal(const SceneObject& object, const Brush* brush, st
 std::string layerStrokeRefusal(const SceneObject& object, const Brush* brush, const StrokeOptions& options) {
   // Grab never runs dynamic topology, and subdivision levels never do either.
   if (brush && movesVertices(brush) && options.dyntopo && !object.multires && !object.mesh.layers.empty())
-    return "Dynamic topology is off while this object has sculpt layers. Use Layers > Apply All Layers to sculpt "
-           "with it.";
+    return "Dynamic topology does not work on objects with sculpt layers. Turn it off (Ctrl+D), or use Layers > "
+           "Apply All Layers.";
   return layerTargetRefusal(object, brush ? &strokeBrush(*brush, object, options) : nullptr, options.layerTarget);
 }
 
