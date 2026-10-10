@@ -15,7 +15,8 @@ namespace plegl {
 
 // Attribute data owned by one BVH leaf at one moment. Each channel is either empty (not recorded,
 // so applying the state leaves it alone) or holds one value per vertex of the leaf (per face for
-// face sets). Sculpt strokes record positions and normals; mask strokes and mask operations record
+// face sets). Sculpt strokes record positions and normals, plus the array they commit into
+// (SculptUndo::layerTarget) on meshes with sculpt layers; mask strokes and mask operations record
 // the mask only; face set strokes and operations (hide and reveal too) the face sets only.
 struct LeafState {
   Index leaf = kInvalid;
@@ -23,6 +24,7 @@ struct LeafState {
   std::vector<Vec3> normals;
   std::vector<float> mask;
   std::vector<std::int32_t> faceSets;
+  std::vector<Vec3> layer;
 };
 
 // Everything one BVH leaf owns at one moment: its ranges and a raw slice of every mesh array over
@@ -102,6 +104,8 @@ struct ConsolidateResult {
   // An unclaimed leaf had changed, so every leaf was rebuilt. The mesh and BVH are valid, but the
   // claims do not describe the stroke and must not be used for undo.
   bool missedClaim = false;
+  // The mesh has sculpt layers, which the new layout would have to carry: nothing was done.
+  bool refused = false;
   // Mesh sizes when the stroke began.
   Index beforeVertexCount = 0, beforeFaceCount = 0, beforeHalfEdgeCount = 0;
   Index regionFaces = 0;  // Faces in the rebuilt leaves.
@@ -138,7 +142,8 @@ LayoutSide captureSide(const Mesh& mesh, const Bvh& bvh, const LayoutDelta& delt
 // Switches the mesh from the other side of `delta` to `to`: untouched leaves are moved into place,
 // their references into the region translated through the delta's pairs, and `to`'s region slices,
 // BVH and position-only states are written verbatim. `toAfter` says which way the pairs are read.
-// Returns false, changing nothing, when the mesh does not match the layout `to` expects.
+// Returns false, changing nothing, when the mesh does not match the layout `to` expects or has
+// sculpt layers.
 bool relayout(Mesh& mesh, Bvh& bvh, const LayoutSide& to, const LayoutDelta& delta, bool toAfter,
               LayoutWorkspace& ws);
 

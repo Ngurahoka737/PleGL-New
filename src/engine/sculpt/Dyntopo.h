@@ -73,6 +73,9 @@ class DyntopoSession {
   const ClaimRecorder& recorder() const { return rec_; }
   // True once anything was claimed or appended.
   bool changedTopology() const;
+  // Set when the mesh has sculpt layers: dynamic topology would have to rebuild every layer
+  // array, so the session makes no edits at all and changedTopology() stays false.
+  bool refused() const { return refused_; }
   // Set when the session found the mesh in a state it does not trust; topology then stops for
   // the rest of the stroke while the brush keeps working.
   bool faulted() const { return faulted_; }
@@ -127,6 +130,7 @@ class DyntopoSession {
   Index lockedCount_ = 0;
   bool faulted_ = false;
   bool outOfRoom_ = false;
+  bool refused_ = false;
   int totalSplits_ = 0, totalCollapses_ = 0;
 
   // Per pass.

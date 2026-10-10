@@ -29,6 +29,7 @@ endif()
 add_library(plegl_engine STATIC
   src/engine/core/Parallel.cpp
   src/engine/mesh/Mesh.cpp
+  src/engine/mesh/LayerStack.cpp
   src/engine/mesh/MeshEdit.cpp
   src/engine/mesh/Primitives.cpp
   src/engine/io/Obj.cpp
@@ -44,6 +45,7 @@ add_library(plegl_engine STATIC
   src/engine/multires/MultiresIo.cpp
   src/engine/sculpt/Brush.cpp
   src/engine/sculpt/Dyntopo.cpp
+  src/engine/sculpt/LayerOps.cpp
   src/engine/sculpt/MaskOps.cpp
   src/engine/sculpt/FaceSetOps.cpp
   src/engine/sculpt/Sculptor.cpp
@@ -57,6 +59,11 @@ add_library(plegl_engine STATIC
 target_include_directories(plegl_engine PUBLIC src/engine)
 target_link_libraries(plegl_engine PUBLIC glm::glm PRIVATE plegl_warnings)
 target_compile_definitions(plegl_engine PUBLIC GLM_ENABLE_EXPERIMENTAL GLM_FORCE_XYZW_ONLY)
+# Bit-exact results (sculpt layer composites, multires kernels, normals) must not depend on whether
+# the compiler fuses a*b+c into one rounding. MSVC's default /fp:precise does not contract.
+if(NOT MSVC)
+  target_compile_options(plegl_engine PUBLIC -ffp-contract=off)
+endif()
 find_package(Threads REQUIRED)
 target_link_libraries(plegl_engine PUBLIC Threads::Threads)
 
@@ -99,6 +106,7 @@ if(PLEGL_BUILD_TESTS)
     tests/test_scene.cpp
     tests/test_sculpt.cpp
     tests/test_remesh.cpp
+    tests/test_layers.cpp
   )
   target_link_libraries(plegl_tests PRIVATE plegl_engine doctest::doctest plegl_warnings)
   add_test(NAME plegl_tests COMMAND plegl_tests)

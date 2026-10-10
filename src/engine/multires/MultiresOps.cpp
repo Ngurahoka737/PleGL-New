@@ -184,7 +184,7 @@ std::optional<SubdivideJob> prepareSubdivide(const SceneObject& o, std::string* 
   job.plain = !o.multires;
   job.serial = o.multires ? o.multires->serial : 0;
   job.maxLeafFaces = o.bvh.maxLeafFaces();
-  job.mesh = o.mesh;
+  job.mesh = copyWithoutLayers(o.mesh);  // New levels start without sculpt layers.
   if (!job.plain) {
     const MultiresLevel& top = o.multires->levels[static_cast<std::size_t>(o.multires->active)];
     job.canon = top.canon;

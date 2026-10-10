@@ -182,6 +182,16 @@ std::vector<Index> Mesh::reorder(std::span<const Index> faceOrder, ReorderMap* m
     if (!newMask.empty()) newMask[v] = mask[o];
     newVertHe[v] = vertHe[o] == kInvalid ? kInvalid : heMap[vertHe[o]];
   }
+  auto permute = [&](std::vector<Vec3>& a) {
+    if (a.size() != static_cast<std::size_t>(nv)) return;
+    std::vector<Vec3> out(a.size());
+    for (Index v = 0; v < nv; ++v) out[v] = a[vertOld[v]];
+    a = std::move(out);
+  };
+  if (!layers.empty()) {
+    permute(layers.base);
+    for (SculptLayer& l : layers.list) permute(l.offset);
+  }
 
   positions = std::move(newPos);
   normals = std::move(newNrm);
@@ -201,6 +211,21 @@ std::vector<Index> Mesh::reorder(std::span<const Index> faceOrder, ReorderMap* m
 }
 
 void Mesh::clear() { *this = Mesh{}; }
+
+Mesh copyWithoutLayers(const Mesh& m) {
+  Mesh c;
+  c.positions = m.positions;
+  c.normals = m.normals;
+  c.mask = m.mask;
+  c.faceSets = m.faceSets;
+  c.vertHe = m.vertHe;
+  c.faceHe = m.faceHe;
+  c.heNext = m.heNext;
+  c.heTwin = m.heTwin;
+  c.heVert = m.heVert;
+  c.heFace = m.heFace;
+  return c;
+}
 
 void Mesh::reserveHeadroom(Index vertices, Index faces, Index halfEdges) {
   const auto nv = static_cast<std::size_t>(vertices), nf = static_cast<std::size_t>(faces),
@@ -480,6 +505,12 @@ ValidationResult validateImpl(const Mesh& m, bool live) {
   for (Index v = 0; v < static_cast<Index>(m.mask.size()); ++v) {
     if (!(m.mask[v] >= 0.0f && m.mask[v] <= 1.0f)) return fail("mask out of range at vertex " + std::to_string(v));
   }
+  if (!m.layers.empty() || !m.layers.base.empty()) {
+    if (m.layers.base.size() != static_cast<std::size_t>(nv)) return fail("layer base size mismatch");
+    for (const SculptLayer& l : m.layers.list) {
+      if (l.offset.size() != static_cast<std::size_t>(nv)) return fail("layer offset size mismatch");
+    }
+  }
   if (!m.faceSets.empty() && static_cast<Index>(m.faceSets.size()) != nf) return fail("face set size mismatch");
   for (Index f = 0; f < static_cast<Index>(m.faceSets.size()); ++f) {
     if (!validFaceSetValue(m.faceSets[f]) && (!live || m.faceHe[f] != kInvalid))
@@ -551,5 +582,56 @@ ValidationResult validateImpl(const Mesh& m, bool live) {
 
 ValidationResult validate(const Mesh& m) { return validateImpl(m, false); }
 ValidationResult validateLive(const Mesh& m) { return validateImpl(m, true); }
+
+ValidationResult validateLayers(const Mesh& m, bool checkComposite) {
+  auto fail = [](std::string msg) { return ValidationResult{false, "layers: " + std::move(msg)}; };
+  const LayerStack& s = m.layers;
+  if (s.empty()) {
+    if (!s.base.empty() || s.epoch != 0 || s.nextId != 1 || s.active != 0) return fail("empty stack carries state");
+    return {};
+  }
+  const std::size_t nv = m.positions.size();
+  if (s.base.size() != nv) return fail("base size mismatch");
+  if (s.epoch == 0) return fail("no epoch");
+  if (s.list.size() > static_cast<std::size_t>(kMaxFileLayers)) return fail("too many layers");
+  auto finite = [](const Vec3& v) { return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z); };
+  for (std::size_t i = 0; i < nv; ++i) {
+    if (!finite(s.base[i])) return fail("non-finite base at vertex " + std::to_string(i));
+  }
+  for (std::size_t k = 0; k < s.list.size(); ++k) {
+    const SculptLayer& l = s.list[k];
+    if (l.id == 0 || l.id >= s.nextId) return fail("layer id out of range");
+    for (std::size_t j = 0; j < k; ++j) {
+      if (s.list[j].id == l.id) return fail("duplicate layer id");
+    }
+    if (!std::isfinite(l.strength) || std::abs(l.strength) > kMaxLayerStrength) return fail("strength out of range");
+    if (l.name.empty() || l.name.size() > kMaxLayerNameBytes) return fail("bad name length");
+    if (l.offset.size() != nv) return fail("offset size mismatch");
+    for (std::size_t i = 0; i < nv; ++i) {
+      if (!finite(l.offset[i])) return fail("non-finite offset at vertex " + std::to_string(i));
+    }
+  }
+  if (s.active != 0 && !s.find(s.active)) return fail("active layer missing");
+  if (!checkComposite) return {};
+  for (std::size_t i = 0; i < nv; ++i) {
+    if (!sameBits(m.positions[i], composeVertex(s, static_cast<Index>(i))))
+      return fail("position differs from the composite at vertex " + std::to_string(i));
+  }
+  if (m.normals.size() == nv) {
+    Mesh copy;
+    copy.positions = m.positions;
+    copy.vertHe = m.vertHe;
+    copy.faceHe = m.faceHe;
+    copy.heNext = m.heNext;
+    copy.heTwin = m.heTwin;
+    copy.heVert = m.heVert;
+    copy.heFace = m.heFace;
+    copy.computeNormals();
+    for (std::size_t i = 0; i < nv; ++i) {
+      if (!sameBits(m.normals[i], copy.normals[i])) return fail("stale normal at vertex " + std::to_string(i));
+    }
+  }
+  return {};
+}
 
 }  // namespace plegl

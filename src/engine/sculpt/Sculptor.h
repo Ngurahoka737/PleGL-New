@@ -29,6 +29,11 @@ struct StrokeOptions {
   bool lockFaceSetBoundaries = false;
   // Face set brushes: continue the set under the first dab instead of starting a new one.
   bool extendFaceSet = false;
+  // Sculpt layers: the layer (by id) strokes commit into, or 0 for the base. Ignored on meshes
+  // without layers.
+  std::uint32_t layerTarget = 0;
+  // Smooth on a layer smooths only that layer's offsets (see LayerSmoothBrush).
+  bool smoothLayerOnly = false;
 };
 
 struct DabTiming {
@@ -66,8 +71,17 @@ struct StrokeTopologyStats {
 // With dynamic topology each dab first refines or coarsens the mesh under the brush (see
 // DyntopoSession), then runs the brush as usual. Leaves the topology pass changed are recorded
 // whole; other leaves keep the usual position snapshots. endStroke() compacts the mesh again.
+//
+// On a mesh with sculpt layers, brushes still move the composite positions dab by dab, exactly as
+// without layers. endStroke() then adds each moved vertex's change, divided by the target's
+// strength, to the target (StrokeOptions::layerTarget: a layer's offsets or the base) and
+// recomposes, so positions stay equal to the composite. Layer brushes (Brush::writesLayer()) edit
+// the target's offsets directly instead. Undo records the target's values with the positions.
+// Dynamic topology is off on such meshes.
 class Sculptor {
  public:
+  // Starts a stroke. A stroke the layer rules refuse (see layerTargetRefusal) does not start, and
+  // active() stays false; callers show layerStrokeRefusal() first.
   void beginStroke(SceneObject& object, const Brush& brush, const StrokeOptions& options, std::string label);
   bool active() const { return object_ != nullptr; }
   SceneObject* object() const { return object_; }
@@ -79,7 +93,8 @@ class Sculptor {
 
   // Grab stroke: captures the vertices inside the sphere (and its X mirror when symmetry is on)
   // and then moves them rigidly with the cursor, weighted by falloff, until the stroke ends.
-  // Returns false (and starts nothing) if no vertex is inside the sphere.
+  // Returns false (and starts nothing) if no vertex is inside the sphere or the layer rules refuse
+  // the stroke.
   bool beginGrab(SceneObject& object, const StrokeOptions& options, const Vec3& center, float radius,
                  std::string label);
   // Moves the captured vertices to their start position plus `offset` (local space).
@@ -104,6 +119,8 @@ class Sculptor {
 
  private:
   void start(SceneObject& object, const StrokeOptions& options, std::string label);
+  void beginLayers();
+  void commitLayerStroke();
   bool applyOne(const Dab& dab, const DabTopology& topology, int side);
   void resolveFaceSets(const Vec3& center, float radius);
   FaceSetFilter filter(int side) const;
@@ -124,6 +141,11 @@ class Sculptor {
   std::int32_t onlySet_[2] = {0, 0};
   std::int32_t paintSet_[2] = {0, 0};
   StrokeOptions options_;
+  // Sculpt layers: the target array of a position stroke on a layered mesh (else nullptr), and
+  // the same as layer brushes see it.
+  std::vector<Vec3>* layerArray_ = nullptr;
+  LayerTarget layerTarget_;
+  std::vector<std::vector<Index>> layerChanged_;  // Per snapshot: vertices the commit recomposed.
   SculptUndo undo_;
   std::unordered_map<Index, std::size_t> snapshotIndex_;  // leaf -> index in undo_.before
   std::vector<std::uint32_t> vertexStamp_;

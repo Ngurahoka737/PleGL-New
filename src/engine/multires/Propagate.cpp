@@ -9,8 +9,6 @@ namespace plegl {
 
 namespace {
 
-bool sameBits(const Vec3& a, const Vec3& b) { return std::memcmp(&a, &b, sizeof(Vec3)) == 0; }
-
 // One level as a sync sees it: the source level reads old values from the reference and new ones
 // from the live mesh; every other level reads old values from its parked mesh and new ones from
 // the workspace overlay where this sync already changed them.

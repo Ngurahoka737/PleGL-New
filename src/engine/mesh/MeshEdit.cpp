@@ -307,6 +307,20 @@ void MeshEditor::compact() {
     out.heVert[n] = vmap[m_.heVert[h]];
     out.heFace[n] = fmap[m_.heFace[h]];
   }
+  // Sculpt layers follow their vertices, like the positions. Dynamic topology refuses meshes with
+  // layers, so today this only keeps compact() correct for any later caller.
+  if (!m_.layers.empty()) {
+    LayerStack& to = out.layers;
+    to = std::move(m_.layers);
+    auto remapArray = [&](std::vector<Vec3>& a) {
+      std::vector<Vec3> b(static_cast<std::size_t>(cv));
+      for (Index v = 0; v < nv; ++v)
+        if (vmap[v] != kInvalid) b[vmap[v]] = a[v];
+      a = std::move(b);
+    };
+    remapArray(to.base);
+    for (SculptLayer& l : to.list) remapArray(l.offset);
+  }
   out.computeNormals();
   m_ = std::move(out);
   deadVertex_.assign(m_.positions.size(), 0);

@@ -19,6 +19,11 @@ struct SculptUndo {
   std::string label;
   std::uint32_t objectId = 0;
   std::uint64_t topologyVersion = 0;  // The entry only applies to this exact vertex order.
+  // Sculpt layers: the array the stroke committed into (a layer id, or 0 for the base) and the
+  // layer state key it was recorded under (0 without layers). Entries that hold positions or layer
+  // values apply only under the same key, because their positions are composites of that state.
+  std::uint32_t layerTarget = 0;
+  std::uint64_t layerKey = 0;
   std::vector<LeafState> before;
   std::vector<LeafState> after;
   // Leaves whose bounds the stroke changed although none of their own vertices did (their faces
@@ -66,6 +71,9 @@ struct DyntopoUndo {
 // and refits the moved leaves (plus entry.refit). The caller checks that the entry belongs to
 // this object and topology version.
 void applySculptStates(SceneObject& object, const SculptUndo& entry, const std::vector<LeafState>& states);
+// True if `states` of `entry` may be applied to `object`: same topology version and, when they hold
+// positions or layer values, the same layer state key and an existing target array.
+bool sculptUndoApplies(const SceneObject& object, const SculptUndo& entry, const std::vector<LeafState>& states);
 
 // What a sculpt stroke leaves for undo.
 using StrokeUndo = std::variant<SculptUndo, DyntopoUndo>;

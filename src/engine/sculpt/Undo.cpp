@@ -10,7 +10,7 @@ std::size_t SculptUndo::bytes() const {
   std::size_t n = 0;
   for (const auto* list : {&before, &after})
     for (const LeafState& s : *list)
-      n += (s.positions.size() + s.normals.size()) * sizeof(Vec3) + s.mask.size() * sizeof(float) +
+      n += (s.positions.size() + s.normals.size() + s.layer.size()) * sizeof(Vec3) + s.mask.size() * sizeof(float) +
            s.faceSets.size() * sizeof(std::int32_t);
   return n + refit.size() * sizeof(Index);
 }
@@ -21,7 +21,7 @@ std::size_t MeshState::bytes() const {
          m.faceSets.size() * sizeof(std::int32_t) +
          (m.heNext.size() + m.heTwin.size() + m.heVert.size() + m.heFace.size() + m.vertHe.size() +
           m.faceHe.size()) * sizeof(Index) +
-         bvh.memoryBytes() + (multires ? multires->bytes() : 0);
+         m.layers.bytes() + bvh.memoryBytes() + (multires ? multires->bytes() : 0);
 }
 
 std::size_t TopologyUndo::bytes() const {
@@ -111,8 +111,10 @@ void applySculptStates(SceneObject& object, const SculptUndo& entry, const std::
   const bool faceSetAll = faceSetLeaves > kMaskDirtyAllLeaves;
   if (maskLeaves > 0) m.ensureMask();  // The mask may have been dropped by a redone remesh.
   if (faceSetLeaves > 0) m.ensureFaceSets();
+  std::vector<Vec3>* target = m.layers.array(entry.layerTarget);
   for (const LeafState& s : states) {
     const BvhLeaf& leaf = obj->bvh.leaves()[s.leaf];
+    if (target) std::copy(s.layer.begin(), s.layer.end(), target->begin() + leaf.vertBegin);
     std::copy(s.positions.begin(), s.positions.end(), m.positions.begin() + leaf.vertBegin);
     std::copy(s.normals.begin(), s.normals.end(), m.normals.begin() + leaf.vertBegin);
     std::copy(s.mask.begin(), s.mask.end(), m.mask.begin() + leaf.vertBegin);
@@ -140,9 +142,22 @@ void applySculptStates(SceneObject& object, const SculptUndo& entry, const std::
   }
 }
 
+bool sculptUndoApplies(const SceneObject& object, const SculptUndo& entry, const std::vector<LeafState>& states) {
+  if (object.topologyVersion != entry.topologyVersion) return false;
+  bool positions = false, layer = false;
+  for (const LeafState& s : states) {
+    positions |= !s.positions.empty();
+    layer |= !s.layer.empty();
+  }
+  // Positions are composites of the layer state they were recorded under; mask and face set
+  // values do not depend on it.
+  if ((positions || layer) && entry.layerKey != layerStateKey(object.mesh.layers)) return false;
+  return !layer || object.mesh.layers.array(entry.layerTarget) != nullptr;
+}
+
 bool UndoStack::apply(Scene& scene, const SculptUndo& entry, const std::vector<LeafState>& states) {
   SceneObject* obj = scene.find(entry.objectId);
-  if (!obj || obj->topologyVersion != entry.topologyVersion) return false;
+  if (!obj || !sculptUndoApplies(*obj, entry, states)) return false;
   applySculptStates(*obj, entry, states);
   return true;
 }
@@ -162,7 +177,8 @@ bool UndoStack::apply(Scene& scene, const TopologyUndo& entry, const MeshState& 
 
 bool UndoStack::apply(Scene& scene, DyntopoUndo& entry, bool redo) {
   SceneObject* obj = scene.find(entry.objectId);
-  if (!obj || obj->multires) return false;
+  // Layouts never carry sculpt layers (dynamic topology refuses them), so the entry cannot apply.
+  if (!obj || obj->multires || !obj->mesh.layers.empty()) return false;
   if (!workspace_) workspace_ = std::make_shared<LayoutWorkspace>();
   if (!redo) {
     if (obj->topologyVersion != entry.afterVersion) return false;

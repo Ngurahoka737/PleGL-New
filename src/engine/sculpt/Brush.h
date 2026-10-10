@@ -66,6 +66,14 @@ struct FaceSetFilter {
   }
 };
 
+// The sculpt layer a layer brush (Brush::writesLayer() true) edits: its offsets, scaled by
+// `strength` in the composite.
+struct LayerTarget {
+  LayerStack* stack = nullptr;
+  std::vector<Vec3>* offset = nullptr;
+  float strength = 1.0f;
+};
+
 // What a brush may touch: the mesh positions (or, for mask brushes, mask values, and for face set
 // brushes, face sets) owned by `leaves`.
 struct BrushContext {
@@ -75,6 +83,7 @@ struct BrushContext {
   const Dab& dab;
   FaceSetFilter filter;
   std::int32_t paintFaceSet = kDefaultFaceSet;  // The set a face set brush paints.
+  LayerTarget* layer = nullptr;                 // Set for layer brushes only.
 };
 
 // A brush moves vertices; it never changes topology, normals or bounds. The sculptor recomputes
@@ -97,6 +106,10 @@ class Brush {
   virtual bool editsMask() const { return false; }
   // True if apply() writes Mesh::faceSets instead of positions.
   virtual bool editsFaceSets() const { return false; }
+  // True if apply() writes the offsets of BrushContext::layer and sets each changed position to
+  // its composite. Other brushes move positions only; on a mesh with sculpt layers the sculptor
+  // commits that movement into the stroke's target when the stroke ends.
+  virtual bool writesLayer() const { return false; }
   virtual void apply(BrushContext& ctx) const = 0;
 };
 
@@ -149,6 +162,25 @@ class CreaseBrush final : public Brush {
  public:
   const char* name() const override { return "Crease"; }
   bool needsArea() const override { return true; }
+  void apply(BrushContext& ctx) const override;
+};
+
+// Fades the target layer's offsets toward zero under the brush, so the surface returns to how it
+// looks without that layer. Inverting does nothing different.
+class EraseLayerBrush final : public Brush {
+ public:
+  const char* name() const override { return "Erase Layer"; }
+  bool writesLayer() const override { return true; }
+  void apply(BrushContext& ctx) const override;
+};
+
+// Smooth with "This layer only": smooths the target layer's offsets instead of the surface, so
+// the layer's detail softens while everything under it stays. The sculptor runs it in place of
+// SmoothBrush when StrokeOptions::smoothLayerOnly is set and the target is a layer.
+class LayerSmoothBrush final : public Brush {
+ public:
+  const char* name() const override { return "Smooth"; }
+  bool writesLayer() const override { return true; }
   void apply(BrushContext& ctx) const override;
 };
 

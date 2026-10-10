@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "core/Types.h"
+#include "mesh/LayerStack.h"
 
 namespace plegl {
 
@@ -56,6 +57,11 @@ class Mesh {
   // Face attribute: the face set value of every face (see kDefaultFaceSet), or empty when every
   // face is in the default set and visible. Topology builders leave it empty.
   std::vector<std::int32_t> faceSets;
+  // Sculpt layers (see mesh/LayerStack.h). While the stack is not empty, `positions` holds its
+  // composite and every vertex array of the stack has one value per vertex. Topology builders and
+  // copyWithoutLayers() leave it empty. A new vertex attribute must also be handled in reorder(),
+  // reserveHeadroom() and copyWithoutLayers().
+  LayerStack layers;
 
   // Topology.
   std::vector<Index> vertHe;  // One outgoing half-edge per vertex (kInvalid if isolated).
@@ -168,6 +174,10 @@ struct BuildReport {
 Mesh buildMesh(std::vector<Vec3> positions, std::span<const Index> faceIndices,
                std::span<const Index> faceSizes, BuildReport* report = nullptr);
 
+// A copy of every member except the sculpt layers: positions keep the composite. For copies handed
+// to workers that build new topology from what is on screen (remesh, subdivide, export).
+Mesh copyWithoutLayers(const Mesh& mesh);
+
 // Merges vertices closer than `epsilon` and rebuilds faces accordingly. Used by primitives that
 // are generated face-by-face and by importers of unwelded files.
 void weldVertices(std::vector<Vec3>& positions, std::vector<Index>& faceIndices, float epsilon);
@@ -183,6 +193,10 @@ ValidationResult validate(const Mesh& mesh);
 // faces with faceHe == kInvalid, half-edges with heFace == kInvalid and vertices without faces.
 // Live elements may only reference live elements.
 ValidationResult validateLive(const Mesh& mesh);
+// Checks the sculpt layers: array sizes, finite values, ids, strengths and names, and with
+// `checkComposite` that positions equal the composite bit for bit and that normals are what
+// computeNormals() gives for them. validate() runs the cheap part.
+ValidationResult validateLayers(const Mesh& mesh, bool checkComposite);
 
 // ---------------------------------------------------------------------------------------------
 

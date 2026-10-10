@@ -11,7 +11,8 @@ std::size_t vecBytes(const std::vector<T>& v) {
 }
 std::size_t meshBytes(const Mesh& m) {
   return vecBytes(m.positions) + vecBytes(m.normals) + vecBytes(m.mask) + vecBytes(m.faceSets) + vecBytes(m.vertHe) +
-         vecBytes(m.faceHe) + vecBytes(m.heNext) + vecBytes(m.heTwin) + vecBytes(m.heVert) + vecBytes(m.heFace);
+         vecBytes(m.faceHe) + vecBytes(m.heNext) + vecBytes(m.heTwin) + vecBytes(m.heVert) + vecBytes(m.heFace) +
+         m.layers.bytes();
 }
 }  // namespace
 

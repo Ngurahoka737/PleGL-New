@@ -545,6 +545,11 @@ void App::bumpUnderCursor() {
     statusMessage = "The bump test is not available on objects with subdivision levels.";
     return;
   }
+  if (!obj->mesh.layers.empty()) {
+    // The bump writes positions directly, which would leave them out of step with the layers.
+    statusMessage = "The bump test is not available on objects with sculpt layers.";
+    return;
+  }
   Timer t;
   Mesh& m = obj->mesh;
   const Vec3 center = hover_->localHit.position;
@@ -875,8 +880,9 @@ void App::requestRemesh() {
   job_ = Job::Remesh;
   jobObjectId_ = obj->id;
   statusMessage = "Remeshing " + obj->name + "...";
-  // The worker gets its own copy; the scene is only touched on the main thread.
-  auto input = std::make_shared<Mesh>(obj->mesh);
+  // The worker gets its own copy; the scene is only touched on the main thread. Remeshing bakes
+  // the sculpt layers: the worker sees only the composite, and undo brings the layers back.
+  auto input = std::make_shared<Mesh>(copyWithoutLayers(obj->mesh));
   const std::uint32_t id = obj->id;
   const std::uint64_t version = obj->topologyVersion;
   const QuadRemeshParams params{.targetEdge = remesh.voxelSize, .rounds = remesh.optimizeQuads ? 3 : 0};

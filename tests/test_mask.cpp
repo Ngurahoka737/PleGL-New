@@ -611,6 +611,6 @@ TEST_CASE("undo memory counts masks") {
   state.mesh.ensureMask();
   CHECK(state.bytes() == plain + state.mesh.mask.size() * sizeof(float));
   SculptUndo e;
-  e.before.push_back({0, {}, {}, std::vector<float>(10), {}});
+  e.before.push_back({0, {}, {}, std::vector<float>(10), {}, {}});
   CHECK(e.bytes() == 10 * sizeof(float));
 }
