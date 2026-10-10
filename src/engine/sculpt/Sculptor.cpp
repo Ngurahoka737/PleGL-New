@@ -1,8 +1,10 @@
 #include "sculpt/Sculptor.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <iterator>
+#include <span>
 
 #include "core/Parallel.h"
 #include "core/Timer.h"
@@ -507,18 +509,27 @@ void Sculptor::commitLayerStroke() {
   std::vector<Vec3>& target = *layerArray_;
   const float s = layerTarget_.strength;
   const bool base = undo_.layerTarget == 0;
-  // 1. Each vertex the stroke moved adds its change, divided by the target's strength, to the
-  // target; then it takes the composite. Usually that is the position the brush left, else it
-  // differs by rounding. On the base where no layer moved the vertex (the base equals the old
-  // position), the base takes the new position as is, so the brush's result stays exact. Snapshots
-  // cover disjoint vertex ranges, so they run in parallel.
-  layerChanged_.resize(undo_.before.size());
-  parallelFor(0, undo_.before.size(), 1, [&](std::size_t b, std::size_t e) {
+  if (++stamp_ == 0) {
+    std::fill(vertexStamp_.begin(), vertexStamp_.end(), 0);
+    stamp_ = 1;
+  }
+  const std::uint32_t stamp = stamp_;
+  const std::span<const BvhLeaf> leafList = bvh.leaves();
+  const std::size_t snapshots = undo_.before.size();
+  layerChanged_.resize(snapshots);
+  layerRing_.resize(snapshots);
+  layerLeaves_.resize(snapshots);
+  // Snapshots cover disjoint vertex ranges, so they run in parallel.
+  parallelFor(0, snapshots, 1, [&](std::size_t b, std::size_t e) {
     for (std::size_t k = b; k < e; ++k) {
+      // 1. Each vertex the stroke moved adds its change, divided by the target's strength, to the
+      // target; then it takes the composite. Usually that is the position the brush left, else it
+      // differs by rounding. On the base where no layer moved the vertex (the base equals the old
+      // position), the base takes the new position as is, so the brush's result stays exact.
       std::vector<Index>& changed = layerChanged_[k];
       changed.clear();
       const LeafState& before = undo_.before[k];
-      const Index begin = bvh.leaves()[before.leaf].vertBegin;
+      const Index begin = leafList[before.leaf].vertBegin;
       for (std::size_t i = 0; i < before.positions.size(); ++i) {
         const Index v = begin + static_cast<Index>(i);
         const Vec3 p0 = before.positions[i];
@@ -541,47 +552,53 @@ void Sculptor::commitLayerStroke() {
           changed.push_back(v);
         }
       }
+      // 2. Vertices sharing a face with a recomposed vertex get new normals, and the leaves of
+      // those faces new bounds. Each vertex is claimed once, by whichever snapshot stamps it
+      // first. Leaf lookups start from the last leaf found, which neighbours almost always share.
+      std::vector<Index>& ring = layerRing_[k];
+      std::vector<Index>& faceLeaves = layerLeaves_[k];
+      ring.clear();
+      faceLeaves.clear();
+      Index faceLeaf = kInvalid;
+      for (Index v : changed) {
+        m.forEachOutgoing(v, [&](Index h) {
+          const Index f = m.heFace[h];
+          if (f == kInvalid) return;
+          if (faceLeaf == kInvalid || f < leafList[faceLeaf].faceBegin || f >= leafList[faceLeaf].faceEnd) {
+            faceLeaf = bvh.leafOfFace(f);
+            if (faceLeaf != kInvalid) faceLeaves.push_back(faceLeaf);
+          }
+          m.forEachFaceVertex(f, [&](Index u) {
+            std::atomic_ref<std::uint32_t> mark(vertexStamp_[u]);
+            if (mark.load(std::memory_order_relaxed) != stamp &&
+                mark.exchange(stamp, std::memory_order_relaxed) != stamp)
+              ring.push_back(u);
+          });
+        });
+      }
     }
   });
 
-  // 2. Vertices sharing a face with a recomposed vertex get new normals. Their leaves are
-  // snapshotted before any normal is written: on a coarse mesh a face can reach past the normals
-  // the dabs recomputed, and such a leaf still holds its values from before the stroke.
-  if (++stamp_ == 0) {
-    std::fill(vertexStamp_.begin(), vertexStamp_.end(), 0);
-    stamp_ = 1;
-  }
+  // Their leaves are snapshotted before any normal is written: on a coarse mesh a face can reach
+  // past the normals the dabs recomputed, and such a leaf still holds its values from before the
+  // stroke.
   normalVerts_.clear();
   leaves_.clear();  // Leaves whose faces moved: their bounds change.
-  for (const std::vector<Index>& changed : layerChanged_) {
-    for (Index v : changed) {
-      m.forEachOutgoing(v, [&](Index h) {
-        const Index f = m.heFace[h];
-        if (f == kInvalid) return;
-        leaves_.push_back(bvh.leafOfFace(f));
-        m.forEachFaceVertex(f, [&](Index u) {
-          if (vertexStamp_[u] != stamp_) {
-            vertexStamp_[u] = stamp_;
-            normalVerts_.push_back(u);
-          }
-        });
-      });
-    }
+  for (std::size_t k = 0; k < snapshots; ++k) {
+    normalVerts_.insert(normalVerts_.end(), layerRing_[k].begin(), layerRing_[k].end());
+    leaves_.insert(leaves_.end(), layerLeaves_[k].begin(), layerLeaves_[k].end());
   }
   if (normalVerts_.empty()) return;
-  std::sort(normalVerts_.begin(), normalVerts_.end());
   dirtyLeaves_.clear();
-  Index lastOwner = kInvalid;
+  Index owner = kInvalid;
   for (Index v : normalVerts_) {
-    if (lastOwner != kInvalid) {
-      const BvhLeaf& l = bvh.leaves()[lastOwner];
-      if (v >= l.vertBegin && v < l.vertEnd) continue;
-    }
-    lastOwner = bvh.leafOfVertex(v);
-    if (lastOwner == kInvalid) continue;
-    snapshot(lastOwner);
-    dirtyLeaves_.push_back(lastOwner);
+    if (owner != kInvalid && v >= leafList[owner].vertBegin && v < leafList[owner].vertEnd) continue;
+    owner = bvh.leafOfVertex(v);
+    if (owner != kInvalid) dirtyLeaves_.push_back(owner);
   }
+  std::sort(dirtyLeaves_.begin(), dirtyLeaves_.end());
+  dirtyLeaves_.erase(std::unique(dirtyLeaves_.begin(), dirtyLeaves_.end()), dirtyLeaves_.end());
+  for (Index l : dirtyLeaves_) snapshot(l);
 
   // 3. Normals, bounds and uploads.
   recomputeNormals(normalVerts_);

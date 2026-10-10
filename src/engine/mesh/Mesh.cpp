@@ -81,9 +81,14 @@ Vec3 Mesh::vertexNormal(Index v) const {
 }
 
 void Mesh::computeNormals() {
+  std::vector<Vec3> faceN;
+  computeNormals(faceN);
+}
+
+void Mesh::computeNormals(std::vector<Vec3>& faceN) {
   normals.resize(positions.size());
   // Same sums in the same order as vertexNormal(), with each face normal computed once.
-  std::vector<Vec3> faceN(faceHe.size());
+  if (faceN.size() < faceHe.size()) faceN.resize(faceHe.size());
   parallelFor(0, faceHe.size(), 4096, [&](std::size_t b, std::size_t e) {
     for (std::size_t f = b; f < e; ++f) faceN[f] = faceAreaNormal(static_cast<Index>(f));
   });

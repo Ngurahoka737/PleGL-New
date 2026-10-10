@@ -82,8 +82,9 @@ inline constexpr std::uint32_t kProjectVersion = 1;
 // A sparse or dense array captured for LAYR.
 struct CapturedArray {
   std::vector<std::uint32_t> index;  // Ascending, unless `unsorted` (canonical order, not sorted yet).
-  std::vector<Vec3> values;
+  std::vector<Vec3> values;          // Parallel to `index`, or every vertex's value when `dense`.
   bool unsorted = false;
+  bool dense = false;
 };
 struct CapturedLayer {
   std::uint32_t id = 0;

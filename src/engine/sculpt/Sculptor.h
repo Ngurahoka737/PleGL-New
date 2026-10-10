@@ -146,6 +146,7 @@ class Sculptor {
   std::vector<Vec3>* layerArray_ = nullptr;
   LayerTarget layerTarget_;
   std::vector<std::vector<Index>> layerChanged_;  // Per snapshot: vertices the commit recomposed.
+  std::vector<std::vector<Index>> layerRing_, layerLeaves_;  // Per snapshot: their face rings and leaves.
   SculptUndo undo_;
   std::unordered_map<Index, std::size_t> snapshotIndex_;  // leaf -> index in undo_.before
   std::vector<std::uint32_t> vertexStamp_;

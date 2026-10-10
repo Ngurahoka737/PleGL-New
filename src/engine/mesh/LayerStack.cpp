@@ -1,6 +1,7 @@
 #include "mesh/LayerStack.h"
 
 #include <algorithm>
+#include <numeric>
 
 #include "core/Parallel.h"
 
@@ -72,6 +73,21 @@ void layerSupport(const std::vector<Vec3>& offset, std::vector<Index>& out) {
       }
     }
   });
+}
+
+std::size_t layerSupportSize(const std::vector<Vec3>& offset) {
+  constexpr std::size_t kChunk = 65536;
+  const std::size_t chunks = (offset.size() + kChunk - 1) / kChunk;
+  std::vector<std::size_t> count(chunks, 0);
+  parallelFor(0, chunks, 1, [&](std::size_t b, std::size_t e) {
+    for (std::size_t c = b; c < e; ++c) {
+      const std::size_t end = std::min(offset.size(), (c + 1) * kChunk);
+      std::size_t n = 0;
+      for (std::size_t i = c * kChunk; i < end; ++i) n += isZero(offset[i]) ? 0 : 1;
+      count[c] = n;
+    }
+  });
+  return std::accumulate(count.begin(), count.end(), std::size_t{0});
 }
 
 std::uint64_t layerStateKey(const LayerStack& s) {

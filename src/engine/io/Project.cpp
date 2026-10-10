@@ -386,32 +386,53 @@ const Mesh& levelMesh(const SceneObject& o, int k) {
   return k == o.multires->active ? o.mesh : o.multires->levels[static_cast<std::size_t>(k)].mesh;
 }
 
+// Whether an array block listing `count` of `vertexCount` vertices is no smaller than the dense one.
+bool denseIsSmaller(std::size_t count, std::uint32_t vertexCount) {
+  return 4 + 16 * std::uint64_t(count) >= 12 * std::uint64_t(vertexCount);
+}
+
 // The (index, value) pairs of `values` where keep(v) holds, ascending by v. With `canon` the
-// indices are canonical and left unsorted for finishProject().
+// indices are canonical and left unsorted for finishProject(). Without, when the list would not be
+// smaller than the array, the whole array (dense), with +0 where keep(v) fails if `zeroElsewhere`
+// (as a sparse block reads back). Two passes over fixed blocks, count, then fill, so both run in
+// parallel.
 template <class Keep>
-CapturedArray capture(const std::vector<Vec3>& values, const std::vector<Index>* canon, Keep&& keep) {
+CapturedArray capture(const std::vector<Vec3>& values, const std::vector<Index>* canon, bool zeroElsewhere,
+                      Keep&& keep) {
   constexpr std::size_t kBlock = std::size_t{1} << 16;
   const std::size_t n = values.size(), blocks = (n + kBlock - 1) / kBlock;
-  std::vector<CapturedArray> parts(blocks);
+  std::vector<std::size_t> at(blocks + 1, 0);
   parallelFor(0, blocks, 1, [&](std::size_t b, std::size_t e) {
     for (std::size_t k = b; k < e; ++k) {
-      CapturedArray& part = parts[k];
+      std::size_t count = 0;
+      for (std::size_t v = k * kBlock, end = std::min(n, v + kBlock); v < end; ++v) count += keep(v) ? 1 : 0;
+      at[k + 1] = count;
+    }
+  });
+  for (std::size_t k = 0; k < blocks; ++k) at[k + 1] += at[k];
+  const std::size_t total = at[blocks];
+  CapturedArray out;
+  if (!canon && total > 0 && denseIsSmaller(total, static_cast<std::uint32_t>(n))) {
+    out.values.resize(n);
+    parallelFor(0, n, kBlock / 4, [&](std::size_t b, std::size_t e) {
+      for (std::size_t v = b; v < e; ++v) out.values[v] = zeroElsewhere && !keep(v) ? Vec3{0.0f} : values[v];
+    });
+    out.dense = true;
+    return out;
+  }
+  out.index.resize(total);
+  out.values.resize(total);
+  parallelFor(0, blocks, 1, [&](std::size_t b, std::size_t e) {
+    for (std::size_t k = b; k < e; ++k) {
+      std::size_t i = at[k];
       for (std::size_t v = k * kBlock, end = std::min(n, v + kBlock); v < end; ++v) {
         if (!keep(v)) continue;
-        part.index.push_back(static_cast<std::uint32_t>(canon ? (*canon)[v] : static_cast<Index>(v)));
-        part.values.push_back(values[v]);
+        out.index[i] = static_cast<std::uint32_t>(canon ? (*canon)[v] : static_cast<Index>(v));
+        out.values[i] = values[v];
+        ++i;
       }
     }
   });
-  CapturedArray out;
-  std::size_t total = 0;
-  for (const CapturedArray& p : parts) total += p.index.size();
-  out.index.reserve(total);
-  out.values.reserve(total);
-  for (const CapturedArray& p : parts) {
-    out.index.insert(out.index.end(), p.index.begin(), p.index.end());
-    out.values.insert(out.values.end(), p.values.begin(), p.values.end());
-  }
   out.unsorted = canon != nullptr && total > 1;
   return out;
 }
@@ -425,10 +446,10 @@ CapturedStack captureStack(const Mesh& m, std::uint32_t objectIndex, std::uint8_
   c.activeSlot = static_cast<std::uint8_t>(s.active == 0 ? 0 : s.indexOf(s.active) + 1);
   c.vertexCount = static_cast<std::uint32_t>(m.positions.size());
   c.nextId = s.nextId;
-  c.base = capture(s.base, canon, [&](std::size_t v) { return !sameBits(s.base[v], m.positions[v]); });
+  c.base = capture(s.base, canon, false, [&](std::size_t v) { return !sameBits(s.base[v], m.positions[v]); });
   for (const SculptLayer& l : s.list) {
     CapturedLayer cl{l.id, l.name, l.strength, l.visible, {}};
-    cl.offsets = capture(l.offset, canon, [&](std::size_t v) { return !isZero(l.offset[v]); });
+    cl.offsets = capture(l.offset, canon, true, [&](std::size_t v) { return !isZero(l.offset[v]); });
     c.layers.push_back(std::move(cl));
   }
   return c;
@@ -472,6 +493,10 @@ void sortCaptured(CapturedArray& a) {
 
 void putArrayBlock(Writer& w, const CapturedArray& a, std::uint32_t vertexCount, std::uint8_t code) {
   w.put(code);
+  if (a.dense) {
+    w.putArray(reinterpret_cast<const float*>(a.values.data()), a.values.size() * 3);
+    return;
+  }
   if (code == kArrayDense) {
     std::vector<Vec3> dense(vertexCount, Vec3{0.0f});
     for (std::size_t i = 0; i < a.index.size(); ++i) dense[a.index[i]] = a.values[i];
@@ -490,9 +515,10 @@ void writeLayers(Writer& w, std::vector<CapturedStack>& stacks) {
   for (CapturedStack& s : stacks) {
     arrays.push_back(&s.base);
     for (CapturedLayer& l : s.layers) arrays.push_back(&l.offsets);
-    bytes += 24 + 16 * s.base.index.size();
+    bytes += 24 + (s.base.dense ? 12 * std::size_t(s.vertexCount) : 16 * s.base.index.size());
     for (const CapturedLayer& l : s.layers)
-      bytes += 80 + std::min<std::size_t>(16 * l.offsets.index.size(), 12 * std::size_t(s.vertexCount));
+      bytes += 80 + (l.offsets.dense ? 12 * std::size_t(s.vertexCount)
+                                     : std::min<std::size_t>(16 * l.offsets.index.size(), 12 * std::size_t(s.vertexCount)));
   }
   parallelFor(0, arrays.size(), 1, [&](std::size_t b, std::size_t e) {
     for (std::size_t i = b; i < e; ++i) sortCaptured(*arrays[i]);
@@ -511,7 +537,7 @@ void writeLayers(Writer& w, std::vector<CapturedStack>& stacks) {
     w.put(std::uint8_t{0});
     w.put(s.vertexCount);
     w.put(s.nextId);
-    putArrayBlock(w, s.base, s.vertexCount, kArrayOverComposite);
+    putArrayBlock(w, s.base, s.vertexCount, s.base.dense ? kArrayDense : kArrayOverComposite);
     for (const CapturedLayer& l : s.layers) {
       w.put(l.id);
       w.put(l.strength);
@@ -519,9 +545,9 @@ void writeLayers(Writer& w, std::vector<CapturedStack>& stacks) {
       const std::size_t nameLength = std::min(l.name.size(), kMaxLayerNameBytes);
       w.put(static_cast<std::uint8_t>(nameLength));
       w.putArray(l.name.data(), nameLength);
-      const std::uint64_t sparse = 4 + 16 * std::uint64_t(l.offsets.index.size());
       putArrayBlock(w, l.offsets, s.vertexCount,
-                    sparse < 12 * std::uint64_t(s.vertexCount) ? kArraySparse : kArrayDense);
+                    l.offsets.dense || denseIsSmaller(l.offsets.index.size(), s.vertexCount) ? kArrayDense
+                                                                                              : kArraySparse);
     }
   }
   w.endChunk(at);

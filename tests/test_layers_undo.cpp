@@ -236,6 +236,40 @@ TEST_CASE("layer ops: every operation undoes and redoes bit for bit") {
   }
 }
 
+TEST_CASE("layer ops: operations on dense layers recompose every vertex") {
+  // Layers that move most of the mesh take the whole-mesh path: every vertex is recomposed, and
+  // normals and bounds come from whole-mesh passes.
+  Fixture f;
+  SceneObject& obj = *f.obj;
+  for (int k : {0, 1}) {
+    SculptLayer& l = obj.mesh.layers.list[static_cast<std::size_t>(k)];
+    for (std::size_t v = 0; v < l.offset.size(); ++v)
+      l.offset[v] += obj.mesh.normals[v] * (0.01f + 0.002f * static_cast<float>((v * 7 + k) % 5));
+  }
+  composeAll(obj.mesh.layers, obj.mesh.positions);
+  obj.mesh.computeNormals();
+  obj.bvh.refit(obj.mesh);
+  requireLayers(obj.mesh);
+  auto requireBounds = [&] {
+    Bvh fresh = obj.bvh;
+    fresh.refit(obj.mesh);
+    const auto a = obj.bvh.leaves(), b = fresh.leaves();
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      CHECK(a[i].bounds.min == b[i].bounds.min);
+      CHECK(a[i].bounds.max == b[i].bounds.max);
+    }
+  };
+  SUBCASE("hide") { f.roundTrip([&] { return setLayerVisible(obj, f.id(1), false, f.ws, &f.error); }); }
+  SUBCASE("strength") { f.roundTrip([&] { return setLayerStrength(obj, f.id(0), 0.3f, f.ws, &f.error); }); }
+  SUBCASE("invert") { f.roundTrip([&] { return invertLayer(obj, f.id(1), f.ws, &f.error); }); }
+  SUBCASE("solo") { f.roundTrip([&] { return soloLayer(obj, f.id(2), f.ws, &f.error); }); }
+  SUBCASE("hide all") { f.roundTrip([&] { return setAllLayersVisible(obj, false, f.ws, &f.error); }); }
+  SUBCASE("merge down") { f.roundTrip([&] { return mergeLayerDown(obj, f.id(1), f.ws, &f.error); }); }
+  SUBCASE("delete") { f.roundTrip([&] { return deleteLayer(obj, f.id(0), f.ws, &f.error); }); }
+  SUBCASE("apply") { f.roundTrip([&] { return applyLayer(obj, f.id(1), f.ws, &f.error); }); }
+  requireBounds();
+}
+
 TEST_CASE("layer ops: refusals") {
   Fixture f(2);
   SceneObject& obj = *f.obj;

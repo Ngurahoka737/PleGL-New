@@ -295,7 +295,7 @@ int main(int argc, char** argv) {
   std::printf("\nSculpt layer benchmark (4 layers)\n\n");
   std::printf("%10s %9s %9s %9s %8s %9s %9s %9s %8s %8s %8s %8s %8s %8s %9s %8s\n", "vertices", "erase dab",
               "lsmooth", "commit", "moved K", "drag 10%", "drag all", "release", "visib.", "merge", "apply",
-              "all", "draft", "finish", "crc MB/s", "open");
+              "all", "draft+", "finish", "crc MB/s", "open");
   for (int res : quick ? std::vector<int>{129} : std::vector<int>{289, 408}) {
     Scene scene;
     SceneObject& obj = scene.add("Head", makeQuadSphere(res));
@@ -382,10 +382,21 @@ int main(int argc, char** argv) {
     t.reset();
     applyLayer(obj, obj.mesh.layers.list[0].id, lws, &error);
     const double applyMs = t.ms();
-    // Saving and opening with four layers.
+    // Saving and opening with the layers left. The draft column is the main-thread time layers add.
+    Scene plain;
+    plain.add("Head", copyWithoutLayers(obj.mesh));
+    double plainMs = 1e30, draftMs = 1e30;
+    for (int i = 0; i < 3; ++i) {
+      t.reset();
+      ProjectDraft d = draftProject(plain, "");
+      plainMs = std::min(plainMs, t.ms());
+      t.reset();
+      d = draftProject(scene, "");
+      draftMs = std::min(draftMs, t.ms());
+    }
+    draftMs -= plainMs;
     t.reset();
     ProjectDraft draft = draftProject(scene, "");
-    const double draftMs = t.ms();
     t.reset();
     const std::vector<std::uint8_t> bytes = finishProject(std::move(draft));
     const double finishMs = t.ms();

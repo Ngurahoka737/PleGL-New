@@ -61,31 +61,83 @@ std::size_t LayerWorkspace::bytes() const {
 
 namespace {
 
-// Writes positionOf(v) for every v in `verts` and collects the vertices whose bits changed.
-template <class PositionOf>
-void writePositions(Mesh& m, std::span<const Index> verts, LayerWorkspace& ws, PositionOf&& positionOf) {
-  ws.next.resize(verts.size());
-  parallelFor(0, verts.size(), 4096, [&](std::size_t b, std::size_t e) {
-    for (std::size_t i = b; i < e; ++i) ws.next[i] = positionOf(verts[i]);
+// Writes positionOf(v) for the `count` vertices v = vertexAt(i) (ascending) and collects the
+// vertices whose bits changed, ascending, in ws.changed (old positions in ws.oldP). Two passes
+// over fixed chunks, compute and count, then write, so both run in parallel.
+template <class VertexAt, class PositionOf>
+void writePositions(Mesh& m, std::size_t count, LayerWorkspace& ws, VertexAt&& vertexAt, PositionOf&& positionOf) {
+  constexpr std::size_t kChunk = 16384;
+  const std::size_t chunks = (count + kChunk - 1) / kChunk;
+  std::vector<std::size_t> at(chunks + 1, 0);
+  ws.next.resize(count);
+  parallelFor(0, chunks, 1, [&](std::size_t b, std::size_t e) {
+    for (std::size_t c = b; c < e; ++c) {
+      std::size_t n = 0;
+      for (std::size_t i = c * kChunk, end = std::min(count, i + kChunk); i < end; ++i) {
+        const Index v = vertexAt(i);
+        ws.next[i] = positionOf(v);
+        n += sameBits(m.positions[v], ws.next[i]) ? 0 : 1;
+      }
+      at[c + 1] = n;
+    }
   });
-  ws.changed.clear();
-  ws.oldP.clear();
-  for (std::size_t i = 0; i < verts.size(); ++i) {
-    Vec3& p = m.positions[verts[i]];
-    if (sameBits(p, ws.next[i])) continue;
-    ws.changed.push_back(verts[i]);
-    ws.oldP.push_back(p);
-    p = ws.next[i];
-  }
+  for (std::size_t c = 0; c < chunks; ++c) at[c + 1] += at[c];
+  ws.changed.resize(at[chunks]);
+  ws.oldP.resize(at[chunks]);
+  parallelFor(0, chunks, 1, [&](std::size_t b, std::size_t e) {
+    for (std::size_t c = b; c < e; ++c) {
+      std::size_t k = at[c];
+      for (std::size_t i = c * kChunk, end = std::min(count, i + kChunk); i < end; ++i) {
+        const Index v = vertexAt(i);
+        Vec3& p = m.positions[v];
+        if (sameBits(p, ws.next[i])) continue;
+        ws.changed[k] = v;
+        ws.oldP[k] = p;
+        p = ws.next[i];
+        ++k;
+      }
+    }
+  });
 }
 
 // a = a united with b; both ascending without repeats.
-void unite(std::vector<Index>& a, const std::vector<Index>& b, std::vector<Index>& scratch) {
+void unite(std::vector<Index>& a, std::span<const Index> b, std::vector<Index>& scratch) {
   if (b.empty()) return;
   scratch.clear();
   std::set_union(a.begin(), a.end(), b.begin(), b.end(), std::back_inserter(scratch));
   a.swap(scratch);
 }
+
+// Where the composite can change: the union of the supports added, in `out`, or every vertex
+// once that union may cover half the mesh (whole-mesh passes then cost less than the lists).
+class Support {
+ public:
+  Support(std::size_t vertexCount, std::vector<Index>& out) : nv_(vertexCount), out_(out) { out_.clear(); }
+  void add(const std::vector<Vec3>& offset) {
+    if (all_) return;
+    const std::size_t n = layerSupportSize(offset);
+    if (n == 0 || dense(n)) return;
+    layerSupport(offset, part_);
+    unite(out_, part_, scratch_);
+  }
+  void add(std::span<const Index> ascending) {
+    if (all_ || ascending.empty() || dense(ascending.size())) return;
+    unite(out_, ascending, scratch_);
+  }
+  bool all() const { return all_; }
+
+ private:
+  bool dense(std::size_t more) {
+    if ((out_.size() + more) * 2 <= nv_) return false;
+    all_ = true;
+    out_.clear();
+    return true;
+  }
+  std::size_t nv_;
+  std::vector<Index>& out_;
+  std::vector<Index> part_, scratch_;
+  bool all_ = false;
+};
 
 bool sameFloat(float a, float b) { return std::memcmp(&a, &b, sizeof(float)) == 0; }
 
@@ -140,8 +192,29 @@ bool roomFor(const SceneObject& obj, std::size_t extra, std::size_t limit, std::
 // Visible layers with a strength: the only ones the composite sees.
 bool contributes(const SculptLayer& l) { return l.visible && l.strength != 0.0f; }
 
-// Recomposes the live stack at `verts` with normals and bounds, as one-shot operations do.
-void recomposeNow(SceneObject& obj, LayerWorkspace& ws) {
+template <class VertexAt>
+std::size_t recompose(SceneObject& object, std::size_t count, VertexAt&& vertexAt, LayerWorkspace& ws,
+                      NormalsMode mode, bool refit) {
+  const LayerStack& stack = object.mesh.layers;
+  // A base without layers is fine: its composite is the base (Delete recomposes that way).
+  if (stack.base.empty() || count == 0) {
+    ws.changed.clear();
+    ws.oldP.clear();
+    return 0;
+  }
+  writePositions(object.mesh, count, ws, vertexAt, [&](Index v) { return composeVertex(stack, v); });
+  finishPositions(object, ws.changed, ws, mode == NormalsMode::Now, refit);
+  return ws.changed.size();
+}
+
+// Recomposes the live stack at ws.support, or at every vertex when `all`, with normals and
+// bounds, as one-shot operations do.
+void recomposeNow(SceneObject& obj, LayerWorkspace& ws, bool all) {
+  if (all) {
+    recompose(obj, obj.mesh.positions.size(), [](std::size_t i) { return static_cast<Index>(i); }, ws,
+              NormalsMode::Now, true);
+    return;
+  }
   const std::vector<Index> verts = std::move(ws.support);
   recomposeVertices(obj, verts, ws, NormalsMode::Now, true);
   ws.support = std::move(verts);
@@ -161,16 +234,7 @@ void addScaled(Vec3& t, float s, const Vec3& o) {
 
 std::size_t recomposeVertices(SceneObject& object, std::span<const Index> verts, LayerWorkspace& ws, NormalsMode mode,
                               bool refit) {
-  const LayerStack& stack = object.mesh.layers;
-  // A base without layers is fine: its composite is the base (Delete recomposes that way).
-  if (stack.base.empty() || verts.empty()) {
-    ws.changed.clear();
-    ws.oldP.clear();
-    return 0;
-  }
-  writePositions(object.mesh, verts, ws, [&](Index v) { return composeVertex(stack, v); });
-  finishPositions(object, ws.changed, ws, mode == NormalsMode::Now, refit);
-  return ws.changed.size();
+  return recompose(object, verts.size(), [&](std::size_t i) { return verts[i]; }, ws, mode, refit);
 }
 
 void finishPositions(SceneObject& object, std::span<const Index> changed, LayerWorkspace& ws, bool normals, bool refit) {
@@ -180,47 +244,46 @@ void finishPositions(SceneObject& object, std::span<const Index> changed, LayerW
   const std::size_t nv = m.positions.size();
   if (changed.size() * 2 > nv) {
     // Most of the mesh: whole-mesh passes give the same bits for less work.
-    if (normals) m.computeNormals();
+    if (normals) m.computeNormals(ws.faceN);
     if (refit) bvh.refit(m);
     object.markPositionsDirtyAll(normals);
     return;
   }
   // Vertices sharing a face with a changed one get new normals; the leaves of those faces new
-  // bounds.
+  // bounds. Leaf lookups start from the last leaf found, which neighbours almost always share.
+  const std::span<const BvhLeaf> leafList = bvh.leaves();
   ws.vertMark.begin(nv);
   ws.faceMark.begin(m.faceHe.size());
   ws.ring.clear();
   ws.leaves.clear();
+  Index faceLeaf = kInvalid;
   for (Index v : changed) {
     m.forEachOutgoing(v, [&](Index h) {
       const Index f = m.heFace[h];
       if (f == kInvalid || !ws.faceMark.insert(f)) return;
-      if (refit) ws.leaves.push_back(bvh.leafOfFace(f));
+      if (refit && (faceLeaf == kInvalid || f < leafList[faceLeaf].faceBegin || f >= leafList[faceLeaf].faceEnd)) {
+        faceLeaf = bvh.leafOfFace(f);
+        if (faceLeaf != kInvalid) ws.leaves.push_back(faceLeaf);
+      }
       m.forEachFaceVertex(f, [&](Index u) {
         if (ws.vertMark.insert(u)) ws.ring.push_back(u);
       });
     });
   }
-  std::sort(ws.ring.begin(), ws.ring.end());
   if (normals) leafNormals(m, ws.ring, ws);
   if (refit && !ws.leaves.empty()) {
     std::sort(ws.leaves.begin(), ws.leaves.end());
     ws.leaves.erase(std::unique(ws.leaves.begin(), ws.leaves.end()), ws.leaves.end());
     bvh.refitLeaves(m, ws.leaves);
   }
-  // Owner leaves of the uploaded vertices, found once per run of the ascending list.
+  // Owner leaves of the uploaded vertices, looked up once per run of vertices in one leaf.
   const std::span<const Index> upload = normals ? std::span<const Index>(ws.ring) : changed;
   ws.leaves.clear();
-  Index lastOwner = kInvalid;
+  Index owner = kInvalid;
   for (Index v : upload) {
-    if (lastOwner != kInvalid) {
-      const BvhLeaf& l = bvh.leaves()[lastOwner];
-      if (v >= l.vertBegin && v < l.vertEnd) continue;
-    }
-    const Index owner = bvh.leafOfVertex(v);
-    if (owner == kInvalid) continue;
-    lastOwner = owner;
-    ws.leaves.push_back(owner);
+    if (owner != kInvalid && v >= leafList[owner].vertBegin && v < leafList[owner].vertEnd) continue;
+    owner = bvh.leafOfVertex(v);
+    if (owner != kInvalid) ws.leaves.push_back(owner);
   }
   std::sort(ws.leaves.begin(), ws.leaves.end());
   ws.leaves.erase(std::unique(ws.leaves.begin(), ws.leaves.end()), ws.leaves.end());
@@ -233,7 +296,7 @@ void finishPositions(SceneObject& object, std::span<const Index> changed, LayerW
 
 void leafNormals(Mesh& m, std::span<const Index> verts, LayerWorkspace& ws) {
   if (verts.size() * 2 > m.positions.size()) {
-    m.computeNormals();
+    m.computeNormals(ws.faceN);
     return;
   }
   // Each face normal once, then the sums in Mesh::vertexNormal's order.
@@ -349,12 +412,12 @@ std::optional<LayerUndo> deleteLayer(SceneObject& object, std::uint32_t id, Laye
   LayerUndo e = beginEntry(object, LayerOp::Delete, "Delete Layer");
   const auto at = static_cast<std::size_t>(k);
   const bool shows = contributes(s.list[at]);
-  ws.support.clear();
-  if (shows) layerSupport(s.list[at].offset, ws.support);
+  Support support(object.mesh.positions.size(), ws.support);
+  if (shows) support.add(s.list[at].offset);
   e.held.push_back({id, {}, std::move(s.list[at].offset)});
   s.list.erase(s.list.begin() + k);
   if (s.active == id) s.active = at > 0 ? s.list[at - 1].id : (at < s.list.size() ? s.list[at].id : 0);
-  if (shows) recomposeNow(object, ws);  // With no layer left this gives the base.
+  if (shows) recomposeNow(object, ws, support.all());  // With no layer left this gives the base.
   if (s.list.empty()) {
     e.held.push_back({0, {}, std::move(s.base)});
     s = LayerStack{};
@@ -385,19 +448,17 @@ std::optional<LayerUndo> setEyes(SceneObject& object, LayerOp op, std::string la
   for (std::size_t k = 0; k < s.list.size(); ++k) any |= (s.list[k].visible != (visible[k] != 0));
   if (!any) return std::nullopt;
   LayerUndo e = beginEntry(object, op, std::move(label));
-  std::vector<Index> support, scratch;
-  ws.support.clear();
+  Support support(object.mesh.positions.size(), ws.support);
   for (std::size_t k = 0; k < s.list.size(); ++k) {
     SculptLayer& l = s.list[k];
     if (l.visible == (visible[k] != 0)) continue;
     l.visible = visible[k] != 0;
     if (l.strength == 0.0f) continue;
     e.recomposeIds.push_back(l.id);
-    layerSupport(l.offset, support);
-    unite(ws.support, support, scratch);
+    support.add(l.offset);
   }
   e.recompose = !e.recomposeIds.empty();
-  recomposeNow(object, ws);
+  recomposeNow(object, ws, support.all());
   return finishEntry(object, e);
 }
 }  // namespace
@@ -442,8 +503,9 @@ std::optional<LayerUndo> changeStrength(SceneObject& object, SculptLayer& l, flo
   const bool recompose = l.visible && (l.strength != 0.0f || strength != 0.0f);
   l.strength = strength;
   if (recompose) {
-    layerSupport(l.offset, ws.support);
-    recomposeNow(object, ws);
+    Support support(object.mesh.positions.size(), ws.support);
+    support.add(l.offset);
+    recomposeNow(object, ws, support.all());
     e.recompose = true;
     e.recomposeIds.push_back(l.id);
   }
@@ -478,22 +540,30 @@ std::optional<LayerUndo> mergeLayerDown(SceneObject& object, std::uint32_t id, L
   SculptLayer& b = s.list[static_cast<std::size_t>(k - 1)];
   if (!a.visible || !b.visible) return refuse(error, "Show both layers to merge them.");
   LayerUndo e = beginEntry(object, LayerOp::MergeDown, "Merge Down");
-  std::vector<Index> support, scratch;
-  layerSupport(a.offset, ws.support);
-  layerSupport(b.offset, support);
-  unite(ws.support, support, scratch);
-  // B' = sB * B + sA * A in a new array, so the old one can go into the entry whole.
-  std::vector<Vec3> merged(b.offset.size(), Vec3{0.0f});
+  Support support(object.mesh.positions.size(), ws.support);
+  support.add(a.offset);
+  support.add(b.offset);
+  // B' = sB * B + sA * A in a new array, so the old one can go into the entry whole. Outside
+  // both supports the sum is +0, what the new array starts with.
   const float sa = a.strength, sb = b.strength;
-  parallelFor(0, ws.support.size(), 4096, [&](std::size_t lo, std::size_t hi) {
-    for (std::size_t i = lo; i < hi; ++i) {
-      const Index v = ws.support[i];
-      Vec3 t{0.0f};
-      addScaled(t, sb, b.offset[v]);
-      addScaled(t, sa, a.offset[v]);
-      merged[v] = t;
-    }
-  });
+  auto mergeAt = [&](Index v) {
+    Vec3 t{0.0f};
+    addScaled(t, sb, b.offset[v]);
+    addScaled(t, sa, a.offset[v]);
+    return t;
+  };
+  std::vector<Vec3> merged;
+  if (support.all()) {
+    merged.resize(b.offset.size());
+    parallelFor(0, merged.size(), 16384, [&](std::size_t lo, std::size_t hi) {
+      for (std::size_t v = lo; v < hi; ++v) merged[v] = mergeAt(static_cast<Index>(v));
+    });
+  } else {
+    merged.assign(b.offset.size(), Vec3{0.0f});
+    parallelFor(0, ws.support.size(), 4096, [&](std::size_t lo, std::size_t hi) {
+      for (std::size_t i = lo; i < hi; ++i) merged[ws.support[i]] = mergeAt(ws.support[i]);
+    });
+  }
   const std::uint32_t bid = b.id;
   e.held.push_back({bid, {}, std::move(b.offset)});
   b.offset = std::move(merged);
@@ -503,7 +573,7 @@ std::optional<LayerUndo> mergeLayerDown(SceneObject& object, std::uint32_t id, L
   s.active = bid;
   e.recompose = true;
   e.recomposeIds = {id, bid};
-  recomposeNow(object, ws);
+  recomposeNow(object, ws, support.all());
   if (object.multires) rebaseReference(*object.multires, ws.changed, ws.oldP, object.mesh, &e);
   return finishEntry(object, e);
 }
@@ -554,7 +624,7 @@ std::optional<LayerUndo> applyLayer(SceneObject& object, std::uint32_t id, Layer
   s.active = 0;
   e.recompose = true;
   e.recomposeIds = {id};
-  recomposeNow(object, ws);
+  recomposeNow(object, ws, false);
   if (object.multires) rebaseReference(*object.multires, ws.changed, ws.oldP, object.mesh, &e);
   return finishEntry(object, e);
 }
@@ -729,25 +799,22 @@ bool applyLayerUndo(Scene& scene, LayerUndo& e, bool redo, LayerWorkspace& ws) {
   }
 
   // Where the composite can change: the supports of the listed layers in either version.
-  std::vector<Index> verts, support, scratch;
+  std::vector<Index>& verts = ws.support;
+  Support support(nv, verts);
   if (e.recompose) {
     for (std::uint32_t id : e.recomposeIds) {
-      if (const std::vector<Vec3>* a = find(id)) {
-        layerSupport(*a, support);
-        unite(verts, support, scratch);
-      }
+      if (const std::vector<Vec3>* a = find(id)) support.add(*a);
       for (const HeldArray& h : e.held) {
         if (h.id != id || !h.index.empty() || h.values.empty()) continue;
-        layerSupport(h.values, support);
-        unite(verts, support, scratch);
+        support.add(h.values);
       }
     }
     for (const HeldArray& h : e.held) {
-      if (h.index.empty()) continue;
-      support = h.index;
-      unite(verts, support, scratch);
+      if (!h.index.empty()) support.add(h.index);
     }
   }
+  const std::size_t count = support.all() ? nv : verts.size();
+  auto vertexAt = [&](std::size_t i) { return support.all() ? static_cast<Index>(i) : verts[i]; };
 
   // The other side's stack, from its settings and the pool.
   LayerStack next;
@@ -765,11 +832,13 @@ bool applyLayerUndo(Scene& scene, LayerUndo& e, bool redo, LayerWorkspace& ws) {
     }
   }
   // New positions: the composite, or the plain base when the other side has no stack.
-  if (!verts.empty()) {
+  ws.changed.clear();
+  ws.oldP.clear();
+  if (count > 0) {
     if (to.hasStack) {
-      writePositions(obj->mesh, verts, ws, [&](Index v) { return composeVertex(next, v); });
+      writePositions(obj->mesh, count, ws, vertexAt, [&](Index v) { return composeVertex(next, v); });
     } else if (const std::vector<Vec3>* base = find(0)) {
-      writePositions(obj->mesh, verts, ws, [&](Index v) { return (*base)[v]; });
+      writePositions(obj->mesh, count, ws, vertexAt, [&](Index v) { return (*base)[v]; });
     }
   }
   // Arrays leaving go into the entry: into a free slot with their id, else a free one, else a new one.
@@ -786,7 +855,7 @@ bool applyLayerUndo(Scene& scene, LayerUndo& e, bool redo, LayerWorkspace& ws) {
     slot->values = std::move(a);
   }
   live = std::move(next);
-  if (!verts.empty()) finishPositions(*obj, ws.changed, ws, true, true);
+  finishPositions(*obj, ws.changed, ws, true, true);
 
   if (obj->multires) {
     std::vector<Vec3>& ref = obj->multires->reference.positions;

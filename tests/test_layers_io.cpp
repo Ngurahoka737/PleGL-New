@@ -275,13 +275,14 @@ TEST_CASE("layer files: a plain object's layers round-trip") {
   CHECK(copy.mesh.layers.epoch != obj.mesh.layers.epoch);
   CHECK(copy.mesh.layers.list[1].name == "D\xC3\xA9tail \xE2\x9C\x93");
 
-  // The chunk size follows from the codes: the base over the composite, the two stroked layers
-  // sparse, the full one dense.
+  // The chunk size follows from the codes: the base dense (the full layer moves every vertex off
+  // it), the two stroked layers sparse, the full one dense.
   const LayerStack& s = obj.mesh.layers;
   const std::size_t V = s.base.size();
   std::size_t baseCount = 0;
   for (std::size_t v = 0; v < V; ++v) baseCount += !sameBits(s.base[v], obj.mesh.positions[v]);
-  std::size_t expected = 8 + 16 + 1 + 4 + 16 * baseCount;
+  CHECK(4 + 16 * baseCount >= 12 * V);
+  std::size_t expected = 8 + 16 + 1 + 12 * V;
   for (const SculptLayer& l : s.list) {
     std::size_t count = 0;
     for (const Vec3& v : l.offset) count += !isZero(v);

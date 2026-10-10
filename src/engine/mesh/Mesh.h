@@ -150,6 +150,8 @@ class Mesh {
   Vec3 vertexNormal(Index v) const;
   // Recomputes area-weighted vertex normals for every vertex (parallel).
   void computeNormals();
+  // The same, with the face normals in `faceScratch` (grown when smaller, kept for the next call).
+  void computeNormals(std::vector<Vec3>& faceScratch);
   // Recomputes normals for a contiguous range of vertices only.
   void computeNormals(Index vertBegin, Index vertEnd);
 

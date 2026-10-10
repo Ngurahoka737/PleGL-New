@@ -100,6 +100,8 @@ void composeAll(const LayerStack& s, std::vector<Vec3>& out);
 
 // Vertices where `offset` is not zero, ascending.
 void layerSupport(const std::vector<Vec3>& offset, std::vector<Index>& out);
+// How many there are (parallel).
+std::size_t layerSupportSize(const std::vector<Vec3>& offset);
 
 // Identifies everything that decides the composite apart from the arrays: the epoch and each
 // layer's id, visibility and strength bits, in list order (FNV-1a). 0 for an empty stack, never 0
