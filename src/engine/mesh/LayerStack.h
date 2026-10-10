@@ -32,6 +32,8 @@ inline constexpr std::size_t kMaxLayerNameBytes = 63;
 inline constexpr std::size_t kMaxObjectLayerBytes = std::size_t{1} << 30;
 // The same when reading a project file, where layers made elsewhere may be larger.
 inline constexpr std::size_t kMaxFileObjectLayerBytes = std::size_t{2} << 30;
+// Largest LayerStack::nextId a project file may hold; Add and Duplicate stop there too.
+inline constexpr std::uint32_t kMaxFileNextId = std::uint32_t{1} << 31;
 // Strength drags recompute normals live up to this many affected vertices, on release above it.
 inline constexpr std::size_t kLiveNormalsLimit = 600'000;
 

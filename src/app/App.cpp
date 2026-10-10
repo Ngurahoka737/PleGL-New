@@ -163,6 +163,9 @@ void App::run() {
     ImGuizmo::BeginFrame();
 
     drawUi();  // Also lays out the viewport rectangle.
+    // A strength drag whose slider stopped being drawn (the selection changed under it) never
+    // reports deactivation; end it here so its change reaches history and autosave resumes.
+    if (strengthDrag_.active() && !ImGui::IsAnyItemActive()) finishLayerStrengthDrag();
     drawGizmo();
     updateHover();
     renderer_.sync(scene, view.wireframe);
@@ -548,7 +551,9 @@ void App::bumpUnderCursor() {
     statusMessage = "Hover over a mesh, then press B";
     return;
   }
-  SceneObject* obj = editableObject(hover_->objectId, "mesh");
+  // Finishing a strength drag (in editableObject) pushes an undo step, which clears hover_.
+  const ScenePick pick = *hover_;
+  SceneObject* obj = editableObject(pick.objectId, "mesh");
   if (!obj) return;
   if (obj->multires) {
     // The bump has no undo entry, and undoing a level switch would lose it or stop it spreading.
@@ -562,8 +567,8 @@ void App::bumpUnderCursor() {
   }
   Timer t;
   Mesh& m = obj->mesh;
-  const Vec3 center = hover_->localHit.position;
-  const Vec3 dir = hover_->localHit.smoothNormal;
+  const Vec3 center = pick.localHit.position;
+  const Vec3 dir = pick.localHit.smoothNormal;
   const float radius = glm::length(obj->bvh.bounds().extent()) * 0.06f;
   std::vector<Index> leaves;
   obj->bvh.querySphere(center, radius, leaves);
@@ -598,7 +603,9 @@ void App::beginStroke(float x, float y, std::uint64_t timestampNs) {
   // undo entry: end it properly first.
   if (sculptor_.active()) endStroke();
   if (!hover_ || ImGui::GetIO().WantCaptureMouse) return;
-  SceneObject* obj = scene.find(hover_->objectId);
+  // Finishing a strength drag pushes an undo step, which clears hover_.
+  const ScenePick pick = *hover_;
+  SceneObject* obj = scene.find(pick.objectId);
   if (!obj) return;
   finishLayerStrengthDrag();
   selectedId = obj->id;
@@ -641,7 +648,7 @@ void App::beginStroke(float x, float y, std::uint64_t timestampNs) {
     const float px = sculpt.radiusPx * (mapRadius ? std::max(p, 0.1f) : 1.0f);
     const Mat4 inv = glm::inverse(obj->transform.matrix());
     const float scale = (obj->transform.scale.x + obj->transform.scale.y + obj->transform.scale.z) / 3.0f;
-    grabStartWorld_ = hover_->worldPosition;
+    grabStartWorld_ = pick.worldPosition;
     grabPlaneNormal_ = camera.forward();
     const float radius = camera.worldPerPixel(grabStartWorld_) * px / std::max(scale, 1e-6f);
     if (sculptor_.beginGrab(*obj, opts, Vec3(inv * Vec4(grabStartWorld_, 1.0f)), radius, label)) {

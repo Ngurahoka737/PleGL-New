@@ -792,7 +792,7 @@ void App::drawLayerPanel(SceneObject& obj) {
     ImGui::SetTooltip("%s", full.empty() ? "A new empty layer on top (Ctrl+L). Strokes go into it." : full.c_str());
   ImGui::SameLine();
   ImGui::BeginDisabled(!hasActive || !full.empty());
-  if (ImGui::Button("Duplicate", ImVec2(third, 0))) duplicateLayer();
+  if (ImGui::Button("Duplicate##layer", ImVec2(third, 0))) duplicateLayer();
   ImGui::EndDisabled();
   if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
     ImGui::SetTooltip("%s", !full.empty() ? full.c_str() : "A hidden copy of the active layer.");
@@ -861,13 +861,17 @@ void App::drawLayerPanel(SceneObject& obj) {
     }
     ImGui::SameLine();
     // Strength in percent: dragging moves the shape live and becomes one undo step; Ctrl+click
-    // types an exact value (up to 1000 %).
+    // types an exact value (up to 1000 %). Typed values apply while typing, so they reach this
+    // row's drag before another widget or a stroke can end it; a row only feeds its own drag.
     float percent = layer.strength * 100.0f;
     ImGui::SetNextItemWidth(-1);
+    ImGui::PushItemFlag(ImGuiItemFlags_LiveEditOnInputScalar, true);
     const bool changed = ImGui::SliderFloat("##strength", &percent, -100.0f, 100.0f, "%.0f %%");
+    ImGui::PopItemFlag();
     if (ImGui::IsItemActivated()) beginLayerStrengthDrag(id);
-    if (changed) updateLayerStrengthDrag(percent / 100.0f);
-    if (ImGui::IsItemDeactivated()) endLayerStrengthDrag();
+    const bool mine = strengthDrag_.active() && strengthDrag_.objectId() == obj.id && strengthDrag_.layerId() == id;
+    if (changed && mine) updateLayerStrengthDrag(percent / 100.0f);
+    if (ImGui::IsItemDeactivated() && mine) endLayerStrengthDrag();
     ImGui::PopID();
   }
   // Right-click menu of a layer row; it acts on that layer, so it becomes the target first.

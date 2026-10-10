@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstring>
 #include <map>
+#include <new>
 #include <sstream>
 #include <system_error>
 
@@ -369,9 +370,15 @@ void App::loadProjectAsync(const std::filesystem::path& path, bool recovered) {
   workers_.emplace_back([this, path, recovered] {
     Timer t;
     auto error = std::make_shared<std::string>();
-    auto project = std::make_shared<std::optional<Project>>(loadProject(path, error.get()));
-    // BVHs and subdivision levels; level data that does not fit refuses the whole file.
-    if (*project && !buildProject(**project, error.get())) project->reset();
+    auto project = std::make_shared<std::optional<Project>>();
+    try {
+      *project = loadProject(path, error.get());
+      // BVHs and subdivision levels; level data that does not fit refuses the whole file.
+      if (*project && !buildProject(**project, error.get())) project->reset();
+    } catch (const std::bad_alloc&) {
+      project->reset();
+      *error = "Not enough memory to open it.";
+    }
     const double ms = t.ms();
     std::lock_guard lock(asyncMutex_);
     asyncResults_.push_back([this, path, recovered, error, project, ms] {

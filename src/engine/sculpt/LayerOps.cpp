@@ -192,6 +192,8 @@ bool roomFor(const SceneObject& obj, std::size_t extra, std::size_t limit, std::
   if (static_cast<int>(obj.mesh.layers.list.size()) >= kMaxLayers)
     return fail(error, "An object (or subdivision level) can have at most " + std::to_string(kMaxLayers) +
                            " sculpt layers.");
+  // An empty stack has nextId 1, so this never refuses the first layer.
+  if (obj.mesh.layers.nextId >= kMaxFileNextId) return fail(error, "This object has used up its layer ids.");
   if (objectLayerBytes(obj) + extra > limit)
     return fail(error, "Not enough room for another layer: the sculpt layers of one object may use at most " +
                            std::to_string(limit >> 20) + " MB.");

@@ -504,6 +504,78 @@ TEST_CASE("layer files: layers too large for an object are refused before decodi
   CHECK(p->objects[0].levelLayers.empty());
 }
 
+TEST_CASE("layer files: layer data cannot decode to far more than the file stores") {
+  // Empty blocks take 5 bytes but decode to 12 per vertex. Each object stays under its own limit,
+  // yet together they would decode to more than 2 GiB beyond what the app ever writes over the
+  // stored positions, so the second stack is refused before it is decoded. Isolated vertices keep
+  // the file small.
+  const std::uint32_t V0 = 50'000, V1 = 699'050;
+  REQUIRE((255.0 + 1.0) * V1 * 12.0 <= double(kMaxFileObjectLayerBytes));
+  REQUIRE((255.0 - kMaxLayers) * (V0 + V1) * 12.0 > double(kMaxFileObjectLayerBytes));
+  Scene scene;
+  for (const std::uint32_t V : {V0, V1}) {
+    std::vector<Vec3> points(V);
+    for (std::uint32_t v = 0; v < V; ++v) points[v] = Vec3{float(v), 0.0f, 0.0f};
+    scene.add("Points", buildMesh(std::move(points), {}, {}), Bvh{});
+  }
+  const std::vector<std::uint8_t> bytes = serializeProject(scene, "");
+  RawLayr l;
+  for (const std::uint32_t object : {0u, 1u}) {
+    RawStack s;
+    s.object = object;
+    s.vertexCount = object == 0 ? V0 : V1;
+    s.nextId = 300;
+    for (std::uint32_t id = 1; id <= 255; ++id) s.layers.push_back({id, 1.0f, 1, "", {1, {}, {}}});
+    l.stacks.push_back(std::move(s));
+  }
+  const std::vector<std::uint8_t> b = withLayr(bytes, encode(l));
+  std::string error;
+  std::optional<Project> p = parseProject(b.data(), b.size(), &error);
+  REQUIRE(p);
+  REQUIRE(p->warnings.size() == 1);
+  CHECK(p->warnings[0] == kDamaged);
+  CHECK(p->objects[0].layers.empty());
+  CHECK(p->objects[1].layers.empty());
+
+  SUBCASE("the same stacks with the app's layer count open") {
+    for (RawStack& s : l.stacks) {
+      s.layers.clear();
+      s.layerCount = -1;
+      for (std::uint32_t id = 1; id <= std::uint32_t(kMaxLayers); ++id) s.layers.push_back({id, 1.0f, 1, "", {1, {}, {}}});
+    }
+    const std::vector<std::uint8_t> ok = withLayr(bytes, encode(l));
+    std::optional<Project> q = parseProject(ok.data(), ok.size(), &error);
+    REQUIRE(q);
+    CHECK(q->warnings.empty());
+    CHECK(q->objects[1].layers.list.size() == std::size_t(kMaxLayers));
+  }
+}
+
+TEST_CASE("layer files: Add and Duplicate stop at the largest id a file may hold") {
+  Scene scene;
+  LayerWorkspace ws;
+  SceneObject& obj = scene.add("A", makeIcosphere(2));
+  sculptLayer(obj, ws, {0, 1, 0});
+  // A stack read from a file may carry the largest next id; the app must still save it so it
+  // reads back.
+  obj.mesh.layers.nextId = kMaxFileNextId;
+  const std::uint32_t id = obj.mesh.layers.list[0].id;
+  std::string error;
+  CHECK(!addLayer(obj, ws, &error));
+  CHECK(error == "This object has used up its layer ids.");
+  error.clear();
+  CHECK(!duplicateLayer(obj, id, ws, &error));
+  CHECK(error == "This object has used up its layer ids.");
+  CHECK(obj.mesh.layers.list.size() == 1);
+  CHECK(obj.mesh.layers.nextId == kMaxFileNextId);
+  Opened o = open(serializeProject(scene, ""));
+  CHECK(o.project.warnings.empty());
+  const LayerStack& copy = o.scene->objects()[0]->mesh.layers;
+  REQUIRE(copy.list.size() == 1);
+  CHECK(copy.nextId == kMaxFileNextId);
+  requireLayers(o.scene->objects()[0]->mesh);
+}
+
 TEST_CASE("layer files: composites off by rounding are recomposed, others dropped") {
   SUBCASE("object without levels") {
     for (float off : {0.0f, 1e-2f}) {

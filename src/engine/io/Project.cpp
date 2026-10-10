@@ -39,7 +39,6 @@ constexpr std::uint32_t kTagLayers = tag("LAYR");
 constexpr std::uint8_t kLayersEncoding = 0;
 constexpr std::uint8_t kPlainLevel = 255;  // LAYR level of an object without levels.
 constexpr std::uint8_t kArrayDense = 0, kArraySparse = 1, kArrayOverComposite = 2;
-constexpr std::uint32_t kMaxFileNextId = std::uint32_t{1} << 31;
 constexpr std::uint32_t kTagEnd = tag("END ");
 
 class Writer {
@@ -630,6 +629,10 @@ LayersRead readLayers(Reader& r, std::size_t size, std::vector<ProjectObject>& o
   };
   std::vector<Read> stacks;
   std::vector<std::uint64_t> objectBytes(objects.size(), 0);
+  // Decoded size over all stacks. A sparse or empty block takes a few bytes but decodes to 12 per
+  // vertex, so the total is bounded by what the file stores: each stack's composite (OBJS or MRES
+  // positions) is in the file, and the app writes at most kMaxLayers layers over it.
+  std::uint64_t totalBytes = 0, allowance = kMaxFileObjectLayerBytes;
   std::int64_t lastKey = -1;
   for (std::uint32_t n = 0; n < stackCount; ++n) {
     const auto objectIndex = r.get<std::uint32_t>();
@@ -661,6 +664,9 @@ LayersRead readLayers(Reader& r, std::size_t size, std::vector<ProjectObject>& o
     if (vertexCount != composite->size()) return LayersRead::Damaged;
     objectBytes[objectIndex] += (std::uint64_t(layerCount) + 1) * vertexCount * 12;
     if (objectBytes[objectIndex] > kMaxFileObjectLayerBytes) return LayersRead::Damaged;
+    totalBytes += (std::uint64_t(layerCount) + 1) * vertexCount * 12;
+    allowance += std::uint64_t(kMaxLayers + 1) * vertexCount * 12;
+    if (totalBytes > allowance) return LayersRead::Damaged;
 
     Read out{objectIndex, level, {}};
     LayerStack& s = out.stack;
