@@ -28,6 +28,8 @@ std::uint64_t nextTopologyVersion();
 // Above this many changed leaves, a mask or face set edit asks for one whole upload instead of
 // per-leaf uploads.
 inline constexpr std::size_t kMaskDirtyAllLeaves = 64;
+// Likewise for positions and normals (layer operations that touch much of the mesh).
+inline constexpr std::size_t kPositionsDirtyAllLeaves = 64;
 
 struct SceneObject {
   std::uint32_t id = 0;
@@ -41,6 +43,9 @@ struct SceneObject {
   std::uint64_t topologyVersion = 1;
   // Leaves whose vertex positions or normals changed since the renderer last uploaded them.
   std::vector<Index> dirtyLeaves;
+  // Every position changed (and every normal too when normalsDirtyAll is set).
+  bool positionsDirtyAll = false;
+  bool normalsDirtyAll = false;
   // Leaves whose mask values changed, or the whole mask when maskDirtyAll is set.
   std::vector<Index> maskDirtyLeaves;
   bool maskDirtyAll = false;
@@ -66,6 +71,13 @@ struct SceneObject {
   // subdivision levels, whose layouts are frozen.
   void rebuildSpatial();
   void markLeafDirty(Index leaf) { dirtyLeaves.push_back(leaf); }
+  // Asks for one upload of all positions, and of all normals when `normals` is set. Leaves already
+  // marked keep their marks unless the normals are uploaded whole too.
+  void markPositionsDirtyAll(bool normals) {
+    positionsDirtyAll = true;
+    normalsDirtyAll |= normals;
+    if (normalsDirtyAll) dirtyLeaves.clear();
+  }
   void markMaskDirty(Index leaf) { maskDirtyLeaves.push_back(leaf); }
   void markTopologyDirty(Index leaf) { topoDirtyLeaves.push_back(leaf); }
   void markMaskDirtyAll() {
@@ -87,6 +99,8 @@ struct SceneObject {
   // Drops pending partial uploads; for use after a topology change, which re-uploads everything.
   void clearDirty() {
     dirtyLeaves.clear();
+    positionsDirtyAll = false;
+    normalsDirtyAll = false;
     maskDirtyLeaves.clear();
     maskDirtyAll = false;
     faceSetDirtyLeaves.clear();

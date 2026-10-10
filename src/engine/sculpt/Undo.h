@@ -104,7 +104,64 @@ struct MultiresUndo {
   std::size_t bytes() const;
 };
 
+// Sculpt layer operations (see sculpt/LayerOps.h).
+enum class LayerOp : std::uint8_t {
+  Add, Duplicate, Delete, Rename, Visibility, Strength, Solo, ShowAll, HideAll, Invert, MergeDown, Apply,
+  ApplyAll,
+};
+
+// A layer's settings, without its offsets. == compares the strength's bits.
+struct LayerMeta {
+  std::uint32_t id = 0;
+  std::string name;
+  float strength = 1.0f;
+  bool visible = true;
+  bool operator==(const LayerMeta& o) const;
+};
+
+// Everything about a layer stack except its arrays, on one side of a layer operation.
+struct LayerSide {
+  bool hasStack = false;
+  std::uint64_t epoch = 0;
+  std::uint32_t nextId = 1;
+  std::uint32_t active = 0;      // Restored, but never compared: selecting is not an edit.
+  std::vector<LayerMeta> layers;  // Bottom to top.
+  // Equal apart from `active`.
+  bool sameState(const LayerSide& o) const;
+};
+
+// An array the live stack does not have right now: a whole array (a layer that exists on the other
+// side only, or the other side's contents of an array both sides have), or a patch of values at
+// some vertices. Applying the entry swaps these with the live arrays, so the entry always holds
+// the side that is not live.
+struct HeldArray {
+  std::uint32_t id = 0;       // A layer id, or 0 for the base.
+  std::vector<Index> index;   // Empty: a whole array. Otherwise a patch at these vertices.
+  std::vector<Vec3> values;
+};
+
+// One layer operation on one object (or the active level of one, see `level`).
+struct LayerUndo {
+  std::string label;
+  std::uint32_t objectId = 0;
+  std::uint64_t topologyVersion = 0;
+  int level = -1;  // Active subdivision level when recorded; -1 for an object without levels.
+  LayerOp op = LayerOp::Add;
+  LayerSide before, after;
+  std::vector<HeldArray> held;
+  // Positions to recompose after a swap: where these layers (in live or held arrays) or the
+  // patches are not zero. Empty when the composite does not change.
+  std::vector<std::uint32_t> recomposeIds;
+  bool recompose = false;
+  // Subdivision levels: reference positions the operation moved along with a rounding-only change
+  // of the composite (see rebaseReference), ascending.
+  std::vector<Index> refIndex;
+  std::vector<Vec3> refBefore, refAfter;
+  std::size_t bytes() const;
+};
+
 struct SyncWorkspace;
+struct LayerWorkspace;
 
 class UndoStack {
  public:
@@ -120,12 +177,17 @@ class UndoStack {
   // one entry (a step that ends where the first began disappears), so browsing levels does not
   // flood the history.
   void push(MultiresUndo entry);
+  // Adds a layer entry. Eye toggles (visibility, solo, show or hide all) that follow each other
+  // on the same object merge into one entry, which disappears when the run ends where it began.
+  void push(LayerUndo entry);
 
   // Scratch memory for dynamic topology undo, shared with the sculptor so only one exists.
   // Without one the stack makes its own on first use.
   void setLayoutWorkspace(std::shared_ptr<LayoutWorkspace> workspace) { workspace_ = std::move(workspace); }
   // Scratch memory for multires syncs, shared with the app's level commands.
   void setSyncWorkspace(std::shared_ptr<SyncWorkspace> workspace) { syncWorkspace_ = std::move(workspace); }
+  // Scratch memory for layer operations, shared with the app.
+  void setLayerWorkspace(std::shared_ptr<LayerWorkspace> workspace) { layerWorkspace_ = std::move(workspace); }
 
   // Return the label of what was undone or redone, or empty when nothing applied.
   std::string undo(Scene& scene);
@@ -138,13 +200,14 @@ class UndoStack {
   void clear();
 
  private:
-  using Entry = std::variant<SculptUndo, TopologyUndo, DyntopoUndo, MultiresUndo>;
+  using Entry = std::variant<SculptUndo, TopologyUndo, DyntopoUndo, MultiresUndo, LayerUndo>;
   void pushEntry(Entry entry);
   static std::size_t bytesOf(const Entry& e);
   static bool apply(Scene& scene, const SculptUndo& entry, const std::vector<LeafState>& states);
   static bool apply(Scene& scene, const TopologyUndo& entry, const MeshState& from, const MeshState& to);
   bool apply(Scene& scene, DyntopoUndo& entry, bool redo);
   bool apply(Scene& scene, MultiresUndo& entry, bool redo);
+  bool apply(Scene& scene, LayerUndo& entry, bool redo);
   // Drops the oldest undoable entries while over budget.
   void trim();
 
@@ -154,6 +217,7 @@ class UndoStack {
   std::size_t maxBytes_;
   std::shared_ptr<LayoutWorkspace> workspace_;
   std::shared_ptr<SyncWorkspace> syncWorkspace_;
+  std::shared_ptr<LayerWorkspace> layerWorkspace_;
 };
 
 }  // namespace plegl

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cmath>
 #include <cstdint>
 #include <span>
 #include <string>
@@ -22,6 +23,13 @@ inline constexpr Vec3 kDeadPosition{1e18f, 1e18f, 1e18f};
 inline constexpr std::int32_t kDefaultFaceSet = 1;
 inline constexpr std::int32_t kMaxFaceSetId = INT32_MAX - 1;
 inline std::int32_t faceSetId(std::int32_t value) { return value < 0 ? -value : value; }
+
+// A vertex normal from its summed face normals: normalized, or (0, 0, 1) when the sum is zero.
+// Every routine that writes vertex normals ends with this, so equal sums give equal bits.
+inline Vec3 safeNormalize(const Vec3& n) {
+  const float len2 = glm::dot(n, n);
+  return len2 > 1e-30f ? n / std::sqrt(len2) : Vec3{0.0f, 0.0f, 1.0f};
+}
 inline bool faceSetHidden(std::int32_t value) { return value < 0; }
 // True for a value that may be stored: a set id in [1, kMaxFaceSetId], negated when hidden.
 inline bool validFaceSetValue(std::int32_t value) {

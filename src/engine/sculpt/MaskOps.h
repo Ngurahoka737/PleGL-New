@@ -21,4 +21,9 @@ const char* maskOpName(MaskOp op);
 // nothing if no value changed (for example Clear on an unmasked object).
 std::optional<SculptUndo> applyMaskOp(SceneObject& object, MaskOp op, int iterations = 1);
 
+// Finishes a whole-mesh mask edit: puts back `old` values on vertices used only by hidden faces,
+// marks the changed GPU ranges and returns an undo entry with the leaves whose mask changed, or
+// nothing if none did. `old` is the mask before the edit (same size as the current one).
+std::optional<SculptUndo> recordMaskEdit(SceneObject& object, const std::vector<float>& old, std::string label);
+
 }  // namespace plegl

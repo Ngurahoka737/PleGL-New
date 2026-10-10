@@ -1,8 +1,10 @@
 #include "sculpt/Undo.h"
 
 #include <algorithm>
+#include <cstring>
 
 #include "multires/MultiresOps.h"
+#include "sculpt/LayerOps.h"
 
 namespace plegl {
 
@@ -39,6 +41,24 @@ std::size_t MultiresUndo::bytes() const {
   return n;
 }
 
+bool LayerMeta::operator==(const LayerMeta& o) const {
+  return id == o.id && name == o.name && std::memcmp(&strength, &o.strength, sizeof strength) == 0 &&
+         visible == o.visible;
+}
+
+bool LayerSide::sameState(const LayerSide& o) const {
+  return hasStack == o.hasStack && epoch == o.epoch && nextId == o.nextId && layers == o.layers;
+}
+
+std::size_t LayerUndo::bytes() const {
+  std::size_t n = sizeof(LayerUndo) + label.size() + recomposeIds.size() * sizeof(std::uint32_t) +
+                  refIndex.size() * sizeof(Index) + (refBefore.size() + refAfter.size()) * sizeof(Vec3);
+  for (const LayerSide* side : {&before, &after})
+    for (const LayerMeta& l : side->layers) n += sizeof(LayerMeta) + l.name.size();
+  for (const HeldArray& h : held) n += sizeof(HeldArray) + h.index.size() * sizeof(Index) + h.values.size() * sizeof(Vec3);
+  return n;
+}
+
 std::size_t UndoStack::bytesOf(const Entry& e) {
   return std::visit([](const auto& x) { return x.bytes(); }, e);
 }
@@ -63,6 +83,34 @@ void UndoStack::push(MultiresUndo entry) {
         bytes_ -= bytesOf(entries_.back());
         entries_.pop_back();
         cursor_ = entries_.size();
+      }
+      return;
+    }
+  }
+  pushEntry(std::move(entry));
+}
+
+void UndoStack::push(LayerUndo entry) {
+  auto eye = [](LayerOp op) {
+    return op == LayerOp::Visibility || op == LayerOp::Solo || op == LayerOp::ShowAll || op == LayerOp::HideAll;
+  };
+  if (eye(entry.op) && entry.held.empty() && cursor_ == entries_.size() && !entries_.empty()) {
+    auto* top = std::get_if<LayerUndo>(&entries_.back());
+    if (top && eye(top->op) && top->held.empty() && top->objectId == entry.objectId && top->level == entry.level &&
+        top->topologyVersion == entry.topologyVersion && top->after.sameState(entry.before)) {
+      bytes_ -= bytesOf(entries_.back());
+      top->after = std::move(entry.after);
+      top->label = "Layer Visibility";
+      // The positions to recompose are those of every layer whose eye changed in the run.
+      for (std::uint32_t id : entry.recomposeIds)
+        if (std::find(top->recomposeIds.begin(), top->recomposeIds.end(), id) == top->recomposeIds.end())
+          top->recomposeIds.push_back(id);
+      top->recompose = !top->recomposeIds.empty();
+      if (top->before.sameState(top->after)) {
+        entries_.pop_back();
+        cursor_ = entries_.size();
+      } else {
+        bytes_ += bytesOf(entries_.back());
       }
       return;
     }
@@ -203,6 +251,15 @@ bool UndoStack::apply(Scene& scene, DyntopoUndo& entry, bool redo) {
   return true;
 }
 
+bool UndoStack::apply(Scene& scene, LayerUndo& entry, bool redo) {
+  if (!layerWorkspace_) layerWorkspace_ = std::make_shared<LayerWorkspace>();
+  // Arrays move between the object and the entry, so its size changes.
+  const std::size_t before = entry.bytes();
+  if (!applyLayerUndo(scene, entry, redo, *layerWorkspace_)) return false;
+  bytes_ = bytes_ - before + entry.bytes();
+  return true;
+}
+
 bool UndoStack::apply(Scene& scene, MultiresUndo& entry, bool redo) {
   if (!syncWorkspace_) syncWorkspace_ = std::make_shared<SyncWorkspace>();
   // Held levels move in and out of the entry, so its size changes.
@@ -230,6 +287,8 @@ std::string UndoStack::undo(Scene& scene) {
       // No trim: levels an undo or redo moves into the entry were in the object a moment ago, so
       // memory did not grow, and trimming would throw away older history to pay for redo data.
       if (apply(scene, *m, false)) return m->label;
+    } else if (auto* l = std::get_if<LayerUndo>(&entry)) {
+      if (apply(scene, *l, false)) return l->label;
     }
   }
   return {};
@@ -246,6 +305,8 @@ std::string UndoStack::redo(Scene& scene) {
       if (apply(scene, *d, true)) return d->label;
     } else if (auto* m = std::get_if<MultiresUndo>(&entry)) {
       if (apply(scene, *m, true)) return m->label;
+    } else if (auto* l = std::get_if<LayerUndo>(&entry)) {
+      if (apply(scene, *l, true)) return l->label;
     }
   }
   return {};

@@ -74,11 +74,6 @@ Aabb Mesh::bounds() const {
   return b;
 }
 
-static Vec3 safeNormalize(const Vec3& n) {
-  const float len2 = glm::dot(n, n);
-  return len2 > 1e-30f ? n / std::sqrt(len2) : Vec3{0.0f, 0.0f, 1.0f};
-}
-
 Vec3 Mesh::vertexNormal(Index v) const {
   Vec3 n{0.0f};
   forEachOutgoing(v, [&](Index h) { n += faceAreaNormal(heFace[h]); });
