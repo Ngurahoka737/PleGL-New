@@ -457,6 +457,91 @@ TEST_CASE("layers: undo restores every normal on a coarse mesh with small leaves
   requireSnap(obj, after);
 }
 
+namespace {
+// Two n x n quad grids that touch at one corner: a vertex whose faces form two fans.
+Mesh makeBowtie(int n) {
+  std::vector<Vec3> p{{0, 0, 0}};
+  std::vector<Index> idx, sizes;
+  for (float s : {1.0f, -1.0f}) {
+    std::vector<Index> id(static_cast<std::size_t>((n + 1) * (n + 1)), 0);
+    for (int j = 0; j <= n; ++j)
+      for (int i = 0; i <= n; ++i) {
+        if (i == 0 && j == 0) continue;  // The shared corner.
+        id[static_cast<std::size_t>(j * (n + 1) + i)] = static_cast<Index>(p.size());
+        p.push_back({s * static_cast<float>(i) * 0.2f, s * static_cast<float>(j) * 0.2f, 0.0f});
+      }
+    auto at = [&](int i, int j) { return id[static_cast<std::size_t>(j * (n + 1) + i)]; };
+    for (int j = 0; j < n; ++j)
+      for (int i = 0; i < n; ++i) {
+        idx.insert(idx.end(), {at(i, j), at(i + 1, j), at(i + 1, j + 1), at(i, j + 1)});
+        sizes.push_back(4);
+      }
+  }
+  BuildReport report;
+  Mesh m = buildMesh(std::move(p), idx, sizes, &report);
+  REQUIRE(report.nonManifoldVertices == 1);
+  m.computeNormals();
+  return m;
+}
+}  // namespace
+
+TEST_CASE("layers: a non-manifold vertex gets every face around it updated") {
+  // Moving the shared corner changes faces in both fans: all of their normals and leaf bounds must
+  // follow, after layer operations, their undo, and strokes on a layer.
+  Scene scene;
+  SceneObject& obj = scene.add("A", makeBowtie(6));
+  obj.bvh.build(obj.mesh, Bvh::Params{4});
+  obj.topologyVersion = nextTopologyVersion();
+  LayerWorkspace ws;
+  std::string error;
+  UndoStack undo;
+  REQUIRE(addLayer(obj, ws, &error));
+  const std::uint32_t id = obj.mesh.layers.active;
+  REQUIRE(setLayerVisible(obj, id, false, ws, &error));  // Not on the stack: eye steps in a row merge.
+  Index corner = kInvalid;
+  for (Index v = 0; v < obj.mesh.vertexCount(); ++v)
+    if (obj.mesh.positions[v] == Vec3{0.0f}) corner = v;
+  REQUIRE(corner != kInvalid);
+  obj.mesh.layers.find(id)->offset[corner] = Vec3{0.0f, 0.0f, 0.3f};
+  auto show = setLayerVisible(obj, id, true, ws, &error);
+  REQUIRE(show);
+  requireLayers(obj.mesh);
+  requireFreshBounds(obj);
+  undo.push(std::move(*show));
+  CHECK_FALSE(undo.undo(scene).empty());
+  requireLayers(obj.mesh);
+  requireFreshBounds(obj);
+  CHECK_FALSE(undo.redo(scene).empty());
+  requireLayers(obj.mesh);
+  requireFreshBounds(obj);
+
+  // A stroke over the corner on a layer whose strength rounds, so the commit recomposes it.
+  REQUIRE(setLayerStrength(obj, id, 0.7f, ws, &error));
+  Sculptor sculptor;
+  DrawBrush draw;
+  StrokeOptions o = onLayer(obj.mesh);
+  for (const Vec3 c : {Vec3{0.05f, 0.05f, 0.3f}, Vec3{-0.05f, -0.05f, 0.3f}}) {
+    REQUIRE(stroke(sculptor, obj, draw, o, {c, c}, 0.5f, 1.0f));
+    requireLayers(obj.mesh);
+    requireFreshBounds(obj);
+  }
+}
+
+TEST_CASE("layers: a smooth dab on a coarse mesh keeps every normal") {
+  // The neighbour mean of a pole vertex lies far away on a coarse sphere; unclamped, the vertex
+  // left the reach the sculptor recomputes normals in.
+  Scene scene;
+  SceneObject& obj = scene.add("A", makeUvSphere(10, 6));
+  LayerWorkspace ws;
+  std::string error;
+  REQUIRE(addLayer(obj, ws, &error));
+  Sculptor sculptor;
+  SmoothBrush smooth;
+  REQUIRE(stroke(sculptor, obj, smooth, onLayer(obj.mesh), {Vec3{0.866f, 0.5f, 0.0f}}, 0.11f, 1.0f));
+  requireLayers(obj.mesh);
+  requireFreshBounds(obj);
+}
+
 TEST_CASE("layers: Erase Layer fades the layer and nothing else") {
   float strength = 1.0f;
   SUBCASE("full strength") {}

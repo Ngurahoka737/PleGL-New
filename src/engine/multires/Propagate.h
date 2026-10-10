@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <span>
+#include <utility>
 #include <vector>
 
 #include "multires/Multires.h"
@@ -153,6 +155,32 @@ void forEachFaceAround(const Mesh& m, const MultiresLevel& level, Index v, Fn&& 
 
 // For every non-manifold vertex, all of its outgoing half-edges, sorted (MultiresLevel::nonManifoldFaces).
 std::vector<std::pair<Index, Index>> findNonManifoldFans(const Mesh& mesh);
+
+// findNonManifoldFans of a mesh whose topology changes only with its topology version, kept for
+// that version.
+struct FanCache {
+  std::vector<std::pair<Index, Index>> fans;
+  std::uint64_t version = 0;
+  std::size_t bytes() const { return fans.capacity() * sizeof(std::pair<Index, Index>); }
+};
+
+// Calls fn(f) for every face f around vertex v, with `fans` from findNonManifoldFans(m): unlike
+// Mesh::forEachOutgoing this also reaches the other fans of a non-manifold vertex.
+template <class Fn>
+void forEachFaceAt(const Mesh& m, std::span<const std::pair<Index, Index>> fans, Index v, Fn&& fn) {
+  if (!fans.empty()) {
+    const auto range = std::equal_range(fans.begin(), fans.end(), std::pair<Index, Index>{v, kInvalid},
+                                        [](const auto& x, const auto& y) { return x.first < y.first; });
+    if (range.first != range.second) {
+      for (auto it = range.first; it != range.second; ++it)
+        if (m.heFace[it->second] != kInvalid) fn(m.heFace[it->second]);
+      return;
+    }
+  }
+  m.forEachOutgoing(v, [&](Index h) {
+    if (m.heFace[h] != kInvalid) fn(m.heFace[h]);
+  });
+}
 
 // Pending edits of the active level: every value where `live` differs bitwise from the reference.
 SyncDelta diffActive(const Multires& stack, const Mesh& live);

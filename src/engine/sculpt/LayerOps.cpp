@@ -56,7 +56,16 @@ std::size_t LayerWorkspace::bytes() const {
   return (support.capacity() + changed.capacity() + ring.capacity() + leaves.capacity() + faces.capacity()) *
              sizeof(Index) +
          (next.capacity() + oldP.capacity() + faceN.capacity()) * sizeof(Vec3) +
-         (faceMark.mark.capacity() + vertMark.mark.capacity()) * sizeof(std::uint32_t);
+         (faceMark.mark.capacity() + vertMark.mark.capacity()) * sizeof(std::uint32_t) + fans.bytes();
+}
+
+std::span<const std::pair<Index, Index>> nonManifoldFans(const SceneObject& object, FanCache& cache) {
+  if (object.multires) return object.multires->levels[static_cast<std::size_t>(object.multires->active)].nonManifoldFaces;
+  if (cache.version != object.topologyVersion) {
+    cache.fans = findNonManifoldFans(object.mesh);
+    cache.version = object.topologyVersion;
+  }
+  return cache.fans;
 }
 
 namespace {
@@ -252,15 +261,15 @@ void finishPositions(SceneObject& object, std::span<const Index> changed, LayerW
   // Vertices sharing a face with a changed one get new normals; the leaves of those faces new
   // bounds. Leaf lookups start from the last leaf found, which neighbours almost always share.
   const std::span<const BvhLeaf> leafList = bvh.leaves();
+  const std::span<const std::pair<Index, Index>> fans = nonManifoldFans(object, ws.fans);
   ws.vertMark.begin(nv);
   ws.faceMark.begin(m.faceHe.size());
   ws.ring.clear();
   ws.leaves.clear();
   Index faceLeaf = kInvalid;
   for (Index v : changed) {
-    m.forEachOutgoing(v, [&](Index h) {
-      const Index f = m.heFace[h];
-      if (f == kInvalid || !ws.faceMark.insert(f)) return;
+    forEachFaceAt(m, fans, v, [&](Index f) {
+      if (!ws.faceMark.insert(f)) return;
       if (refit && (faceLeaf == kInvalid || f < leafList[faceLeaf].faceBegin || f >= leafList[faceLeaf].faceEnd)) {
         faceLeaf = bvh.leafOfFace(f);
         if (faceLeaf != kInvalid) ws.leaves.push_back(faceLeaf);

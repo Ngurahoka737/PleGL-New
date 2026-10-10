@@ -6,6 +6,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "multires/Propagate.h"
 #include "sculpt/Brush.h"
 #include "sculpt/Dyntopo.h"
 #include "sculpt/Undo.h"
@@ -147,6 +148,7 @@ class Sculptor {
   LayerTarget layerTarget_;
   std::vector<std::vector<Index>> layerChanged_;  // Per snapshot: vertices the commit recomposed.
   std::vector<std::vector<Index>> layerRing_, layerLeaves_;  // Per snapshot: their face rings and leaves.
+  FanCache fans_;  // Non-manifold fans of the object's mesh, for the commit's face rings.
   SculptUndo undo_;
   std::unordered_map<Index, std::size_t> snapshotIndex_;  // leaf -> index in undo_.before
   std::vector<std::uint32_t> vertexStamp_;

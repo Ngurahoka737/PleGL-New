@@ -91,6 +91,10 @@ void SmoothBrush::apply(BrushContext& ctx) const {
   Mesh& m = ctx.mesh;
   const float r2 = d.radius * d.radius;
   const float invR = 1.0f / d.radius;
+  // Clamped like every brush: on a coarse mesh the neighbour mean can lie farther than the reach
+  // the sculptor recomputes normals in.
+  const float maxMove = d.radius * kMaxDabMove;
+  const float maxMove2 = maxMove * maxMove;
   const float* mask = m.mask.empty() ? nullptr : m.mask.data();
   // Smoothing reads neighbours, so compute every new position first and write them afterwards.
   std::vector<std::vector<std::pair<Index, Vec3>>> results(ctx.leaves.size());
@@ -107,7 +111,12 @@ void SmoothBrush::apply(BrushContext& ctx) const {
         if (w <= 0.0f) continue;
         neighbourMean<Vec3>(
             m, v, [&](Index u) { return m.positions[u]; },
-            [&](const Vec3& target) { out.emplace_back(v, p + (target - p) * w); });
+            [&](const Vec3& target) {
+              Vec3 move = (target - p) * w;
+              const float len2 = glm::dot(move, move);
+              if (len2 > maxMove2) move *= maxMove / std::sqrt(len2);
+              out.emplace_back(v, p + move);
+            });
       }
     }
   });

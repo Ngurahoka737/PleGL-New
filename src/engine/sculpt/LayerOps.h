@@ -50,11 +50,17 @@ struct LayerWorkspace {
   std::vector<Vec3> oldP;  // Old positions, parallel to `changed`.
   std::vector<Vec3> faceN;
   SyncStamps faceMark, vertMark;
+  FanCache fans;
   std::size_t bytes() const;
   void release() { *this = LayerWorkspace{}; }
 };
 
 enum class NormalsMode : std::uint8_t { Now, Defer };
+
+// The outgoing half-edges of every non-manifold vertex of the object's live mesh (see
+// findNonManifoldFans, and forEachFaceAt for walking them): its level's list, or computed once per
+// topology version into `cache`.
+std::span<const std::pair<Index, Index>> nonManifoldFans(const SceneObject& object, FanCache& cache);
 
 // Sets positions[v] to the composite for every v in `verts` (ascending, no repeats, not one of
 // the workspace's own lists). The vertices whose bits changed end up in ws.changed (old positions

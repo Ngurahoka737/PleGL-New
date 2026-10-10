@@ -515,6 +515,7 @@ void Sculptor::commitLayerStroke() {
   }
   const std::uint32_t stamp = stamp_;
   const std::span<const BvhLeaf> leafList = bvh.leaves();
+  const std::span<const std::pair<Index, Index>> fans = nonManifoldFans(*object_, fans_);
   const std::size_t snapshots = undo_.before.size();
   layerChanged_.resize(snapshots);
   layerRing_.resize(snapshots);
@@ -561,9 +562,7 @@ void Sculptor::commitLayerStroke() {
       faceLeaves.clear();
       Index faceLeaf = kInvalid;
       for (Index v : changed) {
-        m.forEachOutgoing(v, [&](Index h) {
-          const Index f = m.heFace[h];
-          if (f == kInvalid) return;
+        forEachFaceAt(m, fans, v, [&](Index f) {
           if (faceLeaf == kInvalid || f < leafList[faceLeaf].faceBegin || f >= leafList[faceLeaf].faceEnd) {
             faceLeaf = bvh.leafOfFace(f);
             if (faceLeaf != kInvalid) faceLeaves.push_back(faceLeaf);
