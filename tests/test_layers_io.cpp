@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "TestUtil.h"
+#include "io/Obj.h"
 #include "io/Project.h"
 #include "mesh/Primitives.h"
 #include "multires/MultiresIo.h"
@@ -600,4 +601,19 @@ TEST_CASE("layer files: a draft keeps what it captured while the scene changes")
   REQUIRE(addLayer(leveled, ws, &error));
   stroke(leveled, {0, 0, 1});
   CHECK(finishProject(std::move(draft)) == expected);
+}
+
+TEST_CASE("layer files: OBJ export writes the shape you see") {
+  Scene scene;
+  LayerWorkspace ws;
+  SceneObject& obj = scene.add("Head", makeIcosphere(3));
+  sculptLayer(obj, ws, {0, 1, 0}, 0.6f);
+  sculptLayer(obj, ws, {1, 0, 0});
+  std::string error;
+  REQUIRE(setLayerVisible(obj, obj.mesh.layers.list[1].id, false, ws, &error));
+  const std::string text = writeObj(obj.mesh);
+  CHECK(text == writeObj(copyWithoutLayers(obj.mesh)));
+  Mesh plain = obj.mesh;
+  plain.positions = obj.mesh.layers.base;
+  CHECK(text != writeObj(copyWithoutLayers(plain)));
 }

@@ -5,6 +5,7 @@
 
 #include "TestUtil.h"
 #include "mesh/Primitives.h"
+#include "multires/MultiresOps.h"
 #include "scene/Scene.h"
 #include "sculpt/LayerOps.h"
 #include "sculpt/Sculptor.h"
@@ -429,4 +430,163 @@ TEST_CASE("layer ops: duplicated objects get layer stacks of their own") {
   REQUIRE(setLayerStrength(*copy, copy->mesh.layers.list[0].id, 0.2f, f.ws, &f.error));
   REQUIRE(deleteLayer(*copy, copy->mesh.layers.list[1].id, f.ws, &f.error));
   requireState(*f.obj, original);
+}
+
+namespace {
+
+// Every level's values (or the object's, without levels), to compare whole objects bit for bit.
+struct ObjectState {
+  int active = -1;
+  std::vector<State> levels;
+};
+
+ObjectState captureAll(const SceneObject& obj) {
+  ObjectState s;
+  if (!obj.multires) {
+    s.levels.push_back(capture(obj));
+    return s;
+  }
+  s.active = obj.multires->active;
+  for (int k = 0; k < obj.multires->levelCount(); ++k) {
+    const Mesh& m = k == s.active ? obj.mesh : obj.multires->levels[static_cast<std::size_t>(k)].mesh;
+    s.levels.push_back({m.positions, m.normals, m.mask, m.layers, {}});
+  }
+  return s;
+}
+
+void requireSameObject(const ObjectState& a, const ObjectState& b) {
+  CHECK(a.active == b.active);
+  REQUIRE(a.levels.size() == b.levels.size());
+  for (std::size_t k = 0; k < a.levels.size(); ++k) {
+    INFO("level " << k);
+    const State &x = a.levels[k], &y = b.levels[k];
+    CHECK(bitwise(x.positions, y.positions));
+    CHECK(bitwise(x.normals, y.normals));
+    // An undone mask edit may leave an all-zero mask where there was none; both mean unmasked.
+    auto expanded = [](const State& st) {
+      return st.mask.empty() ? std::vector<float>(st.positions.size(), 0.0f) : st.mask;
+    };
+    CHECK(expanded(x) == expanded(y));
+    CHECK(x.layers.list.size() == y.layers.list.size());
+    CHECK(bitwise(x.layers.base, y.layers.base));
+  }
+}
+
+}  // namespace
+
+TEST_CASE("layer fuzz: strokes, operations, drags, level steps, undo and redo stay consistent") {
+  for (int levels : {0, 3}) {
+    INFO("levels " << levels);
+    Scene scene;
+    SyncWorkspace sws;
+    LayerWorkspace ws;
+    UndoStack stack;
+    // About 20K vertices on the sculpted level either way.
+    SceneObject& obj = scene.add("Fuzz", makeQuadSphere(levels ? 7 : 58));
+    for (int i = 0; i < levels; ++i) REQUIRE(subdivideObject(obj, sws));
+    const ObjectState initial = captureAll(obj);
+    std::mt19937 rng(levels ? 4242u : 77u);
+    auto pick = [&](int n) { return static_cast<int>(rng() % static_cast<unsigned>(n)); };
+    auto uniform = [&](float lo, float hi) { return std::uniform_real_distribution<float>(lo, hi)(rng); };
+    auto randomLayer = [&]() -> std::uint32_t {
+      const LayerStack& s = obj.mesh.layers;
+      return s.empty() ? 0 : s.list[static_cast<std::size_t>(pick(static_cast<int>(s.list.size())))].id;
+    };
+    std::string error;
+    auto push = [&](auto entry) {
+      if (entry) stack.push(std::move(*entry));
+    };
+    static DrawBrush draw;
+    static SmoothBrush smooth;
+    static EraseLayerBrush erase;
+    int strokes = 0, ops = 0, undos = 0;
+    for (int step = 0; step < 300; ++step) {
+      INFO("step " << step);
+      const int kind = pick(levels ? 16 : 15);
+      const std::uint32_t id = randomLayer();
+      switch (kind) {
+        case 0:
+        case 1:
+        case 2: {  // A stroke on a random target with a random brush.
+          if (pick(3) == 0) selectLayer(obj, pick(4) == 0 ? 0 : id);
+          StrokeOptions o;
+          o.layerTarget = obj.mesh.layers.active;
+          o.smoothLayerOnly = pick(2) == 0;
+          o.symmetryX = pick(2) == 0;
+          const int b = pick(4);
+          const Brush* brush = b == 0 ? nullptr : b == 1 ? static_cast<const Brush*>(&smooth)
+                                     : b == 2 ? static_cast<const Brush*>(&erase) : &draw;
+          if (!layerTargetRefusal(obj, brush, o.layerTarget).empty()) break;
+          const Vec3 dir{uniform(-1, 1), uniform(-1, 1), uniform(-1, 1)};
+          if (glm::length(dir) < 0.1f) break;
+          const Vec3 c = surfacePoint(obj, dir);
+          Sculptor sculptor;
+          if (brush) {
+            sculptor.beginStroke(obj, *brush, o, brush->name());
+            for (int i = 0; i < 3; ++i) sculptor.dab(c + Vec3{0.03f * i, 0, 0}, uniform(0.1f, 0.4f), uniform(0.2f, 1));
+          } else {
+            if (!sculptor.beginGrab(obj, o, c, uniform(0.2f, 0.5f), "Grab")) break;
+            sculptor.grab(Vec3{uniform(-0.1f, 0.1f), uniform(-0.1f, 0.1f), uniform(-0.1f, 0.1f)});
+          }
+          auto entry = sculptor.endStroke();
+          if (entry) stack.push(std::move(*entry));
+          ++strokes;
+          break;
+        }
+        case 3: push(addLayer(obj, ws, &error)); ++ops; break;
+        case 4: if (id) push(duplicateLayer(obj, id, ws, &error)); ++ops; break;
+        case 5: if (id) push(deleteLayer(obj, id, ws, &error)); ++ops; break;
+        case 6: if (id) push(setLayerVisible(obj, id, pick(2) == 0, ws, &error)); ++ops; break;
+        case 7: if (id) push(setLayerStrength(obj, id, uniform(-2, 2), ws, &error)); ++ops; break;
+        case 8:
+          if (id) push(pick(2) == 0 ? soloLayer(obj, id, ws, &error) : setAllLayersVisible(obj, pick(2) == 0, ws, &error));
+          ++ops;
+          break;
+        case 9: if (id) push(pick(2) == 0 ? invertLayer(obj, id, ws, &error) : renameLayer(obj, id, "R", &error)); ++ops; break;
+        case 10: if (id) push(mergeLayerDown(obj, id, ws, &error)); ++ops; break;
+        case 11:
+          if (id) push(pick(4) == 0 ? applyAllLayers(obj, ws, &error) : applyLayer(obj, id, ws, &error));
+          ++ops;
+          break;
+        case 12:
+          if (id) {
+            if (pick(2) == 0) {
+              push(maskFromLayer(obj, id, &error));
+            } else {  // A drag, live or with normals left for the end.
+              StrengthDrag drag;
+              if (drag.begin(obj, id, ws, &error, pick(2) == 0 ? kLiveNormalsLimit : 10)) {
+                for (int i = 0; i < 3; ++i) drag.update(uniform(-1.5f, 1.5f));
+                if (pick(5) == 0)
+                  drag.cancel();
+                else
+                  push(drag.end());
+              }
+            }
+          }
+          ++ops;
+          break;
+        case 13: stack.undo(scene); ++undos; break;
+        case 14: stack.redo(scene); break;
+        case 15: push(setActiveLevel(obj, pick(levels + 1), sws)); break;
+      }
+      {
+        const ValidationResult r = validateLayers(obj.mesh, true);
+        INFO(r.message);
+        REQUIRE(r.ok);
+      }
+      if (obj.multires) {
+        const ValidationResult r = validateMultires(obj);
+        INFO(r.message);
+        REQUIRE(r.ok);
+      }
+    }
+    CHECK(strokes > 30);
+    CHECK(ops > 100);
+    CHECK(undos > 10);
+    // Everything undoes back to the start, bit for bit.
+    while (!stack.undo(scene).empty()) {
+    }
+    requireSameObject(captureAll(obj), initial);
+    CHECK(obj.mesh.layers.empty());
+  }
 }

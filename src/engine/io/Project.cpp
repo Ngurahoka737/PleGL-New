@@ -94,7 +94,7 @@ class Reader {
   bool getArray(std::vector<T>& out, std::size_t count) {
     if (count > remaining() / sizeof(T)) return fail();
     out.resize(count);
-    std::memcpy(out.data(), p_, count * sizeof(T));
+    if (count) std::memcpy(out.data(), p_, count * sizeof(T));  // An empty vector's data() may be null.
     p_ += count * sizeof(T);
     return true;
   }

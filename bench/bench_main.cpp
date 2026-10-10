@@ -17,6 +17,7 @@
 #include "scene/Scene.h"
 #include "remesh/QuadRemesh.h"
 #include "remesh/VoxelRemesh.h"
+#include "sculpt/LayerOps.h"
 #include "sculpt/MaskOps.h"
 #include "sculpt/Sculptor.h"
 #include "spatial/Bvh.h"
@@ -286,6 +287,124 @@ int main(int argc, char** argv) {
                   runMs, finishMs, switchMs, dabMs / std::max(dabs, 1), downMs, upMs, saveMs, openMs,
                   static_cast<double>(obj.multires->bytes()) / (1024.0 * 1024.0));
     }
+  }
+
+  // Sculpt layers: dabs that write a layer directly, the commit that folds a stroke into its
+  // layer at the end, strength drag frames (a layer touching about 10 % of the mesh, and a dense
+  // one), whole-layer operations, and saving and opening with four layers.
+  std::printf("\nSculpt layer benchmark (4 layers)\n\n");
+  std::printf("%10s %9s %9s %9s %8s %9s %9s %9s %8s %8s %8s %8s %8s %8s %9s %8s\n", "vertices", "erase dab",
+              "lsmooth", "commit", "moved K", "drag 10%", "drag all", "release", "visib.", "merge", "apply",
+              "all", "draft", "finish", "crc MB/s", "open");
+  for (int res : quick ? std::vector<int>{129} : std::vector<int>{289, 408}) {
+    Scene scene;
+    SceneObject& obj = scene.add("Head", makeQuadSphere(res));
+    LayerWorkspace lws;
+    std::string error;
+    DrawBrush draw;
+    auto surface = [&](Vec3 dir) {
+      dir = glm::normalize(dir);
+      RayHit hit;
+      obj.bvh.raycast(obj.mesh, Ray{dir * 3.0f, -dir}, hit);
+      return hit.position;
+    };
+    auto strokeOn = [&](const Brush& brush, Vec3 dir, float radius, int dabs, bool layerOnly, double* avgMs) {
+      Sculptor sculptor;
+      StrokeOptions o;
+      o.strength = 0.5f;
+      o.layerTarget = obj.mesh.layers.active;
+      o.smoothLayerOnly = layerOnly;
+      sculptor.beginStroke(obj, brush, o, "Bench");
+      double total = 0.0;
+      for (int i = 0; i < dabs; ++i) {
+        const float a = -0.4f + 0.8f * static_cast<float>(i) / static_cast<float>(std::max(dabs - 1, 1));
+        sculptor.dab(surface(dir + Vec3{std::sin(a), 0.0f, 0.0f}), radius, 0.5f);
+        total += sculptor.lastDab().totalMs;
+      }
+      if (avgMs) *avgMs = total / std::max(dabs, 1);
+      Timer t;
+      sculptor.endStroke();
+      return t.ms();
+    };
+    // Four layers with detail on different parts.
+    const Vec3 dirs[4] = {{0, 1, 0.3f}, {1, 0.2f, 0}, {0, 0.3f, 1}, {-1, 0.5f, 0.2f}};
+    for (const Vec3& d : dirs) {
+      addLayer(obj, lws, &error);
+      strokeOn(draw, d, 0.3f, 40, false, nullptr);
+    }
+    // Dabs on the top layer.
+    double eraseMs = 0.0, smoothMs = 0.0;
+    EraseLayerBrush erase;
+    SmoothBrush smooth;
+    strokeOn(erase, dirs[3], 0.15f, 100, false, &eraseMs);
+    strokeOn(smooth, dirs[3], 0.15f, 100, true, &smoothMs);
+    // The end of a wide stroke on a layer: about a fifth of the sphere moves.
+    const std::vector<Vec3> before = obj.mesh.positions;
+    const double commitMs = strokeOn(draw, {0.3f, 1, 0.5f}, 0.9f, 20, false, nullptr);
+    std::size_t moved = 0;
+    for (std::size_t v = 0; v < before.size(); ++v) moved += !sameBits(before[v], obj.mesh.positions[v]);
+    // Strength drags: 20 frames each, then the release.
+    auto drag = [&](std::uint32_t id, double* releaseMs) {
+      StrengthDrag d;
+      if (!d.begin(obj, id, lws, &error)) return -1.0;
+      double total = 0.0;
+      for (int i = 0; i < 20; ++i) {
+        Timer t;
+        d.update(i % 2 ? 0.3f : 0.8f);
+        total += t.ms();
+      }
+      Timer t;
+      d.end();
+      if (releaseMs) *releaseMs = t.ms();
+      return total / 20.0;
+    };
+    const double dragSparse = drag(obj.mesh.layers.list[1].id, nullptr);
+    // A dense layer: every vertex moves a little.
+    addLayer(obj, lws, &error);
+    {
+      SculptLayer& l = obj.mesh.layers.list.back();
+      for (std::size_t v = 0; v < l.offset.size(); ++v) l.offset[v] = obj.mesh.normals[v] * 0.002f;
+      for (std::size_t v = 0; v < l.offset.size(); ++v)
+        obj.mesh.positions[v] = composeVertex(obj.mesh.layers, static_cast<Index>(v));
+      obj.mesh.computeNormals();
+      obj.bvh.refit(obj.mesh);
+    }
+    const std::uint32_t dense = obj.mesh.layers.list.back().id;
+    double releaseMs = 0.0;
+    const double dragDense = drag(dense, &releaseMs);
+    Timer t;
+    setLayerVisible(obj, dense, false, lws, &error);
+    setLayerVisible(obj, dense, true, lws, &error);
+    const double visibilityMs = t.ms() * 0.5;
+    t.reset();
+    mergeLayerDown(obj, dense, lws, &error);
+    const double mergeMs = t.ms();
+    t.reset();
+    applyLayer(obj, obj.mesh.layers.list[0].id, lws, &error);
+    const double applyMs = t.ms();
+    // Saving and opening with four layers.
+    t.reset();
+    ProjectDraft draft = draftProject(scene, "");
+    const double draftMs = t.ms();
+    t.reset();
+    const std::vector<std::uint8_t> bytes = finishProject(std::move(draft));
+    const double finishMs = t.ms();
+    t.reset();
+    volatile std::uint32_t crc = crc32(bytes.data(), bytes.size());
+    (void)crc;
+    const double crcMbs = static_cast<double>(bytes.size()) / (1024.0 * 1024.0) / std::max(t.ms() / 1000.0, 1e-9);
+    t.reset();
+    std::optional<Project> project = parseProject(bytes.data(), bytes.size());
+    const bool opened = project && buildProject(*project) && project->warnings.empty() &&
+                        !project->objects[0].mesh.layers.empty();
+    const double openMs = t.ms();
+    if (!opened) std::printf("  reopening with layers failed\n");
+    t.reset();
+    applyAllLayers(obj, lws, &error);
+    const double allMs = t.ms();
+    std::printf("%10d %9.3f %9.3f %9.1f %8.0f %9.2f %9.2f %9.1f %8.1f %8.1f %8.1f %8.2f %8.1f %8.1f %9.0f %8.0f\n",
+                obj.mesh.vertexCount(), eraseMs, smoothMs, commitMs, static_cast<double>(moved) / 1000.0, dragSparse,
+                dragDense, releaseMs, visibilityMs, mergeMs, applyMs, allMs, draftMs, finishMs, crcMbs, openMs);
   }
 
   // Voxel remesh: whole pipeline (sign, narrow-band distance, Surface Nets, half-edge build) at
