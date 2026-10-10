@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstring>
 #include <map>
+#include <new>
 #include <sstream>
 #include <system_error>
 
@@ -190,6 +191,7 @@ std::string App::settingsText() const {
   w.put("mask.filter_steps", sculpt.maskFilterSteps);
   w.put("face_sets.automask", sculpt.faceSetAutoMask);
   w.put("face_sets.lock_borders", sculpt.lockFaceSetBorders);
+  w.put("layers.smooth_layer_only", sculpt.smoothLayerOnly);
   w.put("dyntopo.enabled", sculpt.dyntopo);
   w.put("dyntopo.refine", static_cast<int>(sculpt.dyntopoRefine));
   w.put("dyntopo.detail_mode", static_cast<int>(sculpt.detailMode));
@@ -244,6 +246,7 @@ void App::applySettings(const std::string& text) {
   r.get("mask.filter_steps", sculpt.maskFilterSteps);
   r.get("face_sets.automask", sculpt.faceSetAutoMask);
   r.get("face_sets.lock_borders", sculpt.lockFaceSetBorders);
+  r.get("layers.smooth_layer_only", sculpt.smoothLayerOnly);
   sculpt.maskFilterSteps = std::clamp(sculpt.maskFilterSteps, 1, 10);
   sculpt.radiusPx = std::clamp(sculpt.radiusPx, 2.0f, 2000.0f);
   sculpt.spacing = std::clamp(sculpt.spacing, 0.01f, 1.0f);
@@ -311,18 +314,21 @@ void App::saveProjectTo(const std::filesystem::path& requested, std::function<vo
     return;
   }
   if (sculptor_.active()) endStroke();
+  finishLayerStrengthDrag();
   std::filesystem::path path = requested;
   if (path.extension() != ".psculpt") path += ".psculpt";
   // Remember the path before serializing, so the file's own settings point at itself.
   const std::filesystem::path previousPath = projectPath_;
   projectPath_ = path;
-  auto bytes = std::make_shared<std::vector<std::uint8_t>>(serializeProject(scene, settingsText()));
+  // The draft copies the scene here; the worker encodes, checksums and writes it.
+  auto draft = std::make_shared<ProjectDraft>(draftProject(scene, settingsText()));
   projectPath_ = previousPath;
   const std::uint64_t fingerprint = sceneFingerprint();
   savingProject_ = true;
   statusMessage = "Saving " + pathToUtf8(path.filename()) + "...";
-  workers_.emplace_back([this, path, bytes, fingerprint, then = std::move(then)] {
+  workers_.emplace_back([this, path, draft, fingerprint, then = std::move(then)] {
     Timer t;
+    auto bytes = std::make_shared<std::vector<std::uint8_t>>(finishProject(std::move(*draft)));
     auto error = std::make_shared<std::string>();
     const bool ok = writeFileAtomic(path, *bytes, error.get());
     const double ms = t.ms();
@@ -364,9 +370,15 @@ void App::loadProjectAsync(const std::filesystem::path& path, bool recovered) {
   workers_.emplace_back([this, path, recovered] {
     Timer t;
     auto error = std::make_shared<std::string>();
-    auto project = std::make_shared<std::optional<Project>>(loadProject(path, error.get()));
-    // BVHs and subdivision levels; level data that does not fit refuses the whole file.
-    if (*project && !buildProject(**project, error.get())) project->reset();
+    auto project = std::make_shared<std::optional<Project>>();
+    try {
+      *project = loadProject(path, error.get());
+      // BVHs and subdivision levels; level data that does not fit refuses the whole file.
+      if (*project && !buildProject(**project, error.get())) project->reset();
+    } catch (const std::bad_alloc&) {
+      project->reset();
+      *error = "Not enough memory to open it.";
+    }
     const double ms = t.ms();
     std::lock_guard lock(asyncMutex_);
     asyncResults_.push_back([this, path, recovered, error, project, ms] {
@@ -375,16 +387,21 @@ void App::loadProjectAsync(const std::filesystem::path& path, bool recovered) {
         statusMessage = "Could not open " + pathToUtf8(path.filename()) + ": " + *error;
         return;
       }
+      const std::vector<std::string> warnings = std::move((**project).warnings);
       applyProject(std::move(**project), path, recovered);
       char buf[64];
       std::snprintf(buf, sizeof(buf), " in %.0f ms", ms);
       statusMessage += buf;
+      // What was left out while the project still opened.
+      if (!warnings.empty()) statusMessage += ".";
+      for (const std::string& w : warnings) statusMessage += " " + w;
     });
   });
 }
 
 void App::applyProject(Project project, const std::filesystem::path& path, bool recovered) {
   if (sculptor_.active()) endStroke();
+  finishLayerStrengthDrag();
   scene.clear();
   undoStack.clear();
   releaseSyncScratch();
@@ -494,16 +511,18 @@ void App::autosaveTick() {
   const std::uint64_t now = SDL_GetTicksNS();
   if (dataDir_.empty() || projectSettings.autosaveMinutes <= 0.0f || autosaveRunning_ || offerRecovery_) return;
   if (now - lastAutosaveNs_ < static_cast<std::uint64_t>(projectSettings.autosaveMinutes * 60.0e9)) return;
-  if (sculptor_.active()) return;  // Never in the middle of a stroke; retried next frame.
+  // Never in the middle of a stroke or a strength drag; retried next frame.
+  if (sculptor_.active() || strengthDrag_.active()) return;
   lastAutosaveNs_ = now;
   const std::uint64_t fingerprint = sceneFingerprint();
   if (fingerprint == savedFingerprint_ || fingerprint == autosavedFingerprint_) return;
   autosaveRunning_ = true;
-  auto bytes = std::make_shared<std::vector<std::uint8_t>>(serializeProject(scene, settingsText()));
+  auto draft = std::make_shared<ProjectDraft>(draftProject(scene, settingsText()));
   const std::filesystem::path path = dataDir_ / kAutosaveName;
-  workers_.emplace_back([this, path, bytes, fingerprint] {
+  workers_.emplace_back([this, path, draft, fingerprint] {
+    const std::vector<std::uint8_t> bytes = finishProject(std::move(*draft));
     auto error = std::make_shared<std::string>();
-    const bool ok = writeFileAtomic(path, *bytes, error.get());
+    const bool ok = writeFileAtomic(path, bytes, error.get());
     std::lock_guard lock(asyncMutex_);
     asyncResults_.push_back([this, ok, error, fingerprint] {
       autosaveRunning_ = false;

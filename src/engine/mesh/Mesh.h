@@ -1,11 +1,13 @@
 #pragma once
 
+#include <cmath>
 #include <cstdint>
 #include <span>
 #include <string>
 #include <vector>
 
 #include "core/Types.h"
+#include "mesh/LayerStack.h"
 
 namespace plegl {
 
@@ -21,6 +23,13 @@ inline constexpr Vec3 kDeadPosition{1e18f, 1e18f, 1e18f};
 inline constexpr std::int32_t kDefaultFaceSet = 1;
 inline constexpr std::int32_t kMaxFaceSetId = INT32_MAX - 1;
 inline std::int32_t faceSetId(std::int32_t value) { return value < 0 ? -value : value; }
+
+// A vertex normal from its summed face normals: normalized, or (0, 0, 1) when the sum is zero.
+// Every routine that writes vertex normals ends with this, so equal sums give equal bits.
+inline Vec3 safeNormalize(const Vec3& n) {
+  const float len2 = glm::dot(n, n);
+  return len2 > 1e-30f ? n / std::sqrt(len2) : Vec3{0.0f, 0.0f, 1.0f};
+}
 inline bool faceSetHidden(std::int32_t value) { return value < 0; }
 // True for a value that may be stored: a set id in [1, kMaxFaceSetId], negated when hidden.
 inline bool validFaceSetValue(std::int32_t value) {
@@ -56,6 +65,11 @@ class Mesh {
   // Face attribute: the face set value of every face (see kDefaultFaceSet), or empty when every
   // face is in the default set and visible. Topology builders leave it empty.
   std::vector<std::int32_t> faceSets;
+  // Sculpt layers (see mesh/LayerStack.h). While the stack is not empty, `positions` holds its
+  // composite and every vertex array of the stack has one value per vertex. Topology builders and
+  // copyWithoutLayers() leave it empty. A new vertex attribute must also be handled in reorder(),
+  // reserveHeadroom() and copyWithoutLayers().
+  LayerStack layers;
 
   // Topology.
   std::vector<Index> vertHe;  // One outgoing half-edge per vertex (kInvalid if isolated).
@@ -136,6 +150,8 @@ class Mesh {
   Vec3 vertexNormal(Index v) const;
   // Recomputes area-weighted vertex normals for every vertex (parallel).
   void computeNormals();
+  // The same, with the face normals in `faceScratch` (grown when smaller, kept for the next call).
+  void computeNormals(std::vector<Vec3>& faceScratch);
   // Recomputes normals for a contiguous range of vertices only.
   void computeNormals(Index vertBegin, Index vertEnd);
 
@@ -168,6 +184,10 @@ struct BuildReport {
 Mesh buildMesh(std::vector<Vec3> positions, std::span<const Index> faceIndices,
                std::span<const Index> faceSizes, BuildReport* report = nullptr);
 
+// A copy of every member except the sculpt layers: positions keep the composite. For copies handed
+// to workers that build new topology from what is on screen (remesh, subdivide, export).
+Mesh copyWithoutLayers(const Mesh& mesh);
+
 // Merges vertices closer than `epsilon` and rebuilds faces accordingly. Used by primitives that
 // are generated face-by-face and by importers of unwelded files.
 void weldVertices(std::vector<Vec3>& positions, std::vector<Index>& faceIndices, float epsilon);
@@ -183,6 +203,10 @@ ValidationResult validate(const Mesh& mesh);
 // faces with faceHe == kInvalid, half-edges with heFace == kInvalid and vertices without faces.
 // Live elements may only reference live elements.
 ValidationResult validateLive(const Mesh& mesh);
+// Checks the sculpt layers: array sizes, finite values, ids, strengths and names, and with
+// `checkComposite` that positions equal the composite bit for bit and that normals are what
+// computeNormals() gives for them. validate() runs the cheap part.
+ValidationResult validateLayers(const Mesh& mesh, bool checkComposite);
 
 // ---------------------------------------------------------------------------------------------
 

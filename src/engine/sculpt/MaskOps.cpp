@@ -68,6 +68,12 @@ std::optional<SculptUndo> applyMaskOp(SceneObject& object, MaskOp op, int iterat
     }
   }
 
+  return recordMaskEdit(object, old, maskOpName(op));
+}
+
+std::optional<SculptUndo> recordMaskEdit(SceneObject& object, const std::vector<float>& old, std::string label) {
+  Mesh& m = object.mesh;
+  const Bvh& bvh = object.bvh;
   // Hidden parts keep their mask: only vertices of a visible face change.
   if (m.anyHidden()) {
     forEachLeafVertex(bvh, [&](Index v) {
@@ -85,7 +91,7 @@ std::optional<SculptUndo> applyMaskOp(SceneObject& object, MaskOp op, int iterat
     }
   });
   SculptUndo entry;
-  entry.label = maskOpName(op);
+  entry.label = std::move(label);
   entry.objectId = object.id;
   entry.topologyVersion = object.topologyVersion;
   for (std::size_t i = 0; i < leaves.size(); ++i) {

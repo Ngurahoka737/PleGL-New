@@ -91,6 +91,10 @@ void SmoothBrush::apply(BrushContext& ctx) const {
   Mesh& m = ctx.mesh;
   const float r2 = d.radius * d.radius;
   const float invR = 1.0f / d.radius;
+  // Clamped like every brush: on a coarse mesh the neighbour mean can lie farther than the reach
+  // the sculptor recomputes normals in.
+  const float maxMove = d.radius * kMaxDabMove;
+  const float maxMove2 = maxMove * maxMove;
   const float* mask = m.mask.empty() ? nullptr : m.mask.data();
   // Smoothing reads neighbours, so compute every new position first and write them afterwards.
   std::vector<std::vector<std::pair<Index, Vec3>>> results(ctx.leaves.size());
@@ -107,7 +111,12 @@ void SmoothBrush::apply(BrushContext& ctx) const {
         if (w <= 0.0f) continue;
         neighbourMean<Vec3>(
             m, v, [&](Index u) { return m.positions[u]; },
-            [&](const Vec3& target) { out.emplace_back(v, p + (target - p) * w); });
+            [&](const Vec3& target) {
+              Vec3 move = (target - p) * w;
+              const float len2 = glm::dot(move, move);
+              if (len2 > maxMove2) move *= maxMove / std::sqrt(len2);
+              out.emplace_back(v, p + move);
+            });
       }
     }
   });
@@ -152,6 +161,84 @@ void CreaseBrush::apply(BrushContext& ctx) const {
     Vec3 toCenter = d.center - p;
     toCenter -= n * glm::dot(toCenter, n);  // Pinch only along the surface.
     return (push + toCenter * kCreasePinch) * w;
+  });
+}
+
+namespace {
+// Adds `delta` to a layer offset and returns the vertex's new composite position. The composite
+// moves by strength * delta, which is clamped to kMaxDabMove * radius like every brush.
+Vec3 moveLayer(const LayerTarget& t, Index v, Vec3 delta, float maxMove) {
+  Vec3& o = (*t.offset)[v];
+  const float move = std::abs(t.strength) * glm::length(delta);
+  if (move > maxMove) delta *= maxMove / move;
+  o.x = o.x + delta.x;
+  o.y = o.y + delta.y;
+  o.z = o.z + delta.z;
+  return composeVertex(*t.stack, v);
+}
+}  // namespace
+
+void EraseLayerBrush::apply(BrushContext& ctx) const {
+  if (!ctx.layer || !ctx.layer->offset) return;
+  const LayerTarget& t = *ctx.layer;
+  const Dab& d = ctx.dab;
+  Mesh& m = ctx.mesh;
+  const float r2 = d.radius * d.radius;
+  const float invR = 1.0f / d.radius;
+  const float maxMove = d.radius * kMaxDabMove;
+  const float* mask = m.mask.empty() ? nullptr : m.mask.data();
+  // Each vertex reads only its own offset, so leaves can be written in place in parallel.
+  parallelFor(0, ctx.leaves.size(), 1, [&](std::size_t b, std::size_t e) {
+    for (std::size_t i = b; i < e; ++i) {
+      const BvhLeaf& leaf = ctx.bvh.leaves()[ctx.leaves[i]];
+      for (Index v = leaf.vertBegin; v < leaf.vertEnd; ++v) {
+        const Vec3 delta = m.positions[v] - d.center;
+        const float dist2 = glm::dot(delta, delta);
+        if (dist2 >= r2) continue;
+        const float w = d.strength * falloffWeight(d.falloff, std::sqrt(dist2) * invR) * unmasked(ctx, mask, v);
+        if (w <= 0.0f) continue;
+        const Vec3& o = (*t.offset)[v];
+        if (isZero(o)) continue;
+        m.positions[v] = moveLayer(t, v, Vec3{-(w * o.x), -(w * o.y), -(w * o.z)}, maxMove);
+      }
+    }
+  });
+}
+
+void LayerSmoothBrush::apply(BrushContext& ctx) const {
+  if (!ctx.layer || !ctx.layer->offset) return;
+  const LayerTarget& t = *ctx.layer;
+  const std::vector<Vec3>& offset = *t.offset;
+  const Dab& d = ctx.dab;
+  Mesh& m = ctx.mesh;
+  const float r2 = d.radius * d.radius;
+  const float invR = 1.0f / d.radius;
+  const float maxMove = d.radius * kMaxDabMove;
+  const float* mask = m.mask.empty() ? nullptr : m.mask.data();
+  // Like SmoothBrush: every new offset is computed from the old ones first, then written.
+  std::vector<std::vector<std::pair<Index, Vec3>>> results(ctx.leaves.size());
+  parallelFor(0, ctx.leaves.size(), 1, [&](std::size_t b, std::size_t e) {
+    for (std::size_t i = b; i < e; ++i) {
+      const BvhLeaf& leaf = ctx.bvh.leaves()[ctx.leaves[i]];
+      auto& out = results[i];
+      for (Index v = leaf.vertBegin; v < leaf.vertEnd; ++v) {
+        const Vec3 delta = m.positions[v] - d.center;
+        const float dist2 = glm::dot(delta, delta);
+        if (dist2 >= r2) continue;
+        const float w = d.strength * falloffWeight(d.falloff, std::sqrt(dist2) * invR) * unmasked(ctx, mask, v);
+        if (w <= 0.0f) continue;
+        neighbourMean<Vec3>(
+            m, v, [&](Index u) { return offset[u]; },
+            [&](const Vec3& mean) {
+              const Vec3 change = (mean - offset[v]) * w;
+              if (!isZero(change)) out.emplace_back(v, change);
+            });
+      }
+    }
+  });
+  parallelFor(0, results.size(), 1, [&](std::size_t b, std::size_t e) {
+    for (std::size_t i = b; i < e; ++i)
+      for (const auto& [v, change] : results[i]) m.positions[v] = moveLayer(t, v, change, maxMove);
   });
 }
 

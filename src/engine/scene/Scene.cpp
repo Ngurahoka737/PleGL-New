@@ -103,7 +103,11 @@ SceneObject* Scene::duplicate(std::uint32_t id) {
     // Every level gets a new version; pending edits come along as they are.
     obj->multires = std::shared_ptr<Multires>(src->multires->clone(true));
     obj->topologyVersion = obj->multires->levels[static_cast<std::size_t>(obj->multires->active)].version;
+    for (MultiresLevel& level : obj->multires->levels)
+      if (!level.mesh.layers.empty()) level.mesh.layers.epoch = nextTopologyVersion();
   }
+  // A copied layer stack is a stack of its own: undo entries of the original never match it.
+  if (!obj->mesh.layers.empty()) obj->mesh.layers.epoch = nextTopologyVersion();
   obj->transform = src->transform;
   obj->visible = src->visible;
   objects_.push_back(std::move(obj));

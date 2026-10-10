@@ -1,11 +1,14 @@
 #include "sculpt/Sculptor.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <iterator>
+#include <span>
 
 #include "core/Parallel.h"
 #include "core/Timer.h"
+#include "sculpt/LayerOps.h"
 
 namespace plegl {
 
@@ -15,7 +18,13 @@ namespace {
 constexpr std::int32_t kNoFaceSet = INT32_MAX;
 }  // namespace
 
-void Sculptor::beginStroke(SceneObject& object, const Brush& brush, const StrokeOptions& options, std::string label) {
+void Sculptor::beginStroke(SceneObject& object, const Brush& requested, const StrokeOptions& options,
+                           std::string label) {
+  const Brush& brush = strokeBrush(requested, object, options);
+  if (!layerTargetRefusal(object, &brush, options.layerTarget).empty()) {
+    if (object_) endStroke();  // As start() would: no stroke stays open.
+    return;
+  }
   start(object, options, std::move(label));
   brush_ = &brush;
   maskStroke_ = brush.editsMask();
@@ -23,8 +32,11 @@ void Sculptor::beginStroke(SceneObject& object, const Brush& brush, const Stroke
   // Allocate before the first snapshot, so the before-state holds real (default) values.
   if (maskStroke_) object.mesh.ensureMask();
   if (faceSetStroke_) object.mesh.ensureFaceSets();
-  // Subdivision levels keep their topology for life, so dynamic topology never runs on them.
-  if (options.dyntopo && !object.multires && !maskStroke_ && !faceSetStroke_ && object.mesh.faceCount() > 0) {
+  beginLayers();
+  // Subdivision levels keep their topology for life, so dynamic topology never runs on them; nor
+  // does it on meshes with sculpt layers.
+  if (options.dyntopo && !object.multires && object.mesh.layers.empty() && !maskStroke_ && !faceSetStroke_ &&
+      object.mesh.faceCount() > 0) {
     dyntopo_ = std::make_unique<DyntopoSession>(object, options.dyntopoOptions);
     mergedClaims_ = 0;
   }
@@ -42,6 +54,8 @@ void Sculptor::start(SceneObject& object, const StrokeOptions& options, std::str
   paintSet_[0] = paintSet_[1] = 0;
   grabVerts_.clear();
   options_ = options;
+  layerArray_ = nullptr;
+  layerTarget_ = {};
   undo_ = SculptUndo{};
   undo_.label = std::move(label);
   undo_.objectId = object.id;
@@ -53,6 +67,16 @@ void Sculptor::start(SceneObject& object, const StrokeOptions& options, std::str
     stamp_ = 0;
   }
   dabCount_ = 0;
+}
+
+void Sculptor::beginLayers() {
+  LayerStack& stack = object_->mesh.layers;
+  if (stack.empty() || maskStroke_ || faceSetStroke_) return;
+  // The refusal checked the target exists.
+  layerArray_ = stack.array(options_.layerTarget);
+  layerTarget_ = {&stack, layerArray_, targetStrength(stack, options_.layerTarget)};
+  undo_.layerTarget = options_.layerTarget;
+  undo_.layerKey = layerStateKey(stack);
 }
 
 void Sculptor::snapshot(Index leaf) {
@@ -70,6 +94,7 @@ void Sculptor::snapshot(Index leaf) {
   } else {
     s.positions.assign(m.positions.begin() + l.vertBegin, m.positions.begin() + l.vertEnd);
     s.normals.assign(m.normals.begin() + l.vertBegin, m.normals.begin() + l.vertEnd);
+    if (layerArray_) s.layer.assign(layerArray_->begin() + l.vertBegin, layerArray_->begin() + l.vertEnd);
   }
   snapshotIndex_.emplace(leaf, undo_.before.size());
   undo_.before.push_back(std::move(s));
@@ -236,7 +261,8 @@ bool Sculptor::applyOne(const Dab& dabIn, const DabTopology& topology, int side)
   for (Index l : leaves_) snapshot(l);
 
   Timer t;
-  BrushContext ctx{m, bvh, leaves_, dab, faceSetFilter, paintSet_[side]};
+  BrushContext ctx{m, bvh, leaves_, dab, faceSetFilter, paintSet_[side],
+                   brush_->writesLayer() && layerArray_ ? &layerTarget_ : nullptr};
   brush_->apply(ctx);
   lastDab_.brushMs += t.ms();
 
@@ -329,8 +355,9 @@ void Sculptor::recomputeNormals(std::span<const Index> verts) {
 
 bool Sculptor::beginGrab(SceneObject& object, const StrokeOptions& options, const Vec3& center, float radius,
                          std::string label) {
-  if (radius <= 0.0f) return false;
+  if (radius <= 0.0f || !layerTargetRefusal(object, nullptr, options.layerTarget).empty()) return false;
   start(object, options, std::move(label));
+  beginLayers();
   Mesh& m = object.mesh;
   const Bvh& bvh = object.bvh;
   const float strength = std::clamp(options.strength, 0.0f, 1.0f);
@@ -475,8 +502,118 @@ std::optional<StrokeUndo> Sculptor::endDyntopoStroke(SceneObject& obj, DyntopoSe
   return StrokeUndo{std::move(undo)};
 }
 
+void Sculptor::commitLayerStroke() {
+  Mesh& m = object_->mesh;
+  Bvh& bvh = object_->bvh;
+  const LayerStack& stack = m.layers;
+  std::vector<Vec3>& target = *layerArray_;
+  const float s = layerTarget_.strength;
+  const bool base = undo_.layerTarget == 0;
+  if (++stamp_ == 0) {
+    std::fill(vertexStamp_.begin(), vertexStamp_.end(), 0);
+    stamp_ = 1;
+  }
+  const std::uint32_t stamp = stamp_;
+  const std::span<const BvhLeaf> leafList = bvh.leaves();
+  const std::span<const std::pair<Index, Index>> fans = nonManifoldFans(*object_, fans_);
+  const std::size_t snapshots = undo_.before.size();
+  layerChanged_.resize(snapshots);
+  layerRing_.resize(snapshots);
+  layerLeaves_.resize(snapshots);
+  // Snapshots cover disjoint vertex ranges, so they run in parallel.
+  parallelFor(0, snapshots, 1, [&](std::size_t b, std::size_t e) {
+    for (std::size_t k = b; k < e; ++k) {
+      // 1. Each vertex the stroke moved adds its change, divided by the target's strength, to the
+      // target; then it takes the composite. Usually that is the position the brush left, else it
+      // differs by rounding. On the base where no layer moved the vertex (the base equals the old
+      // position), the base takes the new position as is, so the brush's result stays exact.
+      std::vector<Index>& changed = layerChanged_[k];
+      changed.clear();
+      const LeafState& before = undo_.before[k];
+      const Index begin = leafList[before.leaf].vertBegin;
+      for (std::size_t i = 0; i < before.positions.size(); ++i) {
+        const Index v = begin + static_cast<Index>(i);
+        const Vec3 p0 = before.positions[i];
+        const Vec3 p1 = m.positions[v];
+        if (sameBits(p0, p1)) continue;
+        Vec3& t = target[v];
+        if (base && sameBits(t, p0)) {
+          t = p1;
+        } else {
+          const float dx = p1.x - p0.x;
+          const float dy = p1.y - p0.y;
+          const float dz = p1.z - p0.z;
+          if (dx != 0.0f) t.x = t.x + dx / s;
+          if (dy != 0.0f) t.y = t.y + dy / s;
+          if (dz != 0.0f) t.z = t.z + dz / s;
+        }
+        const Vec3 p = composeVertex(stack, v);
+        if (!sameBits(p, p1)) {
+          m.positions[v] = p;
+          changed.push_back(v);
+        }
+      }
+      // 2. Vertices sharing a face with a recomposed vertex get new normals, and the leaves of
+      // those faces new bounds. Each vertex is claimed once, by whichever snapshot stamps it
+      // first. Leaf lookups start from the last leaf found, which neighbours almost always share.
+      std::vector<Index>& ring = layerRing_[k];
+      std::vector<Index>& faceLeaves = layerLeaves_[k];
+      ring.clear();
+      faceLeaves.clear();
+      Index faceLeaf = kInvalid;
+      for (Index v : changed) {
+        forEachFaceAt(m, fans, v, [&](Index f) {
+          if (faceLeaf == kInvalid || f < leafList[faceLeaf].faceBegin || f >= leafList[faceLeaf].faceEnd) {
+            faceLeaf = bvh.leafOfFace(f);
+            if (faceLeaf != kInvalid) faceLeaves.push_back(faceLeaf);
+          }
+          m.forEachFaceVertex(f, [&](Index u) {
+            std::atomic_ref<std::uint32_t> mark(vertexStamp_[u]);
+            if (mark.load(std::memory_order_relaxed) != stamp &&
+                mark.exchange(stamp, std::memory_order_relaxed) != stamp)
+              ring.push_back(u);
+          });
+        });
+      }
+    }
+  });
+
+  // Their leaves are snapshotted before any normal is written: on a coarse mesh a face can reach
+  // past the normals the dabs recomputed, and such a leaf still holds its values from before the
+  // stroke.
+  normalVerts_.clear();
+  leaves_.clear();  // Leaves whose faces moved: their bounds change.
+  for (std::size_t k = 0; k < snapshots; ++k) {
+    normalVerts_.insert(normalVerts_.end(), layerRing_[k].begin(), layerRing_[k].end());
+    leaves_.insert(leaves_.end(), layerLeaves_[k].begin(), layerLeaves_[k].end());
+  }
+  if (normalVerts_.empty()) return;
+  dirtyLeaves_.clear();
+  Index owner = kInvalid;
+  for (Index v : normalVerts_) {
+    if (owner != kInvalid && v >= leafList[owner].vertBegin && v < leafList[owner].vertEnd) continue;
+    owner = bvh.leafOfVertex(v);
+    if (owner != kInvalid) dirtyLeaves_.push_back(owner);
+  }
+  std::sort(dirtyLeaves_.begin(), dirtyLeaves_.end());
+  dirtyLeaves_.erase(std::unique(dirtyLeaves_.begin(), dirtyLeaves_.end()), dirtyLeaves_.end());
+  for (Index l : dirtyLeaves_) snapshot(l);
+
+  // 3. Normals, bounds and uploads.
+  recomputeNormals(normalVerts_);
+  std::sort(leaves_.begin(), leaves_.end());
+  leaves_.erase(std::unique(leaves_.begin(), leaves_.end()), leaves_.end());
+  bvh.refitLeaves(m, leaves_);
+  strokeRefit_.insert(strokeRefit_.end(), leaves_.begin(), leaves_.end());
+  for (Index l : dirtyLeaves_) object_->markLeafDirty(l);
+}
+
 std::optional<StrokeUndo> Sculptor::endStroke() {
   if (!object_) return std::nullopt;
+  // Commit the stroke into its layer target first: the after-snapshots must hold the committed
+  // values. Dynamic topology never runs on layered meshes.
+  if (layerArray_ && !dyntopo_ && !(brush_ && brush_->writesLayer()) && !undo_.before.empty()) commitLayerStroke();
+  const std::vector<Vec3>* layer = layerArray_;
   SceneObject* obj = object_;
   object_ = nullptr;
   lastStroke_ = {};
@@ -520,7 +657,8 @@ std::optional<StrokeUndo> Sculptor::endStroke() {
     return StrokeUndo{std::move(undo_)};
   }
   // Drop leaves the stroke did not change, for example because they are fully masked. A leaf
-  // whose positions stayed but whose normals changed (a neighbour moved) is kept.
+  // whose positions stayed but whose normals changed (a neighbour moved) is kept, and so is one
+  // where only the layer target changed (a layer brush whose change rounded away).
   std::vector<LeafState> before;
   before.reserve(undo_.before.size());
   undo_.after.reserve(undo_.before.size());
@@ -528,13 +666,15 @@ std::optional<StrokeUndo> Sculptor::endStroke() {
   for (LeafState& b : undo_.before) {
     const BvhLeaf& l = obj->bvh.leaves()[b.leaf];
     if (std::equal(b.positions.begin(), b.positions.end(), m.positions.begin() + l.vertBegin) &&
-        std::equal(b.normals.begin(), b.normals.end(), m.normals.begin() + l.vertBegin))
+        std::equal(b.normals.begin(), b.normals.end(), m.normals.begin() + l.vertBegin) &&
+        (!layer || std::equal(b.layer.begin(), b.layer.end(), layer->begin() + l.vertBegin, sameBits)))
       continue;
     kept_.push_back(b.leaf);
     LeafState a;
     a.leaf = b.leaf;
     a.positions.assign(m.positions.begin() + l.vertBegin, m.positions.begin() + l.vertEnd);
     a.normals.assign(m.normals.begin() + l.vertBegin, m.normals.begin() + l.vertEnd);
+    if (!b.layer.empty()) a.layer.assign(layer->begin() + l.vertBegin, layer->begin() + l.vertEnd);
     undo_.after.push_back(std::move(a));
     before.push_back(std::move(b));
   }
