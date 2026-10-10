@@ -15,20 +15,6 @@ const Mesh& levelMesh(const SceneObject& o, int k) {
   return k == o.multires->active ? o.mesh : o.multires->levels[static_cast<std::size_t>(k)].mesh;
 }
 
-template <class T>
-std::vector<T> toCanonical(const std::vector<T>& live, const std::vector<Index>& canon) {
-  std::vector<T> out(live.size());
-  for (std::size_t i = 0; i < live.size(); ++i) out[static_cast<std::size_t>(canon[i])] = live[i];
-  return out;
-}
-
-template <class T>
-std::vector<T> toLive(const std::vector<T>& canonical, const std::vector<Index>& canon) {
-  std::vector<T> out(canonical.size());
-  for (std::size_t i = 0; i < canon.size(); ++i) out[i] = canonical[static_cast<std::size_t>(canon[i])];
-  return out;
-}
-
 // The polygons of a mesh in its own face order.
 void polygons(const Mesh& m, std::vector<std::uint32_t>& sizes, std::vector<std::uint32_t>& corners) {
   sizes.resize(m.faceHe.size());

@@ -23,6 +23,11 @@ struct ProjectObject {
   // is then the active level and the BVH the level's own).
   Bvh bvh;
   std::shared_ptr<Multires> multires;
+  // Sculpt layers as read from the file, attached by buildProject(): the stack of an object
+  // without levels (file vertex order), or the stacks of an object's levels by level (canonical
+  // order). Both have no epoch yet.
+  LayerStack layers;
+  std::vector<std::pair<int, LayerStack>> levelLayers;
 };
 
 struct Project {
@@ -30,6 +35,9 @@ struct Project {
   // Application state (brush, camera, symmetry, viewport...) as "key value" lines. The engine
   // stores it verbatim; the app decides what goes in it, so new settings need no format change.
   std::string settings;
+  // Data that could not be read and was left out while the project still opened (for the status
+  // line).
+  std::vector<std::string> warnings;
 };
 
 // The .psculpt format: a small binary container.
@@ -56,12 +64,55 @@ struct Project {
 // (u32 count, u32 canonical indices, values) for positions, mask and face sets. For such objects
 // OBJS, MASK and FSET hold the active level in canonical order, so a build without levels opens
 // the level that was being sculpted.
+//
+// The optional "LAYR" holds sculpt layers (written after MRES): u8 encoding (0), u8[3] reserved
+// (0), u32 stack count, then per stack, ascending by object index and level (255 for an object
+// without levels, which sorts last): u32 object index, u8 level, u8 layer count (1..255), u8
+// active slot (0 = base, k = k-th layer from the bottom), u8 reserved (0), u32 vertex count, u32
+// next id, the base as an array block, and per layer bottom to top: u32 id, f32 strength, u8
+// flags (bit 0 = visible), u8 name length (0..63), the name (UTF-8), the offsets as an array
+// block. An array block is u8 code, then f32[3 x vertex count] (code 0, dense), or u32 count,
+// u32 indices (ascending) and f32[3 x count] (code 1: zero elsewhere; code 2, base only: the
+// composite elsewhere). Vertices are in file order, or a level's canonical order. The composite
+// is what OBJS (or MRES, for a parked level) stores, so a build without layers opens the shape
+// that was being sculpted; a damaged LAYR drops the layers with a warning and keeps that shape.
 // Little-endian.
 inline constexpr std::uint32_t kProjectVersion = 1;
 
-// Serializes in memory, so the caller can write the bytes on another thread while the scene keeps
-// changing (autosave does this).
-std::vector<std::uint8_t> serializeProject(const Scene& scene, const std::string& settings);
+// A sparse or dense array captured for LAYR.
+struct CapturedArray {
+  std::vector<std::uint32_t> index;  // Ascending, unless `unsorted` (canonical order, not sorted yet).
+  std::vector<Vec3> values;
+  bool unsorted = false;
+};
+struct CapturedLayer {
+  std::uint32_t id = 0;
+  std::string name;
+  float strength = 1.0f;
+  bool visible = true;
+  CapturedArray offsets;  // Non-zero offsets.
+};
+struct CapturedStack {
+  std::uint32_t objectIndex = 0;
+  std::uint8_t level = 255;
+  std::uint8_t activeSlot = 0;
+  std::uint32_t vertexCount = 0, nextId = 1;
+  CapturedArray base;  // Where the base differs from the composite.
+  std::vector<CapturedLayer> layers;
+};
+// A save in two halves: draftProject() copies what the scene holds (main thread, quick) and
+// finishProject() sorts, encodes and checksums it (any thread), so the scene can keep changing
+// while the bytes are finished and written (autosave does this).
+struct ProjectDraft {
+  std::vector<std::uint8_t> bytes;  // Every chunk before LAYR.
+  std::vector<CapturedStack> layers;
+};
+ProjectDraft draftProject(const Scene& scene, const std::string& settings);
+std::vector<std::uint8_t> finishProject(ProjectDraft&& draft);
+
+inline std::vector<std::uint8_t> serializeProject(const Scene& scene, const std::string& settings) {
+  return finishProject(draftProject(scene, settings));
+}
 
 // Parses and validates; every count and index is checked, and a damaged or truncated file is
 // refused instead of producing a broken mesh.
@@ -74,8 +125,10 @@ bool writeFileAtomic(const std::filesystem::path& path, const std::vector<std::u
 
 std::optional<Project> loadProject(const std::filesystem::path& path, std::string* error = nullptr);
 
-// Builds every object's BVH and rebuilds subdivision levels (the slow part of opening a project;
-// worker-safe). Fails, refusing the whole project, when level data does not fit its object.
+// Builds every object's BVH, rebuilds subdivision levels and attaches sculpt layers (the slow part
+// of opening a project; worker-safe). Fails, refusing the whole project, when level data does not
+// fit its object. Layers whose composite is off from the stored shape by rounding are recomposed;
+// layers further off are dropped with a warning in project.warnings.
 bool buildProject(Project& project, std::string* error = nullptr);
 
 // Moves a built object (see buildProject) into the scene, keeping its name exactly.

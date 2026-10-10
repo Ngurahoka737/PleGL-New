@@ -109,6 +109,7 @@ if(PLEGL_BUILD_TESTS)
     tests/test_layers.cpp
     tests/test_layers_undo.cpp
     tests/test_layers_multires.cpp
+    tests/test_layers_io.cpp
   )
   target_link_libraries(plegl_tests PRIVATE plegl_engine doctest::doctest plegl_warnings)
   add_test(NAME plegl_tests COMMAND plegl_tests)

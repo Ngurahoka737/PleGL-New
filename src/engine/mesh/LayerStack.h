@@ -30,6 +30,8 @@ inline constexpr float kMinStrokeStrength = 0.05f;    // Strokes on a weaker lay
 inline constexpr std::size_t kMaxLayerNameBytes = 63;
 // Layer memory of one object over all its levels: Add and Duplicate are refused above this.
 inline constexpr std::size_t kMaxObjectLayerBytes = std::size_t{1} << 30;
+// The same when reading a project file, where layers made elsewhere may be larger.
+inline constexpr std::size_t kMaxFileObjectLayerBytes = std::size_t{2} << 30;
 // Strength drags recompute normals live up to this many affected vertices, on release above it.
 inline constexpr std::size_t kLiveNormalsLimit = 600'000;
 

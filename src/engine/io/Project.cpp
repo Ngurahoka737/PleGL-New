@@ -2,12 +2,18 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstring>
 #include <optional>
 #include <fstream>
+#include <numeric>
+#include <string_view>
 #include <system_error>
+
+#include "core/Parallel.h"
+#include "sculpt/LayerOps.h"
 
 namespace plegl {
 
@@ -29,6 +35,11 @@ constexpr std::uint32_t kTagFaceSets = tag("FSET");
 constexpr std::uint8_t kFaceSetEncodingI32 = 0;
 constexpr std::uint32_t kTagLevels = tag("MRES");
 constexpr std::uint8_t kLevelsEncoding = 0;
+constexpr std::uint32_t kTagLayers = tag("LAYR");
+constexpr std::uint8_t kLayersEncoding = 0;
+constexpr std::uint8_t kPlainLevel = 255;  // LAYR level of an object without levels.
+constexpr std::uint8_t kArrayDense = 0, kArraySparse = 1, kArrayOverComposite = 2;
+constexpr std::uint32_t kMaxFileNextId = std::uint32_t{1} << 31;
 constexpr std::uint32_t kTagEnd = tag("END ");
 
 class Writer {
@@ -369,24 +380,375 @@ bool readLevels(Reader& r, std::size_t size, std::vector<ProjectObject>& objects
   return true;
 }
 
+// ---- Sculpt layers (LAYR) ----------------------------------------------------------------------
+
+const Mesh& levelMesh(const SceneObject& o, int k) {
+  return k == o.multires->active ? o.mesh : o.multires->levels[static_cast<std::size_t>(k)].mesh;
+}
+
+// The (index, value) pairs of `values` where keep(v) holds, ascending by v. With `canon` the
+// indices are canonical and left unsorted for finishProject().
+template <class Keep>
+CapturedArray capture(const std::vector<Vec3>& values, const std::vector<Index>* canon, Keep&& keep) {
+  constexpr std::size_t kBlock = std::size_t{1} << 16;
+  const std::size_t n = values.size(), blocks = (n + kBlock - 1) / kBlock;
+  std::vector<CapturedArray> parts(blocks);
+  parallelFor(0, blocks, 1, [&](std::size_t b, std::size_t e) {
+    for (std::size_t k = b; k < e; ++k) {
+      CapturedArray& part = parts[k];
+      for (std::size_t v = k * kBlock, end = std::min(n, v + kBlock); v < end; ++v) {
+        if (!keep(v)) continue;
+        part.index.push_back(static_cast<std::uint32_t>(canon ? (*canon)[v] : static_cast<Index>(v)));
+        part.values.push_back(values[v]);
+      }
+    }
+  });
+  CapturedArray out;
+  std::size_t total = 0;
+  for (const CapturedArray& p : parts) total += p.index.size();
+  out.index.reserve(total);
+  out.values.reserve(total);
+  for (const CapturedArray& p : parts) {
+    out.index.insert(out.index.end(), p.index.begin(), p.index.end());
+    out.values.insert(out.values.end(), p.values.begin(), p.values.end());
+  }
+  out.unsorted = canon != nullptr && total > 1;
+  return out;
+}
+
+CapturedStack captureStack(const Mesh& m, std::uint32_t objectIndex, std::uint8_t level,
+                           const std::vector<Index>* canon) {
+  const LayerStack& s = m.layers;
+  CapturedStack c;
+  c.objectIndex = objectIndex;
+  c.level = level;
+  c.activeSlot = static_cast<std::uint8_t>(s.active == 0 ? 0 : s.indexOf(s.active) + 1);
+  c.vertexCount = static_cast<std::uint32_t>(m.positions.size());
+  c.nextId = s.nextId;
+  c.base = capture(s.base, canon, [&](std::size_t v) { return !sameBits(s.base[v], m.positions[v]); });
+  for (const SculptLayer& l : s.list) {
+    CapturedLayer cl{l.id, l.name, l.strength, l.visible, {}};
+    cl.offsets = capture(l.offset, canon, [&](std::size_t v) { return !isZero(l.offset[v]); });
+    c.layers.push_back(std::move(cl));
+  }
+  return c;
+}
+
+// Every stack of the scene, in LAYR order.
+std::vector<CapturedStack> captureLayers(const Scene& scene) {
+  std::vector<CapturedStack> out;
+  for (std::size_t i = 0; i < scene.objects().size(); ++i) {
+    const SceneObject& obj = *scene.objects()[i];
+    const auto index = static_cast<std::uint32_t>(i);
+    if (!obj.multires) {
+      if (!obj.mesh.layers.empty()) out.push_back(captureStack(obj.mesh, index, kPlainLevel, nullptr));
+      continue;
+    }
+    for (int k = 0; k < obj.multires->levelCount(); ++k) {
+      const Mesh& m = levelMesh(obj, k);
+      if (!m.layers.empty())
+        out.push_back(captureStack(m, index, static_cast<std::uint8_t>(k),
+                                   &obj.multires->levels[static_cast<std::size_t>(k)].canon.vert));
+    }
+  }
+  return out;
+}
+
+void sortCaptured(CapturedArray& a) {
+  if (!a.unsorted) return;
+  std::vector<std::uint32_t> order(a.index.size());
+  std::iota(order.begin(), order.end(), 0u);
+  std::sort(order.begin(), order.end(), [&](std::uint32_t x, std::uint32_t y) { return a.index[x] < a.index[y]; });
+  std::vector<std::uint32_t> index(order.size());
+  std::vector<Vec3> values(order.size());
+  for (std::size_t i = 0; i < order.size(); ++i) {
+    index[i] = a.index[order[i]];
+    values[i] = a.values[order[i]];
+  }
+  a.index = std::move(index);
+  a.values = std::move(values);
+  a.unsorted = false;
+}
+
+void putArrayBlock(Writer& w, const CapturedArray& a, std::uint32_t vertexCount, std::uint8_t code) {
+  w.put(code);
+  if (code == kArrayDense) {
+    std::vector<Vec3> dense(vertexCount, Vec3{0.0f});
+    for (std::size_t i = 0; i < a.index.size(); ++i) dense[a.index[i]] = a.values[i];
+    w.putArray(reinterpret_cast<const float*>(dense.data()), dense.size() * 3);
+    return;
+  }
+  w.put(static_cast<std::uint32_t>(a.index.size()));
+  w.putArray(a.index.data(), a.index.size());
+  w.putArray(reinterpret_cast<const float*>(a.values.data()), a.values.size() * 3);
+}
+
+void writeLayers(Writer& w, std::vector<CapturedStack>& stacks) {
+  if (stacks.empty()) return;
+  std::vector<CapturedArray*> arrays;
+  std::size_t bytes = 16;
+  for (CapturedStack& s : stacks) {
+    arrays.push_back(&s.base);
+    for (CapturedLayer& l : s.layers) arrays.push_back(&l.offsets);
+    bytes += 24 + 16 * s.base.index.size();
+    for (const CapturedLayer& l : s.layers)
+      bytes += 80 + std::min<std::size_t>(16 * l.offsets.index.size(), 12 * std::size_t(s.vertexCount));
+  }
+  parallelFor(0, arrays.size(), 1, [&](std::size_t b, std::size_t e) {
+    for (std::size_t i = b; i < e; ++i) sortCaptured(*arrays[i]);
+  });
+  w.bytes.reserve(w.bytes.size() + bytes + 32);
+  const std::size_t at = w.beginChunk(kTagLayers);
+  w.put(kLayersEncoding);
+  const std::uint8_t reserved[3] = {0, 0, 0};
+  w.putArray(reserved, 3);
+  w.put(static_cast<std::uint32_t>(stacks.size()));
+  for (const CapturedStack& s : stacks) {
+    w.put(s.objectIndex);
+    w.put(s.level);
+    w.put(static_cast<std::uint8_t>(s.layers.size()));
+    w.put(s.activeSlot);
+    w.put(std::uint8_t{0});
+    w.put(s.vertexCount);
+    w.put(s.nextId);
+    putArrayBlock(w, s.base, s.vertexCount, kArrayOverComposite);
+    for (const CapturedLayer& l : s.layers) {
+      w.put(l.id);
+      w.put(l.strength);
+      w.put(static_cast<std::uint8_t>(l.visible ? 1 : 0));
+      const std::size_t nameLength = std::min(l.name.size(), kMaxLayerNameBytes);
+      w.put(static_cast<std::uint8_t>(nameLength));
+      w.putArray(l.name.data(), nameLength);
+      const std::uint64_t sparse = 4 + 16 * std::uint64_t(l.offsets.index.size());
+      putArrayBlock(w, l.offsets, s.vertexCount,
+                    sparse < 12 * std::uint64_t(s.vertexCount) ? kArraySparse : kArrayDense);
+    }
+  }
+  w.endChunk(at);
+}
+
+bool validUtf8(std::string_view s) {
+  std::size_t i = 0;
+  while (i < s.size()) {
+    const auto c = static_cast<unsigned char>(s[i]);
+    std::size_t n = 0;
+    std::uint32_t cp = 0;
+    if (c < 0x80) {
+      ++i;
+      continue;
+    } else if ((c & 0xE0) == 0xC0) {
+      n = 1, cp = c & 0x1Fu;
+    } else if ((c & 0xF0) == 0xE0) {
+      n = 2, cp = c & 0x0Fu;
+    } else if ((c & 0xF8) == 0xF0) {
+      n = 3, cp = c & 0x07u;
+    } else {
+      return false;
+    }
+    for (std::size_t k = 1; k <= n; ++k) {
+      if (i + k >= s.size()) return false;
+      const auto d = static_cast<unsigned char>(s[i + k]);
+      if ((d & 0xC0) != 0x80) return false;
+      cp = cp << 6 | (d & 0x3Fu);
+    }
+    // No overlong forms, surrogates or code points past U+10FFFF.
+    if ((n == 1 && cp < 0x80) || (n == 2 && cp < 0x800) || (n == 3 && cp < 0x10000) || cp > 0x10FFFF ||
+        (cp >= 0xD800 && cp <= 0xDFFF))
+      return false;
+    i += n + 1;
+  }
+  return true;
+}
+
+// One array block of a stack with `vertexCount` vertices. `composite` fills what a code 2 block
+// leaves out; only the base may use code 2.
+bool readArrayBlock(Reader& r, std::uint32_t vertexCount, const std::vector<Vec3>* composite, std::vector<Vec3>& out) {
+  const auto code = r.get<std::uint8_t>();
+  if (!r.ok()) return false;
+  if (code == kArrayDense) {
+    if (!r.getArray(out, vertexCount)) return false;
+    for (const Vec3& v : out)
+      if (!finite(v)) return false;
+    return true;
+  }
+  if (code != kArraySparse && !(code == kArrayOverComposite && composite)) return false;
+  const auto count = r.get<std::uint32_t>();
+  std::vector<std::uint32_t> index;
+  std::vector<Vec3> values;
+  if (!r.ok() || count > vertexCount || !r.getArray(index, count) || !r.getArray(values, count)) return false;
+  for (std::size_t i = 0; i < index.size(); ++i)
+    if (index[i] >= vertexCount || (i > 0 && index[i] <= index[i - 1]) || !finite(values[i])) return false;
+  if (code == kArrayOverComposite)
+    out = *composite;
+  else
+    out.assign(vertexCount, Vec3{0.0f});
+  for (std::size_t i = 0; i < index.size(); ++i) out[index[i]] = values[i];
+  return true;
+}
+
+enum class LayersRead { Ok, Damaged, Newer };
+
+// Parses a LAYR chunk into `objects`, all or nothing.
+LayersRead readLayers(Reader& r, std::size_t size, std::vector<ProjectObject>& objects) {
+  const auto encoding = r.get<std::uint8_t>();
+  if (!r.ok()) return LayersRead::Damaged;
+  if (encoding != kLayersEncoding) return LayersRead::Newer;
+  const auto reserved = r.get<std::array<std::uint8_t, 3>>();
+  const auto stackCount = r.get<std::uint32_t>();
+  if (!r.ok() || reserved != std::array<std::uint8_t, 3>{} || stackCount == 0 || stackCount > size / 16)
+    return LayersRead::Damaged;
+  struct Read {
+    std::uint32_t object;
+    std::uint8_t level;
+    LayerStack stack;
+  };
+  std::vector<Read> stacks;
+  std::vector<std::uint64_t> objectBytes(objects.size(), 0);
+  std::int64_t lastKey = -1;
+  for (std::uint32_t n = 0; n < stackCount; ++n) {
+    const auto objectIndex = r.get<std::uint32_t>();
+    const auto level = r.get<std::uint8_t>();
+    const auto layerCount = r.get<std::uint8_t>();
+    const auto activeSlot = r.get<std::uint8_t>();
+    const auto zero = r.get<std::uint8_t>();
+    const auto vertexCount = r.get<std::uint32_t>();
+    const auto nextId = r.get<std::uint32_t>();
+    if (!r.ok() || objectIndex >= objects.size() || zero != 0 || layerCount == 0 || activeSlot > layerCount ||
+        nextId < 2 || nextId > kMaxFileNextId)
+      return LayersRead::Damaged;
+    const std::int64_t key = std::int64_t(objectIndex) << 8 | level;
+    if (key <= lastKey) return LayersRead::Damaged;
+    lastKey = key;
+    const ProjectObject& obj = objects[objectIndex];
+    // The composite: OBJS positions for an object without levels and for the active level, the
+    // MRES positions for a parked level.
+    const std::vector<Vec3>* composite = nullptr;
+    if (level == kPlainLevel) {
+      if (obj.levelData) return LayersRead::Damaged;
+      composite = &obj.mesh.positions;
+    } else {
+      if (!obj.levelData || level >= obj.levelData->levels.size()) return LayersRead::Damaged;
+      const MultiresFileLevel& l = obj.levelData->levels[level];
+      composite = level == obj.levelData->active ? &obj.mesh.positions : &l.positions;
+      if (vertexCount != l.vertices) return LayersRead::Damaged;
+    }
+    if (vertexCount != composite->size()) return LayersRead::Damaged;
+    objectBytes[objectIndex] += (std::uint64_t(layerCount) + 1) * vertexCount * 12;
+    if (objectBytes[objectIndex] > kMaxFileObjectLayerBytes) return LayersRead::Damaged;
+
+    Read out{objectIndex, level, {}};
+    LayerStack& s = out.stack;
+    s.nextId = nextId;
+    if (!readArrayBlock(r, vertexCount, composite, s.base)) return LayersRead::Damaged;
+    for (int k = 0; k < layerCount; ++k) {
+      SculptLayer l;
+      l.id = r.get<std::uint32_t>();
+      l.strength = r.get<float>();
+      const auto flags = r.get<std::uint8_t>();
+      const auto nameLength = r.get<std::uint8_t>();
+      if (!r.ok() || l.id == 0 || l.id >= nextId || s.find(l.id) || !std::isfinite(l.strength) ||
+          std::abs(l.strength) > kMaxLayerStrength || (flags & ~1u) != 0 || nameLength > kMaxLayerNameBytes ||
+          nameLength > r.remaining())
+        return LayersRead::Damaged;
+      l.visible = (flags & 1u) != 0;
+      const std::string_view name(reinterpret_cast<const char*>(r.position()), nameLength);
+      r.skip(nameLength);
+      l.name = validUtf8(name) ? clampLayerName(name, l.id) : "Layer " + std::to_string(l.id);
+      if (!readArrayBlock(r, vertexCount, nullptr, l.offset)) return LayersRead::Damaged;
+      s.list.push_back(std::move(l));
+    }
+    s.active = activeSlot == 0 ? 0 : s.list[activeSlot - 1u].id;
+    stacks.push_back(std::move(out));
+  }
+  for (Read& x : stacks) {
+    ProjectObject& obj = objects[x.object];
+    if (x.level == kPlainLevel)
+      obj.layers = std::move(x.stack);
+    else
+      obj.levelLayers.emplace_back(x.level, std::move(x.stack));
+  }
+  return LayersRead::Ok;
+}
+
+enum class Fit { Exact, Close, Off };
+
+// How the composite of `s` compares with the positions stored for it.
+Fit compositeFit(const LayerStack& s, const std::vector<Vec3>& stored) {
+  std::atomic<int> worst{0};
+  parallelFor(0, stored.size(), 16384, [&](std::size_t b, std::size_t e) {
+    int local = 0;
+    for (std::size_t v = b; v < e && local < 2; ++v) {
+      const Vec3 c = composeVertex(s, static_cast<Index>(v));
+      const Vec3& p = stored[v];
+      if (sameBits(c, p)) continue;
+      const float tol = 1e-5f * std::max({1.0f, std::abs(p.x), std::abs(p.y), std::abs(p.z)});
+      const Vec3 d = glm::abs(c - p);
+      local = (d.x <= tol && d.y <= tol && d.z <= tol) ? std::max(local, 1) : 2;  // NaN counts as off.
+    }
+    int seen = worst.load();
+    while (local > seen && !worst.compare_exchange_weak(seen, local)) {
+    }
+  });
+  return worst == 0 ? Fit::Exact : worst == 1 ? Fit::Close : Fit::Off;
+}
+
+// Puts `stack` on `mesh` when its composite fits the mesh's positions. A composite that differs by
+// rounding replaces the positions (their old values for the changed vertices go to `changed` and
+// `oldP`); one that differs more is dropped with a warning. Returns whether positions changed.
+bool attachLayers(Mesh& mesh, LayerStack&& stack, const std::string& objectName, std::vector<std::string>& warnings,
+                  std::vector<Index>& changed, std::vector<Vec3>& oldP) {
+  changed.clear();
+  oldP.clear();
+  const Fit fit = compositeFit(stack, mesh.positions);
+  if (fit == Fit::Off) {
+    warnings.push_back("Sculpt layers of '" + objectName + "' did not match the saved shape and were dropped.");
+    return false;
+  }
+  stack.epoch = nextTopologyVersion();
+  mesh.layers = std::move(stack);
+  if (fit == Fit::Exact) return false;
+  for (std::size_t v = 0; v < mesh.positions.size(); ++v) {
+    const Vec3 c = composeVertex(mesh.layers, static_cast<Index>(v));
+    if (sameBits(c, mesh.positions[v])) continue;
+    changed.push_back(static_cast<Index>(v));
+    oldP.push_back(mesh.positions[v]);
+    mesh.positions[v] = c;
+  }
+  mesh.computeNormals();
+  return true;
+}
+
 }  // namespace
 
 std::uint32_t crc32(const std::uint8_t* data, std::size_t size, std::uint32_t crc) {
-  static const std::array<std::uint32_t, 256> table = [] {
-    std::array<std::uint32_t, 256> t{};
+  // Slicing-by-8: eight bytes per step through eight tables; table[0] is the classic byte table.
+  static const std::array<std::array<std::uint32_t, 256>, 8> table = [] {
+    std::array<std::array<std::uint32_t, 256>, 8> t{};
     for (std::uint32_t i = 0; i < 256; ++i) {
       std::uint32_t c = i;
       for (int k = 0; k < 8; ++k) c = (c & 1u) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
-      t[i] = c;
+      t[0][i] = c;
     }
+    for (std::uint32_t i = 0; i < 256; ++i)
+      for (std::size_t k = 1; k < 8; ++k) t[k][i] = (t[k - 1][i] >> 8) ^ t[0][t[k - 1][i] & 0xFFu];
     return t;
   }();
   crc = ~crc;
-  for (std::size_t i = 0; i < size; ++i) crc = table[(crc ^ data[i]) & 0xFFu] ^ (crc >> 8);
+  while (size >= 8) {
+    std::uint32_t lo, hi;
+    std::memcpy(&lo, data, 4);
+    std::memcpy(&hi, data + 4, 4);
+    lo ^= crc;
+    crc = table[7][lo & 0xFFu] ^ table[6][(lo >> 8) & 0xFFu] ^ table[5][(lo >> 16) & 0xFFu] ^ table[4][lo >> 24] ^
+          table[3][hi & 0xFFu] ^ table[2][(hi >> 8) & 0xFFu] ^ table[1][(hi >> 16) & 0xFFu] ^ table[0][hi >> 24];
+    data += 8;
+    size -= 8;
+  }
+  for (std::size_t i = 0; i < size; ++i) crc = table[0][(crc ^ data[i]) & 0xFFu] ^ (crc >> 8);
   return ~crc;
 }
 
-std::vector<std::uint8_t> serializeProject(const Scene& scene, const std::string& settings) {
+ProjectDraft draftProject(const Scene& scene, const std::string& settings) {
   Writer w;
   std::size_t total = 64 + 32 + settings.size();  // 32: MASK and FSET chunk headers and counts.
   for (const auto& obj : scene.objects())
@@ -413,8 +775,19 @@ std::vector<std::uint8_t> serializeProject(const Scene& scene, const std::string
   writeMasks(w, scene, canonical);
   writeFaceSets(w, scene, canonical);
   writeLevels(w, scene);
+  ProjectDraft draft;
+  draft.layers = captureLayers(scene);
+  draft.bytes = std::move(w.bytes);
+  return draft;
+}
+
+std::vector<std::uint8_t> finishProject(ProjectDraft&& draft) {
+  Writer w;
+  w.bytes = std::move(draft.bytes);
+  writeLayers(w, draft.layers);
+  draft.layers.clear();
   const std::uint32_t crc = crc32(w.bytes.data(), w.bytes.size());
-  at = w.beginChunk(kTagEnd);
+  const std::size_t at = w.beginChunk(kTagEnd);
   w.put(crc);
   w.endChunk(at);
   return std::move(w.bytes);
@@ -440,6 +813,8 @@ std::optional<Project> parseProject(const std::uint8_t* data, std::size_t size, 
   std::size_t faceSetSize = 0;
   const std::uint8_t* levelData = nullptr;
   std::size_t levelSize = 0;
+  const std::uint8_t* layerData = nullptr;
+  std::size_t layerSize = 0;
   for (;;) {
     const std::uint8_t* chunkStart = r.position();
     const auto t = r.get<std::uint32_t>();
@@ -479,6 +854,9 @@ std::optional<Project> parseProject(const std::uint8_t* data, std::size_t size, 
     } else if (t == kTagLevels) {
       levelData = chunk.position();
       levelSize = std::size_t(chunkSize);
+    } else if (t == kTagLayers && !layerData) {  // A second LAYR is ignored.
+      layerData = chunk.position();
+      layerSize = std::size_t(chunkSize);
     }
     // Unknown chunks are skipped.
   }
@@ -498,16 +876,45 @@ std::optional<Project> parseProject(const std::uint8_t* data, std::size_t size, 
     Reader levels(levelData, levelSize);
     if (!readLevels(levels, levelSize, project.objects, error)) return std::nullopt;
   }
+  if (layerData) {
+    // Damaged layers never refuse the project: OBJS and MRES hold the shape that was sculpted.
+    Reader layers(layerData, layerSize);
+    const LayersRead result = readLayers(layers, layerSize, project.objects);
+    if (result == LayersRead::Newer) project.warnings.push_back("Sculpt layers were saved by a newer version and were dropped.");
+    if (result == LayersRead::Damaged)
+      project.warnings.push_back("Sculpt layers could not be read and were dropped; the sculpted shape is kept.");
+  }
   return project;
 }
 
 bool buildProject(Project& project, std::string* error) {
+  std::vector<Index> changed;
+  std::vector<Vec3> oldP;
   for (ProjectObject& obj : project.objects) {
     if (obj.levelData) {
       if (!restoreLevels(*obj.levelData, obj.mesh, obj.bvh, obj.multires, error)) return false;
       obj.levelData.reset();
+      Multires& stack = *obj.multires;
+      for (auto& [level, layers] : obj.levelLayers) {
+        MultiresLevel& l = stack.levels[static_cast<std::size_t>(level)];
+        const bool active = level == stack.active;
+        layers.base = toLive(layers.base, l.canon.vert);
+        for (SculptLayer& layer : layers.list) layer.offset = toLive(layer.offset, l.canon.vert);
+        Mesh& m = active ? obj.mesh : l.mesh;
+        if (!attachLayers(m, std::move(layers), obj.name, project.warnings, changed, oldP)) continue;
+        if (active) {
+          obj.bvh.refit(obj.mesh);
+          // Rounding is not an edit to carry to the other levels.
+          rebaseReference(stack, changed, oldP, obj.mesh, nullptr);
+        } else {
+          l.boundsStale = true;
+        }
+      }
+      obj.levelLayers.clear();
     } else {
-      obj.bvh.build(obj.mesh);
+      if (!obj.layers.empty()) attachLayers(obj.mesh, std::move(obj.layers), obj.name, project.warnings, changed, oldP);
+      obj.layers = LayerStack{};
+      obj.bvh.build(obj.mesh);  // Reorders the layers along with the vertices.
     }
   }
   return true;

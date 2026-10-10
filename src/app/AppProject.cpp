@@ -316,13 +316,15 @@ void App::saveProjectTo(const std::filesystem::path& requested, std::function<vo
   // Remember the path before serializing, so the file's own settings point at itself.
   const std::filesystem::path previousPath = projectPath_;
   projectPath_ = path;
-  auto bytes = std::make_shared<std::vector<std::uint8_t>>(serializeProject(scene, settingsText()));
+  // The draft copies the scene here; the worker encodes, checksums and writes it.
+  auto draft = std::make_shared<ProjectDraft>(draftProject(scene, settingsText()));
   projectPath_ = previousPath;
   const std::uint64_t fingerprint = sceneFingerprint();
   savingProject_ = true;
   statusMessage = "Saving " + pathToUtf8(path.filename()) + "...";
-  workers_.emplace_back([this, path, bytes, fingerprint, then = std::move(then)] {
+  workers_.emplace_back([this, path, draft, fingerprint, then = std::move(then)] {
     Timer t;
+    auto bytes = std::make_shared<std::vector<std::uint8_t>>(finishProject(std::move(*draft)));
     auto error = std::make_shared<std::string>();
     const bool ok = writeFileAtomic(path, *bytes, error.get());
     const double ms = t.ms();
@@ -375,10 +377,14 @@ void App::loadProjectAsync(const std::filesystem::path& path, bool recovered) {
         statusMessage = "Could not open " + pathToUtf8(path.filename()) + ": " + *error;
         return;
       }
+      const std::vector<std::string> warnings = std::move((**project).warnings);
       applyProject(std::move(**project), path, recovered);
       char buf[64];
       std::snprintf(buf, sizeof(buf), " in %.0f ms", ms);
       statusMessage += buf;
+      // What was left out while the project still opened.
+      if (!warnings.empty()) statusMessage += ".";
+      for (const std::string& w : warnings) statusMessage += " " + w;
     });
   });
 }
@@ -499,11 +505,12 @@ void App::autosaveTick() {
   const std::uint64_t fingerprint = sceneFingerprint();
   if (fingerprint == savedFingerprint_ || fingerprint == autosavedFingerprint_) return;
   autosaveRunning_ = true;
-  auto bytes = std::make_shared<std::vector<std::uint8_t>>(serializeProject(scene, settingsText()));
+  auto draft = std::make_shared<ProjectDraft>(draftProject(scene, settingsText()));
   const std::filesystem::path path = dataDir_ / kAutosaveName;
-  workers_.emplace_back([this, path, bytes, fingerprint] {
+  workers_.emplace_back([this, path, draft, fingerprint] {
+    const std::vector<std::uint8_t> bytes = finishProject(std::move(*draft));
     auto error = std::make_shared<std::string>();
-    const bool ok = writeFileAtomic(path, *bytes, error.get());
+    const bool ok = writeFileAtomic(path, bytes, error.get());
     std::lock_guard lock(asyncMutex_);
     asyncResults_.push_back([this, ok, error, fingerprint] {
       autosaveRunning_ = false;
