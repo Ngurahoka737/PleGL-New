@@ -88,6 +88,18 @@ std::optional<StrokeUndo> stroke(Sculptor& sculptor, SceneObject& obj, const Bru
   return sculptor.endStroke();
 }
 
+// Every leaf's bounds as a full refit gives them: picking must see the committed surface.
+void requireFreshBounds(const SceneObject& obj) {
+  Bvh fresh = obj.bvh;
+  fresh.refit(obj.mesh);
+  const auto a = obj.bvh.leaves(), b = fresh.leaves();
+  REQUIRE(a.size() == b.size());
+  std::size_t stale = 0;
+  for (std::size_t i = 0; i < a.size(); ++i)
+    stale += !(a[i].bounds.min == b[i].bounds.min && a[i].bounds.max == b[i].bounds.max);
+  CHECK(stale == 0);
+}
+
 StrokeOptions onLayer(const Mesh& m) {
   StrokeOptions o;
   o.strength = 0.8f;
@@ -268,6 +280,7 @@ TEST_CASE("layers: a stroke on a layer goes into that layer only") {
   auto undo = stroke(sculptor, obj, draw, onLayer(obj.mesh), dabs, r, 0.9f);
   REQUIRE(undo);
   requireLayers(obj.mesh);
+  requireFreshBounds(obj);
   CHECK(bitwise(obj.mesh.layers.base, before.base));
   CHECK(bitwise(obj.mesh.layers.list[0].offset, before.offsets[0]));
   std::size_t touched = 0;
@@ -302,16 +315,31 @@ TEST_CASE("layers: strokes divide by the layer's strength") {
   Sculptor sculptor;
   DrawBrush draw;
   SUBCASE("half strength stores twice the movement") {
+    // The same stroke on a copy without layers: the surface must end up where the brush left it.
+    Scene plainScene;
+    SceneObject& plain = plainScene.add("P", makeIcosphere(4));  // Built the same way: same vertex order.
+    REQUIRE(bitwise(plain.mesh.positions, obj.mesh.positions));
+    Sculptor plainSculptor;
+    StrokeOptions plainOptions;
+    plainOptions.strength = 0.8f;
+    const auto dabs = path(obj, {0, 1, 0}, {0.3f, 1, 0}, 4);
+    REQUIRE(stroke(plainSculptor, plain, draw, plainOptions, dabs, 0.3f, 1.0f));
+
     addLayer(obj.mesh, 0.5f);
     const std::vector<Vec3> start = obj.mesh.positions;
-    REQUIRE(stroke(sculptor, obj, draw, onLayer(obj.mesh), path(obj, {0, 1, 0}, {0.3f, 1, 0}, 4), 0.3f, 1.0f));
+    REQUIRE(stroke(sculptor, obj, draw, onLayer(obj.mesh), dabs, 0.3f, 1.0f));
     requireLayers(obj.mesh);
-    float worst = 0.0f;
+    requireFreshBounds(obj);
+    float worst = 0.0f, offPlain = 0.0f, moved = 0.0f;
     for (Index v = 0; v < obj.mesh.vertexCount(); ++v) {
       const Vec3 d = obj.mesh.positions[v] - start[v];
       worst = std::max(worst, glm::length(obj.mesh.layers.list[0].offset[v] - d * 2.0f));
+      offPlain = std::max(offPlain, glm::length(obj.mesh.positions[v] - plain.mesh.positions[v]));
+      moved = std::max(moved, glm::length(d));
     }
     CHECK(worst <= 1e-6f);
+    CHECK(moved > 1e-2f);
+    CHECK(offPlain <= 1e-6f);
   }
   SUBCASE("a negative layer still moves the surface the way the brush pushes") {
     addLayer(obj.mesh, -1.0f);
@@ -416,6 +444,7 @@ TEST_CASE("layers: undo restores every normal on a coarse mesh with small leaves
                        0.6f, 1.0f);  // Grid spacing 0.5: a few vertices per dab.
     REQUIRE(undo);
     requireLayers(obj.mesh);
+    requireFreshBounds(obj);  // Strength 0.7 rounds, so the commit moves vertices of tiny leaves.
     stack.push(std::move(*undo));
   }
   const Snap after = snap(obj);
