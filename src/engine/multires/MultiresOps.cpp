@@ -452,6 +452,8 @@ ValidationResult validateMultires(const SceneObject& obj) {
     const ValidationResult layout = validateLayout(m, refit);
     if (!layout.ok) return fail(layout.message + at);
     if (layoutHash(bvhOf(k)) != l.layoutHash) return fail("leaf layout changed" + at);
+    const ValidationResult layers = validateLayers(m, true);
+    if (!layers.ok) return fail(layers.message + at);
     if (l.rule != classifyVertices(m)) return fail("vertex rules" + at);
     if (l.nonManifoldFaces != findNonManifoldFans(m)) return fail("non-manifold fans" + at);
     if (l.canon.vert.size() != m.positions.size() || l.canon.face.size() != m.faceHe.size())

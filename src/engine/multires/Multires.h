@@ -115,6 +115,16 @@ struct LevelDelta {
   std::vector<std::int32_t> setBefore, setAfter;
   bool maskCreated = false;  // The level had no mask before (it is dropped again on `before`).
   bool setsCreated = false;  // Likewise for face sets.
+  // Levels with sculpt layers: the base at every posIndex vertex (a vertex is listed when its
+  // base or any offset changed, even if its composite kept its bits), and the offsets that changed,
+  // per layer by id.
+  struct LayerRows {
+    std::uint32_t id = 0;
+    std::vector<Index> index;
+    std::vector<Vec3> before, after;
+  };
+  std::vector<Vec3> baseBefore, baseAfter;
+  std::vector<LayerRows> layerRows;
   bool empty() const { return posIndex.empty() && maskIndex.empty() && setIndex.empty(); }
   std::size_t bytes() const;
 };

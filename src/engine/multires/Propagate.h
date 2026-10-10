@@ -23,6 +23,10 @@ namespace plegl {
 //    with a tent filter, which keeps constants (a translation arrives exactly) and removes the
 //    checkerboard pattern (pores do not alias into the coarse shape). Changes are filtered, not
 //    values, so each level keeps its own sculpting.
+//  - Sculpt layers on a parked level: the fold acts on the base and the offsets, and positions
+//    are recomposed from them. Up, a translation moves the base; a rotation of the frame moves the
+//    base like a position and turns every offset with the surface, so layer detail rides along.
+//    Down, the change goes into the base. The active level's layers are never touched.
 //  - Mask: up by assignment at vertex children and interpolated changes elsewhere, down by
 //    injection (the coarse value is its vertex child's), so 1.0 stays exact everywhere.
 //  - Face sets: the id and the hidden flag travel separately. Up, children take whichever of the
@@ -118,11 +122,15 @@ struct SyncWorkspace {
     Overlay<Vec3> pos;
     Overlay<float> mask;
     Overlay<std::int32_t> sets;
+    // Levels with sculpt layers: the new base and offsets where they changed.
+    Overlay<Vec3> base;
+    std::vector<Overlay<Vec3>> offs;
   };
   std::vector<Level> levels;
   SyncStamps faces, verts, fine, fineAll;
   std::vector<Index> ring, region, support, targets;
-  std::vector<Vec3> sOld, sNew, delta, scratch;
+  std::vector<Vec3> sOld, sNew, delta, scratch, scratchBase;
+  std::vector<std::vector<Vec3>> scratchOffs;
   std::vector<std::uint8_t> flags;
 };
 

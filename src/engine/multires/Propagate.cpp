@@ -1,5 +1,6 @@
 #include "multires/Propagate.h"
 
+#include <cassert>
 #include <cstring>
 
 #include "core/Parallel.h"
@@ -17,6 +18,7 @@ struct Access {
   const MultiresLevel* meta = nullptr;
   const LevelReference* ref = nullptr;  // Source level only.
   SyncWorkspace::Level* ov = nullptr;   // Other levels only.
+  const LayerStack* layers = nullptr;   // Other levels with sculpt layers only.
   bool source = false;
 
   const Vec3& posOld(Index v) const { return source ? ref->positions[v] : mesh->positions[v]; }
@@ -51,6 +53,23 @@ struct Access {
   void writeSet(Index f, std::int32_t s) {
     ov->sets.value[f] = s;
     if (ov->sets.stamp.insert(f)) ov->sets.changed.push_back(f);
+  }
+  // A level with layers: the new composite p, base b and (when given) offsets offs[l][k] of vertex
+  // v. The vertex is listed even when p kept its bits, so its base and offset rows are collected.
+  void writeLayered(Index v, const Vec3& p, const Vec3& b, const std::vector<std::vector<Vec3>>* offs, std::size_t k) {
+    ov->pos.value[v] = p;
+    if (ov->pos.stamp.insert(v)) ov->pos.changed.push_back(v);
+    if (!sameBits(b, layers->base[v])) {
+      ov->base.value[v] = b;
+      if (ov->base.stamp.insert(v)) ov->base.changed.push_back(v);
+    }
+    if (!offs) return;
+    for (std::size_t l = 0; l < layers->list.size(); ++l) {
+      const Vec3& o = (*offs)[l][k];
+      if (sameBits(o, layers->list[l].offset[v])) continue;
+      ov->offs[l].value[v] = o;
+      if (ov->offs[l].stamp.insert(v)) ov->offs[l].changed.push_back(v);
+    }
   }
 };
 
@@ -173,6 +192,12 @@ void upPositions(const Access& C, Access& F, const SubdivisionLinks& L, const st
 
   ws.scratch.resize(region.size());
   ws.flags.assign(region.size(), 0);
+  const LayerStack* layers = F.layers;
+  if (layers) {
+    ws.scratchBase.resize(region.size());
+    ws.scratchOffs.resize(layers->list.size());
+    for (std::vector<Vec3>& o : ws.scratchOffs) o.resize(region.size());
+  }
   const auto Sold = [&](Index j) -> const Vec3& { return ws.sOld[j]; };
   const auto Snew = [&](Index j) -> const Vec3& { return ws.sNew[j]; };
   parallelFor(0, region.size(), 1024, [&](std::size_t b, std::size_t e) {
@@ -185,6 +210,28 @@ void upPositions(const Access& C, Access& F, const SubdivisionLinks& L, const st
       const DetailFrame fn = detailFrame(fm, i, Snew);
       const bool sameS = sameBits(so, sn), sameFrame = fo == fn;
       if (sameS && sameFrame) continue;  // Nothing this vertex depends on changed: keep its bits.
+      if (layers) {
+        // The same fold on the base, with the offsets turned by the frame's rotation: rot is
+        // linear, so the composite moves as a position without layers would, up to rounding.
+        const bool rotate = !(sameFrame || fo.degenerate || fn.degenerate);
+        const auto rot = [&](const Vec3& x) {
+          return fn.t * glm::dot(fo.t, x) + fn.b * glm::dot(fo.b, x) + fn.n * glm::dot(fo.n, x);
+        };
+        const Vec3& base = layers->base[i];
+        const Vec3 nb = rotate ? sn + rot(base - so) : base + (sn - so);
+        bool same = sameBits(nb, base);
+        for (std::size_t l = 0; l < layers->list.size(); ++l) {
+          const Vec3& o = layers->list[l].offset[i];
+          const Vec3 no = rotate && !isZero(o) ? rot(o) : o;  // Zero offsets stay exactly zero.
+          ws.scratchOffs[l][k] = no;
+          same &= sameBits(no, o);
+        }
+        if (same) continue;
+        ws.scratch[k] = composeFrom(*layers, nb, [&](std::size_t l) -> const Vec3& { return ws.scratchOffs[l][k]; });
+        ws.scratchBase[k] = nb;
+        ws.flags[k] = 2;
+        continue;
+      }
       Vec3 p;
       if (sameFrame || fo.degenerate || fn.degenerate) {
         p = pOld + (sn - so);
@@ -197,8 +244,10 @@ void upPositions(const Access& C, Access& F, const SubdivisionLinks& L, const st
       ws.flags[k] = 1;
     }
   });
-  for (std::size_t k = 0; k < region.size(); ++k)
-    if (ws.flags[k]) F.writePos(region[k], ws.scratch[k]);
+  for (std::size_t k = 0; k < region.size(); ++k) {
+    if (ws.flags[k] == 1) F.writePos(region[k], ws.scratch[k]);
+    if (ws.flags[k] == 2) F.writeLayered(region[k], ws.scratch[k], ws.scratchBase[k], &ws.scratchOffs, k);
+  }
 }
 
 void upMask(const Access& C, Access& F, const SubdivisionLinks& L, const std::vector<Index>& changed,
@@ -296,6 +345,8 @@ void downPositions(const Access& F, Access& C, const SubdivisionLinks& L, const 
   const auto D = [&](Index i) { return ws.fine.has(i) ? ws.delta[i] : Vec3{0.0f}; };
   ws.scratch.resize(targets.size());
   ws.flags.assign(targets.size(), 0);
+  const LayerStack* layers = C.layers;
+  if (layers) ws.scratchBase.resize(targets.size());
   parallelFor(0, targets.size(), 1024, [&](std::size_t b, std::size_t e) {
     for (std::size_t k = b; k < e; ++k) {
       const Index v = targets[k];
@@ -322,6 +373,16 @@ void downPositions(const Access& F, Access& C, const SubdivisionLinks& L, const 
         d = (D(L.vertexChild[v]) * 4.0f + sumE * 2.0f + sumF) / static_cast<float>(4 + 3 * n);
       }
       if (d.x == 0.0f && d.y == 0.0f && d.z == 0.0f) continue;
+      if (layers) {
+        // The change goes into the base; the layers stay as they are.
+        const Vec3& base = layers->base[v];
+        const Vec3 nb = base + d;
+        if (sameBits(nb, base)) continue;
+        ws.scratch[k] = composeFrom(*layers, nb, [&](std::size_t l) -> const Vec3& { return layers->list[l].offset[v]; });
+        ws.scratchBase[k] = nb;
+        ws.flags[k] = 2;
+        continue;
+      }
       const Vec3& old = C.posOld(v);
       const Vec3 p = old + d;
       if (sameBits(p, old)) continue;
@@ -329,8 +390,10 @@ void downPositions(const Access& F, Access& C, const SubdivisionLinks& L, const 
       ws.flags[k] = 1;
     }
   });
-  for (std::size_t k = 0; k < targets.size(); ++k)
-    if (ws.flags[k]) C.writePos(targets[k], ws.scratch[k]);
+  for (std::size_t k = 0; k < targets.size(); ++k) {
+    if (ws.flags[k] == 1) C.writePos(targets[k], ws.scratch[k]);
+    if (ws.flags[k] == 2) C.writeLayered(targets[k], ws.scratch[k], ws.scratchBase[k], nullptr, 0);
+  }
 }
 
 void downMask(const Access& F, Access& C, const SubdivisionLinks& L, const std::vector<Index>& changed) {
@@ -395,6 +458,25 @@ LevelDelta collectDelta(int level, const Access& a) {
   for (Index v : d.posIndex) {
     d.posBefore.push_back(m.positions[v]);
     d.posAfter.push_back(a.ov->pos.value[v]);
+  }
+  if (a.layers && !d.posIndex.empty()) {
+    const LayerStack& s = *a.layers;
+    for (Index v : d.posIndex) {
+      d.baseBefore.push_back(s.base[v]);
+      d.baseAfter.push_back(a.ov->base.stamp.has(v) ? a.ov->base.value[v] : s.base[v]);
+    }
+    for (std::size_t l = 0; l < s.list.size(); ++l) {
+      const SyncWorkspace::Overlay<Vec3>& o = a.ov->offs[l];
+      if (o.changed.empty()) continue;
+      LevelDelta::LayerRows rows;
+      rows.id = s.list[l].id;
+      rows.index = sorted(o.changed);
+      for (Index v : rows.index) {
+        rows.before.push_back(s.list[l].offset[v]);
+        rows.after.push_back(o.value[v]);
+      }
+      d.layerRows.push_back(std::move(rows));
+    }
   }
   d.maskIndex = sorted(a.ov->mask.changed);
   for (Index v : d.maskIndex) {
@@ -493,6 +575,12 @@ SyncDelta computeSync(const Multires& stack, const Mesh& live, SyncDelta diff, S
       x.ov->pos.begin(x.mesh->positions.size());
       x.ov->mask.begin(x.mesh->positions.size());
       x.ov->sets.begin(x.mesh->faceHe.size());
+      if (!x.mesh->layers.empty()) {
+        x.layers = &x.mesh->layers;
+        x.ov->base.begin(x.mesh->positions.size());
+        x.ov->offs.resize(x.layers->list.size());
+        for (auto& o : x.ov->offs) o.begin(x.mesh->positions.size());
+      }
     }
   }
   const LevelDelta& src = diff.levels[0];
@@ -554,6 +642,18 @@ void applyDelta(Multires& stack, const SyncDelta& delta, bool after, SyncWorkspa
     Mesh& m = level.mesh;
     if (!d.posIndex.empty()) {
       for (std::size_t i = 0; i < d.posIndex.size(); ++i) m.positions[d.posIndex[i]] = pos[i];
+      // Sculpt layer rows go back together with the composites they make.
+      if (!d.baseBefore.empty() && m.layers.base.size() == m.positions.size()) {
+        const auto& base = after ? d.baseAfter : d.baseBefore;
+        for (std::size_t i = 0; i < d.posIndex.size(); ++i) m.layers.base[d.posIndex[i]] = base[i];
+      }
+      for (const LevelDelta::LayerRows& rows : d.layerRows) {
+        std::vector<Vec3>* offset = rows.id != 0 ? m.layers.array(rows.id) : nullptr;
+        assert(offset);
+        if (!offset) continue;
+        const auto& values = after ? rows.after : rows.before;
+        for (std::size_t i = 0; i < rows.index.size(); ++i) (*offset)[rows.index[i]] = values[i];
+      }
       // Normals change on every corner of every face around a moved vertex.
       ws.verts.begin(m.positions.size());
       std::vector<Index>& verts = ws.targets;
