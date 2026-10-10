@@ -732,17 +732,22 @@ void App::drawUi() {
 
 void App::drawLayersMenu() {
   if (!ImGui::BeginMenu("Layers")) return;
+  // Read everything first: an item can add or remove layers, which moves the list.
   const SceneObject* sel = scene.find(selectedId);
   const LayerStack* stack = sel ? &sel->mesh.layers : nullptr;
   const SculptLayer* layer = stack ? stack->find(stack->active) : nullptr;
   const bool can = canEditLayers();
   const bool any = can && stack && !stack->empty();
   const bool one = can && layer;
+  const std::uint32_t layerId = layer ? layer->id : 0;
+  const bool layerHidden = layer && !layer->visible;
+  const bool hasBelow = layer && stack->indexOf(layerId) > 0;
+  layer = nullptr;
   if (ImGui::MenuItem("New Layer", "Ctrl+L", false, can && sel)) addLayer();
   if (ImGui::MenuItem("Duplicate Layer", nullptr, false, one)) duplicateLayer();
   if (ImGui::MenuItem("Delete Layer", nullptr, false, one)) deleteLayer();
   ImGui::Separator();
-  if (ImGui::MenuItem("Merge Down", nullptr, false, one && stack->indexOf(layer->id) > 0)) mergeLayerDown();
+  if (ImGui::MenuItem("Merge Down", nullptr, false, one && hasBelow)) mergeLayerDown();
   if (ImGui::MenuItem("Apply Layer", nullptr, false, one)) applyLayer();
   if (ImGui::MenuItem("Apply All Layers", nullptr, false, any)) applyAllLayers();
   if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -751,9 +756,8 @@ void App::drawLayersMenu() {
   if (ImGui::MenuItem("Invert Layer", nullptr, false, one)) invertLayer();
   if (ImGui::MenuItem("Mask from Layer", nullptr, false, one)) maskFromLayer();
   ImGui::Separator();
-  if (ImGui::MenuItem(layer && !layer->visible ? "Show Layer" : "Hide Layer", "L", false, one))
-    toggleActiveLayerVisible();
-  if (ImGui::MenuItem("Solo Layer", "Alt+click eye", false, one)) soloLayer(layer->id);
+  if (ImGui::MenuItem(layerHidden ? "Show Layer" : "Hide Layer", "L", false, one)) toggleActiveLayerVisible();
+  if (ImGui::MenuItem("Solo Layer", "Alt+click eye", false, one)) soloLayer(layerId);
   if (ImGui::MenuItem("Show All Layers", nullptr, false, any)) setAllLayersVisible(true);
   if (ImGui::MenuItem("Hide All Layers", nullptr, false, any)) setAllLayersVisible(false);
   ImGui::EndMenu();
@@ -767,8 +771,10 @@ void App::drawLayerPanel(SceneObject& obj) {
   } else {
     sectionHeader("Sculpt layers");
   }
+  // Buttons below can add or remove layers mid-frame, so layer pointers are looked up again after
+  // them rather than kept.
   const LayerStack& stack = obj.mesh.layers;
-  const SculptLayer* active = stack.find(stack.active);
+  const bool hasActive = stack.find(stack.active) != nullptr;
   const bool can = canEditLayers();
   ImGui::BeginDisabled(!can);
 
@@ -785,13 +791,13 @@ void App::drawLayerPanel(SceneObject& obj) {
   if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
     ImGui::SetTooltip("%s", full.empty() ? "A new empty layer on top (Ctrl+L). Strokes go into it." : full.c_str());
   ImGui::SameLine();
-  ImGui::BeginDisabled(!active || !full.empty());
+  ImGui::BeginDisabled(!hasActive || !full.empty());
   if (ImGui::Button("Duplicate", ImVec2(third, 0))) duplicateLayer();
   ImGui::EndDisabled();
   if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
     ImGui::SetTooltip("%s", !full.empty() ? full.c_str() : "A hidden copy of the active layer.");
   ImGui::SameLine();
-  ImGui::BeginDisabled(!active);
+  ImGui::BeginDisabled(!hasActive);
   if (ImGui::Button("Delete##layer", ImVec2(third, 0))) deleteLayer();
   ImGui::EndDisabled();
 
@@ -870,11 +876,11 @@ void App::drawLayerPanel(SceneObject& obj) {
   if (contextLayer != 0) menuLayer = contextLayer;
   if (ImGui::BeginPopup("layerActions")) {
     const int index = stack.indexOf(menuLayer);
-    const SculptLayer* layer = index >= 0 ? &stack.list[static_cast<std::size_t>(index)] : nullptr;
-    if (!layer) {
+    if (index < 0) {
       ImGui::CloseCurrentPopup();
     } else {
-      ImGui::TextDisabled("%s", layer->name.c_str());
+      const std::string name = stack.list[static_cast<std::size_t>(index)].name;  // Ops below may move the list.
+      ImGui::TextDisabled("%s", name.c_str());
       ImGui::Separator();
       auto onLayer = [&](void (App::*op)()) {
         selectLayer(menuLayer);
@@ -888,7 +894,7 @@ void App::drawLayerPanel(SceneObject& obj) {
       if (ImGui::MenuItem("Rename")) {
         renaming = menuLayer;
         renamingObject = obj.id;
-        renameText = layer->name;
+        renameText = name;
         focusRename = true;
       }
       ImGui::Separator();
@@ -904,6 +910,7 @@ void App::drawLayerPanel(SceneObject& obj) {
   ImGui::EndDisabled();
 
   ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+  const SculptLayer* active = stack.find(stack.active);
   ImGui::Text("Sculpting on: %s", active ? active->name.c_str() : "Base");
   if (obj.multires) ImGui::TextWrapped("Each subdivision level has its own layers.");
   ImGui::Text("Layers use %.1f MB", static_cast<double>(objectLayerBytes(obj)) / (1024.0 * 1024.0));
