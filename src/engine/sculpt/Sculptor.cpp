@@ -790,8 +790,19 @@ float snakeGain(float strength, double dtMs) {
   return static_cast<float>(1.0 - std::pow(1.0 - s, dt / (1000.0 / 60.0)));
 }
 
-Index Sculptor::findHook(const CopyCluster& cluster, float radius) {
+Index Sculptor::findHook(const CopyCluster& cluster, float radius, int self) {
   const Mesh& m = object_->mesh;
+  // When re-gluing cluster `self`, the other clusters' hooks are not candidates: two copies on one
+  // vertex would pull it both ways for the rest of the stroke.
+  std::array<Index, kMaxSymmetryCopies> others{};
+  int otherCount = 0;
+  if (self >= 0)
+    for (int j = 0; j < snakeClusterCount_; ++j)
+      if (j != self && snakeHooks_[static_cast<std::size_t>(j)] != kInvalid)
+        others[static_cast<std::size_t>(otherCount++)] = snakeHooks_[static_cast<std::size_t>(j)];
+  const auto taken = [&](Index v) {
+    return std::find(others.begin(), others.begin() + otherCount, v) != others.begin() + otherCount;
+  };
   const FaceSetFilter allowed = filter(cluster.op);
   // Coordinates the merged copies agree are zero: a hook with those zero stays on the plane or
   // axis, where the pins keep it.
@@ -810,7 +821,8 @@ Index Sculptor::findHook(const CopyCluster& cluster, float radius) {
       const Vec3 d = m.positions[v] - cluster.center;
       const float dist2 = glm::dot(d, d);
       // Removed and isolated vertices have no face; hidden ones none that is visible.
-      if ((dist2 >= bestDist2 && dist2 >= bestSeam2) || m.vertHe[v] == kInvalid || !allowed.allows(m, v)) continue;
+      if ((dist2 >= bestDist2 && dist2 >= bestSeam2) || m.vertHe[v] == kInvalid || !allowed.allows(m, v) || taken(v))
+        continue;
       if (dist2 < bestDist2 || (dist2 == bestDist2 && v < best)) {
         bestDist2 = dist2;
         best = v;
@@ -856,7 +868,7 @@ void Sculptor::reglueHooks(float radius, std::span<const Vec3> before) {
     if (hook == kInvalid || m.vertHe[hook] != kInvalid) continue;
     CopyCluster around = snakeClusters_[static_cast<std::size_t>(k)];
     around.center = before[static_cast<std::size_t>(k)];
-    hook = findHook(around, radius);
+    hook = findHook(around, radius, k);
   }
 }
 
@@ -949,12 +961,13 @@ SnakeStep Sculptor::snakeTo(const Vec3& target, float radius, float gain, const 
   }
 
   // 3. Sub-dabs glued to the hooks. One that would pull farther than a step is cut to a step and
-  // the next tick covers the rest. A pull below the float spacing at the hook would round away.
+  // the next tick covers the rest. None when the hook would move (E * command) by less than the
+  // float spacing at it: the move would round away.
   const float length = glm::length(command);
   const float stepLen = kSnakeStep * radius;
   const float resolution = std::numeric_limits<float>::epsilon() *
                            std::max({std::abs(p0.x), std::abs(p0.y), std::abs(p0.z)});
-  if (length > std::max(1e-7f * radius, resolution)) {
+  if (glm::length(E * command) > std::max(1e-7f * radius, resolution)) {
     const int n = std::clamp(static_cast<int>(std::ceil(length / stepLen)), 1, kMaxSnakeSubDabs);
     Vec3 part = command / static_cast<float>(n);
     if (glm::length(part) > stepLen) part *= stepLen / glm::length(part);

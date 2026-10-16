@@ -477,10 +477,16 @@ TEST_CASE("snake hook: a hook pinned on the mirror plane settles when the mirror
 }
 
 TEST_CASE("snake hook: a hook on the plane following an off-plane cursor at low gain settles") {
-  // The pull along the plane shrinks to under a float step at the hook; it must count as none.
-  for (const float gain : {0.2f, 0.4f}) {
+  // The hook's move along the plane shrinks to under a float step; it must count as none, also
+  // when the mask makes the steered pull several times the move.
+  for (const auto& [gain, mask] : {std::pair{0.2f, 0.0f}, std::pair{0.4f, 0.0f}, std::pair{0.7f, 0.9f}}) {
     Scene scene;
-    SceneObject& obj = scene.add("S", makeQuadSphere(16));
+    Mesh mesh = makeQuadSphere(16);
+    if (mask > 0.0f) {
+      mesh.ensureMask();
+      std::fill(mesh.mask.begin(), mesh.mask.end(), mask);
+    }
+    SceneObject& obj = scene.add("S", std::move(mesh));
     SnakeHookBrush snake;
     Sculptor s;
     const float r = 0.15f;
@@ -491,8 +497,38 @@ TEST_CASE("snake hook: a hook on the plane following an off-plane cursor at low 
     const Vec3 target = start + Vec3{0.4f * r, 0.73f * r, 0.31f * r};
     int still = 0, ticks = 0;
     for (; ticks < 600 && still < 3; ++ticks) still = s.snakeTo(target, r, gain).subDabs == 0 ? still + 1 : 0;
-    INFO("gain " << gain << " ticks " << ticks);
+    INFO("gain " << gain << " mask " << mask << " ticks " << ticks);
     CHECK(still == 3);
     REQUIRE(s.endStroke());
+  }
+}
+
+TEST_CASE("snake hook: a removed hook is never glued onto another copy's hook") {
+  // An odd resolution has no vertex loop on the plane, so the two hooks are neighbours across it
+  // and one copy's pass can merge the other's hook into its own.
+  for (const float offset : {0.06f, 0.1f, 0.15f, 0.2f}) {
+    Scene scene;
+    SceneObject& obj = scene.add("S", makeQuadSphere(15));
+    SnakeHookBrush snake;
+    Sculptor s;
+    const float r = 0.2f;
+    StrokeOptions o = snakeOptions({true, false, false});
+    o.dyntopo = true;
+    o.dyntopoOptions.timeBudgetMs = 0.0;
+    const Vec3 press = test::surfacePoint(obj, {offset * r, 1.0f, 0.0f});
+    REQUIRE(s.beginSnake(obj, snake, o, press, r, 0.0f, "Snake Hook"));
+    REQUIRE(s.snakeHook(1) != kInvalid);
+    const Vec3 start = obj.mesh.positions[s.snakeHook()];
+    for (int i = 1; i <= 12; ++i) {
+      DabTopology topo;
+      topo.detail = 0.6f;
+      s.snakeTo(start + Vec3{0.1f * r * static_cast<float>(i), 0.15f * r * static_cast<float>(i), 0.0f}, r, 1.0f,
+                topo);
+      INFO("offset " << offset << " tick " << i);
+      REQUIRE(s.snakeHook() != kInvalid);
+      if (s.snakeHook(1) != kInvalid) REQUIRE(s.snakeHook(1) != s.snakeHook());
+    }
+    REQUIRE(s.endStroke());
+    test::requireValid(obj.mesh);
   }
 }

@@ -231,7 +231,7 @@ class Sculptor {
   FaceSetFilter filter(int op) const;
   void applyTopology(const Dab& dab, const DabTopology& topology);
   double topologyBudget(int passes) const;
-  Index findHook(const CopyCluster& cluster, float radius);
+  Index findHook(const CopyCluster& cluster, float radius, int self = -1);
   void reglueHooks(float radius, std::span<const Vec3> before);
   void finishPose();
   Mat3 snakeSteering(float radius) const;
