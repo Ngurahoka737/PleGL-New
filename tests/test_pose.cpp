@@ -7,6 +7,7 @@
 #include "TestUtil.h"
 #include "core/Parallel.h"
 #include "mesh/Primitives.h"
+#include "multires/MultiresOps.h"
 #include "multires/Propagate.h"
 #include "scene/Scene.h"
 #include "sculpt/LayerOps.h"
@@ -447,6 +448,55 @@ TEST_CASE("pose: a stroke on a sculpt layer commits into it and undoes") {
   REQUIRE_FALSE(stack.undo(scene).empty());
   CHECK(test::hashBits(obj.mesh.layers.list[0].offset) == test::hashBits(offsets));
   CHECK(test::hashBits(obj.mesh.positions) == test::hashBits(positions));
+}
+
+TEST_CASE("pose: on a low subdivision level the detail above rides along rigidly") {
+  Scene scene;
+  SyncWorkspace ws;
+  SceneObject& obj = scene.add("T", test::makeTube(16, 40, 0.1f, 2.0f));
+  for (int i = 0; i < 2; ++i) {
+    std::string error;
+    INFO(error);
+    REQUIRE(subdivideObject(obj, ws, &error));
+  }
+  // Detail on the top level: every vertex near the tip pushed out a little.
+  for (Index v = 0; v < obj.mesh.vertexCount(); ++v) {
+    const Vec3 p = obj.mesh.positions[v];
+    if (p.y > 1.5f) obj.mesh.positions[v] += Vec3{p.x, 0.0f, p.z} * 0.2f * std::sin(p.y * 40.0f);
+  }
+  obj.mesh.computeNormals();
+  obj.bvh.refit(obj.mesh);
+  REQUIRE(setActiveLevel(obj, 0, ws));
+  const std::vector<Vec3> top = obj.multires->levels[2].mesh.positions;
+  const std::vector<Vec3> low = obj.mesh.positions;
+  const Vec3 click = hitFrom(obj, {1.0f, 1.8f, 0.0f}, {-1, 0, 0});
+  Sculptor s;
+  REQUIRE(s.beginPose(obj, withSymmetry(), {}, click, 0.5f, "Pose"));
+  const Vec3 pivot = s.poseBuild()->rigs[0].pivot;
+  const Vec3 r = Vec3{0.0f, 0.0f, 1.0f} * 0.8f;
+  s.pose(targetFor(click, pivot, r, glm::length(r)), {0, 0, 1});
+  auto entry = s.endStroke();
+  REQUIRE(entry);
+  // The entry undoes and redoes on its level.
+  UndoStack stack;
+  stack.push(std::move(*entry));
+  REQUIRE_FALSE(stack.undo(scene).empty());
+  CHECK(test::hashBits(obj.mesh.positions) == test::hashBits(low));
+  REQUIRE_FALSE(stack.redo(scene).empty());
+  // Up on the top level, the tip (all of whose support turned rigidly) turned with its detail.
+  REQUIRE(setActiveLevel(obj, 2, ws));
+  float worst = 0.0f;
+  int checked = 0;
+  for (Index v = 0; v < obj.mesh.vertexCount(); ++v) {
+    if (top[v].y < 1.6f) continue;
+    worst = std::max(worst, glm::length(obj.mesh.positions[v] - turned(top[v], pivot, r)));
+    ++checked;
+  }
+  CHECK(checked > 100);
+  CHECK(worst < 1e-4f);
+  // The root end did not move.
+  for (Index v = 0; v < obj.mesh.vertexCount(); ++v)
+    if (top[v].y < 0.8f) REQUIRE(sameBits(obj.mesh.positions[v], top[v]));
 }
 
 TEST_CASE("pose: every update starts from the press, so going back gives the same bits") {

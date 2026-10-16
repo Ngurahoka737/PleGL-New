@@ -146,6 +146,173 @@ int main(int argc, char** argv) {
       report(obj, radius, "Grab", times, verts);
     }
   }
+  // Symmetry: Draw strokes of 50 dabs with the copies each spec makes. "apart" runs on one side
+  // of the X plane, so its mirror copy is separate; "plane" runs along the plane, where the copies
+  // merge into one. 64 copies at radius 0.40 is skipped (the app warns above 16).
+  std::printf("\nSymmetry benchmark (Draw, ms per dab, 50 dabs)\n\n");
+  std::printf("%10s %8s %10s %7s %10s %10s %10s\n", "vertices", "radius", "symmetry", "copies", "avg ms", "p95 ms",
+              "max ms");
+  struct SymmetryCase {
+    const char* name;
+    bool x, y, z;
+    int radial;
+    bool onPlane;
+  };
+  const SymmetryCase symmetryCases[] = {{"none", false, false, false, 1, false},
+                                        {"X apart", true, false, false, 1, false},
+                                        {"X plane", true, false, false, 1, true},
+                                        {"XYZ", true, true, true, 1, false},
+                                        {"radial16", false, false, false, 16, false},
+                                        {"X+rad32", true, false, false, 32, false}};
+  for (int res : strokeRes) {
+    for (const SymmetryCase& c : symmetryCases) {
+      for (float radius : {0.05f, 0.15f, 0.4f}) {
+        if (c.radial * (c.x ? 2 : 1) > 16 && radius > 0.2f) continue;
+        Scene scene;
+        SceneObject& obj = scene.add("Sphere", makeQuadSphere(res));
+        DrawBrush draw;
+        Sculptor sculptor;
+        StrokeOptions o;
+        o.strength = 0.5f;
+        o.symmetryX = c.x;
+        o.symmetryY = c.y;
+        o.symmetryZ = c.z;
+        o.radialAxis = Axis::Y;
+        o.radialCount = c.radial;
+        sculptor.beginStroke(obj, draw, o, "Draw");
+        std::vector<double> times;
+        int copies = 1;
+        for (int i = 0; i < 50; ++i) {
+          const float t = static_cast<float>(i) / 49.0f;
+          const Vec3 dir = glm::normalize(c.onPlane ? Vec3{0.0f, -0.5f + t, 1.0f} : Vec3{0.75f, -0.5f + t, 0.65f});
+          RayHit hit;
+          if (!obj.bvh.raycast(obj.mesh, Ray{dir * 3.0f, -dir}, hit)) continue;
+          sculptor.dab(hit.position, radius, 0.5f);
+          times.push_back(sculptor.lastDab().totalMs);
+          copies = sculptor.lastDab().copies;
+        }
+        sculptor.endStroke();
+        std::sort(times.begin(), times.end());
+        double avg = 0.0;
+        for (double t : times) avg += t;
+        avg /= static_cast<double>(times.size());
+        std::printf("%10d %8.2f %10s %7d %10.3f %10.3f %10.3f\n", obj.mesh.vertexCount(), radius, c.name, copies, avg,
+                    times.at(times.size() * 95 / 100), times.back());
+      }
+    }
+  }
+
+  // Snake Hook: one stroke pulling a horn out of the sphere over 60 ticks at 60 Hz, the cursor
+  // moving one radius per tick (about 6 sub-dabs each), without and with dynamic topology (detail
+  // radius / 8, a 10 ms tick budget as in the app).
+  std::printf("\nSnake Hook benchmark (radius 0.15, 60 ticks, cursor moves 1 radius per tick)\n\n");
+  std::printf("%10s %8s %9s %10s %10s %10s %11s %10s %10s\n", "vertices", "dyntopo", "sub/tick", "tick avg", "tick p95",
+              "tick max", "per sub ms", "out verts", "end ms");
+  for (int res : strokeRes) {
+    for (bool dyntopo : {false, true}) {
+      Scene scene;
+      SceneObject& obj = scene.add("Sphere", makeQuadSphere(res));
+      SnakeHookBrush snake;
+      Sculptor sculptor;
+      StrokeOptions o;
+      o.strength = 0.7f;
+      o.dyntopo = dyntopo;
+      const float radius = 0.15f;
+      const Vec3 dir = glm::normalize(Vec3{0.0f, 0.3f, 1.0f});
+      RayHit hit;
+      if (!obj.bvh.raycast(obj.mesh, Ray{dir * 3.0f, -dir}, hit)) continue;
+      if (!sculptor.beginSnake(obj, snake, o, hit.position, radius, 0.0f, "Snake Hook")) continue;
+      Vec3 target = hit.position;
+      std::vector<double> times;
+      int subDabs = 0;
+      for (int i = 0; i < 60; ++i) {
+        target += glm::normalize(dir + Vec3{0.4f * std::sin(0.15f * static_cast<float>(i)), 0.0f, 0.0f}) * radius;
+        DabTopology topology;
+        if (dyntopo) topology.detail = radius / 8.0f;
+        Timer t;
+        const SnakeStep step = sculptor.snakeTo(target, radius, snakeGain(o.strength, 1000.0 / 60.0), topology, 10.0);
+        times.push_back(t.ms());
+        subDabs += step.subDabs;
+      }
+      Timer t;
+      sculptor.endStroke();
+      const double endMs = t.ms();
+      double total = 0.0;
+      for (double ms : times) total += ms;
+      std::sort(times.begin(), times.end());
+      std::printf("%10d %8s %9.1f %10.3f %10.3f %10.3f %11.3f %10d %10.1f\n", static_cast<int>(6 * res * res + 2),
+                  dyntopo ? "on" : "off", subDabs / 60.0, total / 60.0, times.at(times.size() * 95 / 100), times.back(),
+                  total / std::max(subDabs, 1), obj.mesh.vertexCount(), endMs);
+    }
+  }
+
+  // Pose: a press on top of the sphere. Topology mode turns the cap within one radius of it along
+  // the surface (a tenth and half of the sphere); Mask mode turns the unmasked upper half. "build"
+  // is the press without a preview, "reused" the press taking the preview's build; then 30 turns
+  // up to 60 degrees and the end of the stroke (exact normals and bounds).
+  std::printf("\nPose benchmark (30 turns up to 60 degrees)\n\n");
+  std::printf("%10s %9s %10s %10s %10s %10s %10s %10s %10s\n", "vertices", "mode", "region", "visited", "build ms",
+              "reused ms", "turn avg", "turn p95", "end ms");
+  for (int res : strokeRes) {
+    struct PoseCase {
+      PoseMode mode;
+      float radius;
+    };
+    for (const PoseCase& c : {PoseCase{PoseMode::Topology, 0.6435f}, PoseCase{PoseMode::Topology, 1.5708f},
+                              PoseCase{PoseMode::Mask, 0.3f}}) {
+      Scene scene;
+      SceneObject& obj = scene.add("Sphere", makeQuadSphere(res));
+      if (c.mode == PoseMode::Mask) {
+        obj.mesh.mask.resize(obj.mesh.positions.size());
+        for (Index v = 0; v < obj.mesh.vertexCount(); ++v)
+          obj.mesh.mask[v] = obj.mesh.positions[v].y < 0.0f ? 1.0f : 0.0f;
+      }
+      RayHit hit;
+      if (!obj.bvh.raycast(obj.mesh, Ray{{0.01f, 3.0f, 0.02f}, {0.0f, -1.0f, 0.0f}}, hit)) continue;
+      const Vec3 click = hit.position;
+      const PoseOptions pose{c.mode, 0.25f};
+      FanCache fans;
+      PoseBuild preview = buildPoseFor(obj, {}, pose, click, c.radius, {}, fans);
+      double reusedMs = 0.0;
+      {
+        Sculptor sculptor;
+        Timer t;
+        if (sculptor.beginPose(obj, {}, pose, click, c.radius, "Pose", &preview)) reusedMs = t.ms();
+        sculptor.endStroke();
+      }
+      Sculptor sculptor;
+      Timer t;
+      if (!sculptor.beginPose(obj, {}, pose, click, c.radius, "Pose")) {
+        std::printf("  pose build failed\n");
+        continue;
+      }
+      const double buildMs = t.ms();
+      const PoseBuild& build = *sculptor.poseBuild();
+      std::size_t region = 0;
+      for (const PoseRig& rig : build.rigs) region += rig.verts.size();
+      const std::size_t visited = build.visited;
+      const Vec3 pivot = build.rigs[0].pivot;
+      std::vector<double> times;
+      for (int i = 1; i <= 30; ++i) {
+        const float angle = glm::radians(60.0f) * static_cast<float>(i) / 30.0f;
+        const Vec3 from = click - pivot;
+        const Vec3 target = pivot + Vec3{from.x * std::cos(angle) - from.y * std::sin(angle),
+                                         from.x * std::sin(angle) + from.y * std::cos(angle), from.z};
+        sculptor.pose(target, {0.0f, 0.0f, 1.0f});
+        times.push_back(sculptor.lastDab().totalMs);
+      }
+      t.reset();
+      sculptor.endStroke();
+      const double endMs = t.ms();
+      double avg = 0.0;
+      for (double ms : times) avg += ms;
+      std::sort(times.begin(), times.end());
+      std::printf("%10d %9s %10zu %10zu %10.1f %10.2f %10.3f %10.3f %10.1f\n", obj.mesh.vertexCount(),
+                  c.mode == PoseMode::Mask ? "mask" : "topology", region, visited, buildMs, reusedMs, avg / 30.0,
+                  times.at(times.size() * 95 / 100), endMs);
+    }
+  }
+
   // Dynamic topology strokes with the app's default per-pass budget (3 ms). The detail size is a
   // twelfth of the radius, so every dab refines. "dab" includes the topology pass; "end" is the
   // compaction in endStroke(), with a warm workspace as in the app (it keeps one for the session).

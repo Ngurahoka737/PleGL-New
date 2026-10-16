@@ -119,6 +119,7 @@ if(PLEGL_BUILD_TESTS)
     tests/test_symmetry.cpp
     tests/test_snakehook.cpp
     tests/test_pose.cpp
+    tests/test_fuzz_symmetry.cpp
   )
   target_link_libraries(plegl_tests PRIVATE plegl_engine doctest::doctest plegl_warnings)
   add_test(NAME plegl_tests COMMAND plegl_tests)

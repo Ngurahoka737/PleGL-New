@@ -519,8 +519,10 @@ bool Sculptor::applyCopies(int count, const ApplyFlags& flags) {
     });
   }
 
-  // Phase P: vertices that started on a symmetry plane or axis go back onto it.
-  for (const PinnedVertex& pin : pins_) m.positions[pin.v] = snapPinned(pin.pin, pin.start, m.positions[pin.v]);
+  // Phase P: vertices that started on a symmetry plane or axis and moved go back onto it; a
+  // vertex the dab left alone (masked, filtered, outside the falloff) stays where it is.
+  for (const PinnedVertex& pin : pins_)
+    if (!sameBits(m.positions[pin.v], pin.start)) m.positions[pin.v] = snapPinned(pin.pin, pin.start, m.positions[pin.v]);
   lastDab_.pinned = static_cast<int>(pins_.size());
   lastDab_.brushMs += t.ms();
 
@@ -763,7 +765,7 @@ void Sculptor::grab(const Vec3& offset) {
   });
   for (const auto& [i, pin] : grabPins_) {
     const GrabVertex& g = grabVerts_[i];
-    m.positions[g.v] = snapPinned(pin, g.start, m.positions[g.v]);
+    if (!sameBits(m.positions[g.v], g.start)) m.positions[g.v] = snapPinned(pin, g.start, m.positions[g.v]);
   }
   lastDab_.brushMs = t.ms();
   lastDab_.copies = group_.size();
@@ -1075,10 +1077,14 @@ void Sculptor::finishPose() {
   // that changed shape.
   poseStroke_ = false;
   Mesh& m = object_->mesh;
-  std::vector<Index> verts = pose_.bentNormals;
-  for (const PoseRig& rig : pose_.rigs) verts.insert(verts.end(), rig.verts.begin(), rig.verts.end());
-  std::sort(verts.begin(), verts.end());
-  verts.erase(std::unique(verts.begin(), verts.end()), verts.end());
+  // Every list is ascending, so merging keeps the union ascending.
+  std::vector<Index> verts = pose_.bentNormals, merged;
+  for (const PoseRig& rig : pose_.rigs) {
+    merged.clear();
+    merged.reserve(verts.size() + rig.verts.size());
+    std::set_union(verts.begin(), verts.end(), rig.verts.begin(), rig.verts.end(), std::back_inserter(merged));
+    verts.swap(merged);
+  }
   recomputeNormals(verts);
   object_->bvh.refitLeaves(m, pose_.refitLeaves);
   strokeRefit_.insert(strokeRefit_.end(), pose_.refitLeaves.begin(), pose_.refitLeaves.end());

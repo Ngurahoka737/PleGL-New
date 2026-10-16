@@ -1,9 +1,9 @@
 #include "sculpt/PoseOps.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
-#include <queue>
 #include <tuple>
 #include <unordered_map>
 
@@ -44,41 +44,89 @@ struct DisjointSet {
   }
 };
 
+// The fan of a non-manifold vertex v from findNonManifoldFans: its outgoing half-edges, or an
+// empty range when v is manifold.
+std::pair<const std::pair<Index, Index>*, const std::pair<Index, Index>*> fanOf(
+    std::span<const std::pair<Index, Index>> fans, Index v) {
+  if (fans.empty()) return {nullptr, nullptr};
+  const auto range = std::equal_range(fans.begin(), fans.end(), std::pair<Index, Index>{v, kInvalid},
+                                      [](const auto& x, const auto& y) { return x.first < y.first; });
+  return {fans.data() + (range.first - fans.begin()), fans.data() + (range.second - fans.begin())};
+}
+
+// Walks the face of half-edge h from the edge after h: calls corner(u) for every vertex of the
+// face but h's own, and returns the edge before h. Mesh::forEachOutgoing walks the same face to
+// find that edge, so walking it once serves both.
+template <class Fn>
+Index walkFace(const Mesh& m, Index h, Fn&& corner) {
+  Index p = h;
+  for (Index g = m.heNext[h]; g != h; g = m.heNext[g]) {
+    corner(m.heVert[g]);
+    p = g;
+  }
+  return p;
+}
+
+// Mesh::forEachOutgoing, calling fn(h, prev) with the edge before h in its face; `corner` sees
+// the face's other vertices on the way (see walkFace).
+template <class Fn, class Corner>
+void forEachOutgoingWalk(const Mesh& m, Index v, Fn&& fn, Corner&& corner) {
+  const Index start = m.vertHe[v];
+  if (start == kInvalid) return;
+  Index h = start;
+  for (;;) {
+    const Index p = walkFace(m, h, [&](Index u) { corner(h, u); });
+    fn(h, p);
+    const Index t = m.heTwin[p];
+    if (t == kInvalid) break;  // Hit the border; walk the other way below.
+    h = t;
+    if (h == start) return;
+  }
+  h = start;
+  for (;;) {
+    const Index t = m.heTwin[h];
+    if (t == kInvalid) return;
+    h = m.heNext[t];
+    fn(h, walkFace(m, h, [&](Index u) { corner(h, u); }));
+  }
+}
+
 // Calls fn(u) for every vertex sharing an edge with v, in every fan of a non-manifold vertex.
 // A neighbour may come twice.
 template <class Fn>
 void forEachNeighbour(const Mesh& m, std::span<const std::pair<Index, Index>> fans, Index v, Fn&& fn) {
-  const auto visit = [&](Index h) {
-    fn(m.heTarget(h));
-    const Index prev = m.hePrev(h);
-    if (m.heTwin[prev] == kInvalid) fn(m.heVert[prev]);  // Incoming border edge.
-  };
-  if (!fans.empty()) {
-    const auto range = std::equal_range(fans.begin(), fans.end(), std::pair<Index, Index>{v, kInvalid},
-                                        [](const auto& x, const auto& y) { return x.first < y.first; });
-    if (range.first != range.second) {
-      for (auto it = range.first; it != range.second; ++it)
-        if (m.heFace[it->second] != kInvalid) visit(it->second);
-      return;
+  if (const auto [first, last] = fanOf(fans, v); first != last) {
+    for (auto it = first; it != last; ++it) {
+      const Index h = it->second;
+      if (m.heFace[h] == kInvalid) continue;
+      fn(m.heTarget(h));
+      const Index prev = m.hePrev(h);
+      if (m.heTwin[prev] == kInvalid) fn(m.heVert[prev]);  // Incoming border edge.
     }
+    return;
   }
-  m.forEachOutgoing(v, visit);
+  forEachOutgoingWalk(
+      m, v,
+      [&](Index h, Index prev) {
+        fn(m.heTarget(h));
+        if (m.heTwin[prev] == kInvalid) fn(m.heVert[prev]);  // Incoming border edge.
+      },
+      [](Index, Index) {});
 }
 
 template <class Fn>
 void forEachFaceAround(const Mesh& m, std::span<const std::pair<Index, Index>> fans, Index v, Fn&& fn) {
-  if (!fans.empty()) {
-    const auto range = std::equal_range(fans.begin(), fans.end(), std::pair<Index, Index>{v, kInvalid},
-                                        [](const auto& x, const auto& y) { return x.first < y.first; });
-    if (range.first != range.second) {
-      for (auto it = range.first; it != range.second; ++it)
-        if (m.heFace[it->second] != kInvalid) fn(m.heFace[it->second]);
-      return;
-    }
+  if (const auto [first, last] = fanOf(fans, v); first != last) {
+    for (auto it = first; it != last; ++it)
+      if (m.heFace[it->second] != kInvalid) fn(m.heFace[it->second]);
+    return;
   }
-  m.forEachOutgoing(v, [&](Index h) {
-    if (m.heFace[h] != kInvalid) fn(m.heFace[h]);
-  });
+  forEachOutgoingWalk(
+      m, v,
+      [&](Index h, Index) {
+        if (m.heFace[h] != kInvalid) fn(m.heFace[h]);
+      },
+      [](Index, Index) {});
 }
 
 // Calls fn(u) for every other corner of every face around v: the straight line across a face is
@@ -86,11 +134,21 @@ void forEachFaceAround(const Mesh& m, std::span<const std::pair<Index, Index>> f
 // 1.41 edges, not 2). A corner may come several times.
 template <class Fn>
 void forEachFaceCorner(const Mesh& m, std::span<const std::pair<Index, Index>> fans, Index v, Fn&& fn) {
-  forEachFaceAround(m, fans, v, [&](Index f) {
-    m.forEachFaceVertex(f, [&](Index u) {
-      if (u != v) fn(u);
-    });
-  });
+  if (const auto [first, last] = fanOf(fans, v); first != last) {
+    for (auto it = first; it != last; ++it) {
+      const Index f = m.heFace[it->second];
+      if (f == kInvalid) continue;
+      m.forEachFaceVertex(f, [&](Index u) {
+        if (u != v) fn(u);
+      });
+    }
+    return;
+  }
+  forEachOutgoingWalk(
+      m, v, [](Index, Index) {},
+      [&](Index h, Index u) {
+        if (u != v && m.heFace[h] != kInvalid) fn(u);
+      });
 }
 
 float smoothStep(float t) {
@@ -108,6 +166,112 @@ Vec3 rodrigues(const Vec3& x, const Vec3& k, float phi) {
 Mat3 rodriguesMatrix(const Vec3& k, float phi) {
   return Mat3{rodrigues({1.0f, 0.0f, 0.0f}, k, phi), rodrigues({0.0f, 1.0f, 0.0f}, k, phi),
               rodrigues({0.0f, 0.0f, 1.0f}, k, phi)};
+}
+
+// Leaf lookups for runs of nearby vertices and faces: the last leaf found is tried first.
+class LeafCursor {
+ public:
+  explicit LeafCursor(const Bvh& bvh) : bvh_(bvh), leaves_(bvh.leaves()) {}
+  Index ofVertex(Index v) {
+    if (vert_ != kInvalid && v >= leaves_[vert_].vertBegin && v < leaves_[vert_].vertEnd) return vert_;
+    const Index l = bvh_.leafOfVertex(v);
+    if (l != kInvalid) vert_ = l;
+    return l;
+  }
+  Index ofFace(Index f) {
+    if (face_ != kInvalid && f >= leaves_[face_].faceBegin && f < leaves_[face_].faceEnd) return face_;
+    const Index l = bvh_.leafOfFace(f);
+    if (l != kInvalid) face_ = l;
+    return l;
+  }
+
+ private:
+  const Bvh& bvh_;
+  std::span<const BvhLeaf> leaves_;
+  Index vert_ = kInvalid, face_ = kInvalid;
+};
+
+// An indexed 4-ary min-heap of vertices keyed by (distance, tie, vertex), so a vertex is in it at
+// most once and a lower key moves it up. Keys live in the heap entries, so sifting reads no
+// per-vertex arrays; `pos` holds each vertex's slot, -1 when it is not in the heap.
+class VertexHeap {
+ public:
+  struct Entry {
+    float d;
+    std::int32_t tie;
+    Index v;
+    bool operator<(const Entry& o) const {
+      if (d != o.d) return d < o.d;
+      if (tie != o.tie) return tie < o.tie;
+      return v < o.v;
+    }
+  };
+  explicit VertexHeap(std::vector<std::int32_t>& pos) : pos_(pos) {}
+  bool empty() const { return items_.empty(); }
+  const Entry& top() const { return items_[0]; }
+  // Adds v with this key, or lowers its key (the key must not be higher than the one it has).
+  void lower(Index v, float d, std::int32_t tie) {
+    std::int32_t& at = pos_[v];
+    if (at < 0) {
+      items_.push_back({d, tie, v});
+      at = static_cast<std::int32_t>(items_.size() - 1);
+    } else {
+      items_[static_cast<std::size_t>(at)].d = d;
+      items_[static_cast<std::size_t>(at)].tie = tie;
+    }
+    up(static_cast<std::size_t>(at));
+  }
+  void pop() {
+    pos_[items_[0].v] = -1;
+    const Entry last = items_.back();
+    items_.pop_back();
+    if (items_.empty()) return;
+    place(0, last);
+    down(0);
+  }
+
+ private:
+  void place(std::size_t i, const Entry& e) {
+    items_[i] = e;
+    pos_[e.v] = static_cast<std::int32_t>(i);
+  }
+  void up(std::size_t i) {
+    const Entry e = items_[i];
+    while (i > 0) {
+      const std::size_t parent = (i - 1) / 4;
+      if (!(e < items_[parent])) break;
+      place(i, items_[parent]);
+      i = parent;
+    }
+    place(i, e);
+  }
+  void down(std::size_t i) {
+    const Entry e = items_[i];
+    const std::size_t n = items_.size();
+    for (;;) {
+      const std::size_t first = 4 * i + 1;
+      if (first >= n) break;
+      std::size_t best = first;
+      for (std::size_t c = first + 1; c < std::min(first + 4, n); ++c)
+        if (items_[c] < items_[best]) best = c;
+      if (!(items_[best] < e)) break;
+      place(i, items_[best]);
+      i = best;
+    }
+    place(i, e);
+  }
+  std::vector<Entry> items_;
+  std::vector<std::int32_t>& pos_;
+};
+
+// Runs fn(chunk, begin, end) over [0, n) in chunks of kPoseChunk, in parallel.
+constexpr std::size_t kPoseChunk = 8192;
+template <class Fn>
+void forChunks(std::size_t n, Fn&& fn) {
+  const std::size_t chunks = (n + kPoseChunk - 1) / kPoseChunk;
+  parallelFor(0, chunks, 1, [&](std::size_t cb, std::size_t ce) {
+    for (std::size_t c = cb; c < ce; ++c) fn(c, c * kPoseChunk, std::min(n, (c + 1) * kPoseChunk));
+  });
 }
 
 class PoseBuilder {
@@ -202,6 +366,14 @@ class PoseBuilder {
   std::uint32_t faceStampValue_ = 0;
   std::vector<std::uint8_t> claimed_;  // Moves with an earlier rig.
   std::vector<Index> region_;          // In the order the flood reached them.
+  std::vector<std::int32_t> bandPos_;  // weigh: the band heap's slots.
+  std::vector<std::uint8_t> onCut_;    // findLoops: a region vertex of a face with a corner outside.
+  // weigh: the distance to the root loop (in dist_, free by then) of the band's vertices, and
+  // every rig vertex's weight, each valid where its stamp is current.
+  std::vector<std::uint32_t> bandStamp_, weightStamp_;
+  std::uint32_t bandStampValue_ = 0, weightStampValue_ = 0;
+  std::vector<Index> bandList_;
+  std::vector<float> weight_;
 
   std::uint32_t nextStamp() {
     if (++stampValue_ == 0) {
@@ -209,6 +381,13 @@ class PoseBuilder {
       stampValue_ = 1;
     }
     return stampValue_;
+  }
+  static std::uint32_t next(std::vector<std::uint32_t>& stamps, std::uint32_t& value) {
+    if (++value == 0) {
+      std::fill(stamps.begin(), stamps.end(), 0);
+      value = 1;
+    }
+    return value;
   }
   std::uint32_t nextFaceStamp() {
     if (++faceStampValue_ == 0) {
@@ -262,33 +441,31 @@ bool PoseBuilder::seed(std::vector<Seed>& seeds) {
 bool PoseBuilder::flood(std::vector<Seed>& seeds) {
   std::size_t work = 0;
   if (options_.mode == PoseMode::Topology) {
-    // Multi-source Dijkstra over edge lengths, ties by (distance, op, vertex), up to one radius.
-    using Entry = std::tuple<float, int, Index>;
-    std::priority_queue<Entry, std::vector<Entry>, std::greater<Entry>> queue;
+    // Multi-source Dijkstra over straight lines across faces, ties by (distance, op, vertex), up
+    // to one radius. owner_ holds the heap slots until the race.
+    VertexHeap heap(owner_);
     for (const Seed& s : seeds) {
       if (s.d < dist_[s.v] || (s.d == dist_[s.v] && s.op < label_[s.v])) {
         dist_[s.v] = s.d;
         label_[s.v] = static_cast<std::int8_t>(s.op);
-        queue.emplace(s.d, s.op, s.v);
+        heap.lower(s.v, s.d, s.op);
       }
     }
-    while (!queue.empty()) {
-      const auto [d, k, v] = queue.top();
-      queue.pop();
-      if (inRegion_[v] || d != dist_[v] || k != label_[v]) continue;  // Stale.
+    while (!heap.empty()) {
+      const auto [d, k, v] = heap.top();
       if (d > radius_) break;
+      heap.pop();
       inRegion_[v] = 1;
       region_.push_back(v);
       if ((++work & 255) == 0 && overTime()) return false;
       const Vec3 p = m_.positions[v];
       forEachFaceCorner(m_, fans_, v, [&](Index w) {
-        if (inRegion_[w] || !allowed(w, k)) return;
+        if (inRegion_[w]) return;
         const float nd = d + glm::length(m_.positions[w] - p);
-        if (nd < dist_[w] || (nd == dist_[w] && k < label_[w])) {
-          dist_[w] = nd;
-          label_[w] = static_cast<std::int8_t>(k);
-          queue.emplace(nd, k, w);
-        }
+        if (!(nd < dist_[w] || (nd == dist_[w] && k < label_[w])) || !allowed(w, k)) return;
+        dist_[w] = nd;
+        label_[w] = static_cast<std::int8_t>(k);
+        heap.lower(w, nd, k);
       });
     }
   } else {
@@ -345,7 +522,18 @@ void PoseBuilder::findLoops(RigWork& rig, int index) {
     bool exit;  // From the region outward along the face's boundary.
   };
   std::vector<Cut> cuts;
+  // Only faces with a corner outside the rig have cuts. Their region corners are found first, in
+  // parallel; the walk below visits only those, in region order, which numbers the crossings.
+  forChunks(rig.region.size(), [&](std::size_t, std::size_t b, std::size_t e) {
+    for (std::size_t i = b; i < e; ++i) {
+      const Index v = rig.region[i];
+      bool cut = false;
+      forEachFaceCorner(m_, fans_, v, [&](Index w) { cut |= !inRig(w); });
+      onCut_[v] = cut;
+    }
+  });
   for (Index v : rig.region) {
+    if (!onCut_[v]) continue;
     forEachFaceAround(m_, fans_, v, [&](Index f) {
       if (faceStamp_[f] == fs) return;
       faceStamp_[f] = fs;
@@ -560,18 +748,25 @@ void PoseBuilder::weigh(const RigWork& rig, PoseRig& out) {
   // Distance to the root loop on both sides, up to half the band.
   const float band = std::clamp(options_.softness, 0.0f, 1.0f) * radius_;
   const float half = 0.5f * band;
-  std::unordered_map<Index, float> distance;
+  const std::uint32_t bs = next(bandStamp_, bandStampValue_);
+  const auto inBand = [&](Index v) { return bandStamp_[v] == bs; };
+  bandList_.clear();
   if (!out.loose && band > 0.0f) {
-    using Entry = std::pair<float, Index>;
-    std::priority_queue<Entry, std::vector<Entry>, std::greater<Entry>> queue;
+    VertexHeap queue(bandPos_);
     // Vertices that may not move hold the band back: a joint along a locked border or the mask
     // does not bend the far side.
     const auto offer = [&](Index v, float d) {
-      if (!(d < half) || claimed_[v] || !movable(v, rig.cluster.members)) return;
-      auto [it, inserted] = distance.try_emplace(v, d);
-      if (!inserted && !(d < it->second)) return;
-      it->second = d;
-      queue.emplace(d, v);
+      if (!(d < half)) return;
+      if (inBand(v)) {
+        if (!(d < dist_[v])) return;
+      } else {
+        if (claimed_[v] || !movable(v, rig.cluster.members)) return;
+        bandStamp_[v] = bs;
+        bandPos_[v] = -1;
+        bandList_.push_back(v);
+      }
+      dist_[v] = d;
+      queue.lower(v, d, 0);
     };
     for (std::size_t c = 0; c < rig.crossings.size(); ++c) {
       if (!rig.rootLoop[static_cast<std::size_t>(rig.loopOf[c])]) continue;
@@ -580,9 +775,8 @@ void PoseBuilder::weigh(const RigWork& rig, PoseRig& out) {
       offer(x.v, (1.0f - x.t) * x.len);
     }
     while (!queue.empty()) {
-      const auto [d, v] = queue.top();
+      const auto [d, tie, v] = queue.top();
       queue.pop();
-      if (d != distance[v]) continue;
       const bool vSide = moving(v);
       const Vec3 p = m_.positions[v];
       forEachFaceCorner(m_, fans_, v, [&](Index w) {
@@ -591,34 +785,51 @@ void PoseBuilder::weigh(const RigWork& rig, PoseRig& out) {
       });
     }
   }
-  std::vector<std::pair<Index, float>> weights;
+  const std::uint32_t ws = next(weightStamp_, weightStampValue_);
+  std::vector<Index> picked;
   const auto add = [&](Index v, float w) {
     if (claimed_[v] || !movable(v, rig.cluster.members)) return;
     w *= 1.0f - maskAt(v);
-    if (w > 0.0f) weights.emplace_back(v, w);
+    if (!(w > 0.0f)) return;
+    if (weightStamp_[v] != ws) {
+      weightStamp_[v] = ws;
+      weight_[v] = w;
+      picked.push_back(v);
+    } else {
+      weight_[v] = std::min(weight_[v], w);
+    }
   };
   const auto movingWeight = [&](Index v) {
-    if (band <= 0.0f || out.loose) return 1.0f;
-    const auto it = distance.find(v);
-    return it == distance.end() ? 1.0f : smoothStep((it->second + half) / band);
+    if (band <= 0.0f || out.loose || !inBand(v)) return 1.0f;
+    return smoothStep((dist_[v] + half) / band);
   };
   for (Index v : rig.region) add(v, movingWeight(v));
   for (Index v : rig.distal) add(v, movingWeight(v));
-  for (const auto& [v, d] : distance)
-    if (!moving(v)) add(v, smoothStep((half - d) / band));
-  std::sort(weights.begin(), weights.end());
-  weights.erase(std::unique(weights.begin(), weights.end(),
-                            [](const auto& a, const auto& b) { return a.first == b.first; }),
-                weights.end());
-  out.verts.reserve(weights.size());
-  out.weight.reserve(weights.size());
-  for (const auto& [v, w] : weights) {
-    claimed_[v] = 1;
-    out.verts.push_back(v);
-    out.weight.push_back(std::min(w, 1.0f));
-    out.start.push_back(m_.positions[v]);
-    out.startNormal.push_back(m_.normals[v]);
+  for (Index v : bandList_)
+    if (!moving(v)) add(v, smoothStep((half - dist_[v]) / band));
+  // Ascending: a scan of the stamps when the rig holds much of the mesh, else a sort.
+  const Index nv = m_.vertexCount();
+  if (picked.size() > static_cast<std::size_t>(nv) / 8) {
+    picked.clear();
+    for (Index v = 0; v < nv; ++v)
+      if (weightStamp_[v] == ws) picked.push_back(v);
+  } else {
+    std::sort(picked.begin(), picked.end());
   }
+  const std::size_t count = picked.size();
+  out.weight.resize(count);
+  out.start.resize(count);
+  out.startNormal.resize(count);
+  forChunks(count, [&](std::size_t, std::size_t b, std::size_t e) {
+    for (std::size_t i = b; i < e; ++i) {
+      const Index v = picked[i];
+      claimed_[v] = 1;
+      out.weight[i] = std::min(weight_[v], 1.0f);
+      out.start[i] = m_.positions[v];
+      out.startNormal[i] = m_.normals[v];
+    }
+  });
+  out.verts = std::move(picked);
   // The root loop for the overlay, thinned to the point budget.
   std::vector<const Segment*> root;
   for (const Segment& seg : rig.segments)
@@ -632,70 +843,89 @@ void PoseBuilder::weigh(const RigWork& rig, PoseRig& out) {
 
 void PoseBuilder::finish() {
   // Which normals change and how: a face whose corners all turn fully with one rig turns rigidly;
-  // a vertex whose faces all do keeps its normal turned; any other vertex next to a moving one is
-  // recomputed.
-  const Index nv = m_.vertexCount();
-  std::vector<float> w(static_cast<std::size_t>(nv), 0.0f);
-  std::vector<std::int16_t> rigOfMove(static_cast<std::size_t>(nv), -1);
+  // a vertex whose faces all do keeps its normal turned; every other vertex of a face with a
+  // moving corner is recomputed.
+  const std::size_t nv = static_cast<std::size_t>(m_.vertexCount());
+  std::vector<std::int16_t> rigOfMove(nv, -1);
+  std::vector<std::uint8_t> full(nv, 0);
+  struct Chunk {
+    std::size_t rig, begin, end;
+  };
+  std::vector<Chunk> chunks;
   for (std::size_t r = 0; r < out_.rigs.size(); ++r) {
     const PoseRig& rig = out_.rigs[r];
-    for (std::size_t i = 0; i < rig.verts.size(); ++i) {
-      w[rig.verts[i]] = rig.weight[i];
-      rigOfMove[rig.verts[i]] = static_cast<std::int16_t>(r);
-    }
+    for (std::size_t b = 0; b < rig.verts.size(); b += kPoseChunk)
+      chunks.push_back({r, b, std::min(rig.verts.size(), b + kPoseChunk)});
   }
-  constexpr std::uint8_t kStatic = 0, kRigid = 1, kBent = 2;
-  const std::uint32_t fs = nextFaceStamp();
-  std::vector<Index> faces;
-  std::unordered_map<Index, std::uint8_t> faceClass;
-  for (const PoseRig& rig : out_.rigs) {
-    for (Index v : rig.verts) {
-      forEachFaceAround(m_, fans_, v, [&](Index f) {
-        if (faceStamp_[f] == fs) return;
-        faceStamp_[f] = fs;
-        faces.push_back(f);
-        bool rigid = true;
-        const std::int16_t first = rigOfMove[m_.heVert[m_.faceHe[f]]];
-        m_.forEachFaceVertex(f, [&](Index u) { rigid &= w[u] == 1.0f && rigOfMove[u] == first; });
-        faceClass[f] = rigid ? kRigid : kBent;
-      });
-    }
-  }
-  const std::uint32_t vs = nextStamp();
-  std::vector<Index> bent;
-  for (Index f : faces) {
-    m_.forEachFaceVertex(f, [&](Index u) {
-      if (stamp_[u] == vs) return;
-      stamp_[u] = vs;
-      bool allRigid = true, anyBent = false, anyRigid = false, anyStatic = false;
-      forEachFaceAround(m_, fans_, u, [&](Index g) {
-        const auto it = faceClass.find(g);
-        const std::uint8_t c = it == faceClass.end() ? kStatic : it->second;
-        allRigid &= c == kRigid;
-        anyBent |= c == kBent;
-        anyRigid |= c == kRigid;
-        anyStatic |= c == kStatic;
-      });
-      if (allRigid && rigOfMove[u] >= 0) {
-        PoseRig& rig = out_.rigs[static_cast<std::size_t>(rigOfMove[u])];
-        const auto it = std::lower_bound(rig.verts.begin(), rig.verts.end(), u);
-        rig.rigidSlots.push_back(static_cast<std::uint32_t>(it - rig.verts.begin()));
-      } else if (anyBent || (anyRigid && anyStatic)) {
-        bent.push_back(u);
+  parallelFor(0, chunks.size(), 1, [&](std::size_t cb, std::size_t ce) {
+    for (std::size_t c = cb; c < ce; ++c) {
+      const PoseRig& rig = out_.rigs[chunks[c].rig];
+      for (std::size_t i = chunks[c].begin; i < chunks[c].end; ++i) {
+        rigOfMove[rig.verts[i]] = static_cast<std::int16_t>(chunks[c].rig);
+        full[rig.verts[i]] = rig.weight[i] == 1.0f;
       }
-    });
+    }
+  });
+  const auto rigid = [&](Index f) {
+    const std::int16_t r = rigOfMove[m_.heVert[m_.faceHe[f]]];
+    bool ok = r >= 0;
+    m_.forEachFaceVertex(f, [&](Index u) { ok &= full[u] && rigOfMove[u] == r; });
+    return ok;
+  };
+  const std::size_t leafCount = bvh_.leaves().size();
+  struct ChunkOut {
+    std::vector<std::uint32_t> rigidSlots;
+    std::vector<Index> bent, ring;
+    std::vector<std::uint8_t> refit, snapshot;  // Per leaf.
+  };
+  std::vector<ChunkOut> outs(chunks.size());
+  parallelFor(0, chunks.size(), 1, [&](std::size_t cb, std::size_t ce) {
+    for (std::size_t c = cb; c < ce; ++c) {
+      const PoseRig& rig = out_.rigs[chunks[c].rig];
+      ChunkOut& o = outs[c];
+      o.refit.assign(leafCount, 0);
+      o.snapshot.assign(leafCount, 0);
+      LeafCursor leaf(bvh_);
+      for (std::size_t i = chunks[c].begin; i < chunks[c].end; ++i) {
+        const Index u = rig.verts[i];
+        bool allRigid = true, anyFace = false;
+        forEachFaceAround(m_, fans_, u, [&](Index f) {
+          anyFace = true;
+          allRigid &= rigid(f);
+          if (const Index l = leaf.ofFace(f); l != kInvalid) o.refit[l] = 1;
+          m_.forEachFaceVertex(f, [&](Index w) {
+            if (rigOfMove[w] < 0) o.ring.push_back(w);
+          });
+        });
+        if (const Index l = leaf.ofVertex(u); l != kInvalid) o.snapshot[l] = 1;
+        if (!anyFace) continue;
+        if (allRigid) o.rigidSlots.push_back(static_cast<std::uint32_t>(i));
+        else o.bent.push_back(u);
+      }
+    }
+  });
+  std::vector<std::uint8_t> refit(leafCount, 0), snapshot(leafCount, 0);
+  std::vector<Index> bent;
+  for (std::size_t c = 0; c < chunks.size(); ++c) {
+    ChunkOut& o = outs[c];
+    std::vector<std::uint32_t>& slots = out_.rigs[chunks[c].rig].rigidSlots;
+    slots.insert(slots.end(), o.rigidSlots.begin(), o.rigidSlots.end());
+    bent.insert(bent.end(), o.bent.begin(), o.bent.end());
+    bent.insert(bent.end(), o.ring.begin(), o.ring.end());
+    for (std::size_t l = 0; l < leafCount; ++l) {
+      refit[l] |= o.refit[l];
+      snapshot[l] |= o.snapshot[l];
+    }
   }
   std::sort(bent.begin(), bent.end());
+  bent.erase(std::unique(bent.begin(), bent.end()), bent.end());
+  LeafCursor leaf(bvh_);
+  for (Index v : bent)
+    if (const Index l = leaf.ofVertex(v); l != kInvalid) snapshot[l] = 1;
   out_.bentNormals = std::move(bent);
-  for (PoseRig& rig : out_.rigs) std::sort(rig.rigidSlots.begin(), rig.rigidSlots.end());
-  for (Index f : faces) out_.refitLeaves.push_back(bvh_.leafOfFace(f));
-  for (const PoseRig& rig : out_.rigs)
-    for (Index v : rig.verts) out_.snapshotLeaves.push_back(bvh_.leafOfVertex(v));
-  for (Index v : out_.bentNormals) out_.snapshotLeaves.push_back(bvh_.leafOfVertex(v));
-  for (std::vector<Index>* list : {&out_.refitLeaves, &out_.snapshotLeaves}) {
-    list->erase(std::remove(list->begin(), list->end(), kInvalid), list->end());
-    std::sort(list->begin(), list->end());
-    list->erase(std::unique(list->begin(), list->end()), list->end());
+  for (std::size_t l = 0; l < leafCount; ++l) {
+    if (refit[l]) out_.refitLeaves.push_back(static_cast<Index>(l));
+    if (snapshot[l]) out_.snapshotLeaves.push_back(static_cast<Index>(l));
   }
 }
 
@@ -710,8 +940,13 @@ PoseBuild PoseBuilder::run() {
   inRegion_.assign(nv, 0);
   rigOf_.assign(nv, -1);
   stamp_.assign(nv, 0);
-  owner_.assign(nv, 0);
+  owner_.assign(nv, -1);
   claimed_.assign(nv, 0);
+  onCut_.assign(nv, 0);
+  bandStamp_.assign(nv, 0);
+  weightStamp_.assign(nv, 0);
+  weight_.resize(nv);
+  bandPos_.resize(nv);
   faceStamp_.assign(static_cast<std::size_t>(m_.faceCount()), 0);
 
   std::vector<Seed> seeds;
@@ -722,10 +957,25 @@ PoseBuild PoseBuilder::run() {
 
   // Copies whose regions touch turn as one: the subgroup they generate with op 0.
   DisjointSet ops(group_.size());
-  for (Index v : region_)
-    forEachNeighbour(m_, fans_, v, [&](Index u) {
-      if (inRegion_[u] && label_[u] != label_[v]) ops.unite(label_[u], label_[v]);
+  if (group_.size() > 1) {
+    // The pairs of ops whose regions share an edge, per chunk in parallel.
+    std::vector<std::array<OpMask, kMaxSymmetryCopies>> touch((region_.size() + kPoseChunk - 1) / kPoseChunk);
+    forChunks(region_.size(), [&](std::size_t c, std::size_t b, std::size_t e) {
+      std::array<OpMask, kMaxSymmetryCopies>& t = touch[c];
+      t.fill(0);
+      for (std::size_t i = b; i < e; ++i) {
+        const Index v = region_[i];
+        forEachNeighbour(m_, fans_, v, [&](Index u) {
+          if (inRegion_[u] && label_[u] != label_[v])
+            t[static_cast<std::size_t>(label_[v])] |= OpMask{1} << label_[u];
+        });
+      }
     });
+    for (const auto& t : touch)
+      for (int a = 0; a < group_.size(); ++a)
+        for (int b = 0; b < group_.size(); ++b)
+          if (t[static_cast<std::size_t>(a)] >> b & 1) ops.unite(a, b);
+  }
   // Copies of the press that nearly coincide (on a plane or axis) are one part too, even where
   // op 0 reached every vertex first.
   CopyClusters pressed;
@@ -841,11 +1091,14 @@ void applyPoseRig(Mesh& mesh, const PoseRig& rig, const Vec3& rotation) {
       mesh.positions[rig.verts[i]] = o + (w == 1.0f ? R * x : rodrigues(x, axis, angle * w));
     }
   });
-  for (std::uint32_t slot : rig.rigidSlots) {
-    const Vec3 n = R * rig.startNormal[slot];
-    const float len = glm::length(n);
-    mesh.normals[rig.verts[slot]] = len > 0.0f ? n / len : rig.startNormal[slot];
-  }
+  parallelFor(0, rig.rigidSlots.size(), 4096, [&](std::size_t b, std::size_t e) {
+    for (std::size_t i = b; i < e; ++i) {
+      const std::uint32_t slot = rig.rigidSlots[i];
+      const Vec3 n = R * rig.startNormal[slot];
+      const float len = glm::length(n);
+      mesh.normals[rig.verts[slot]] = len > 0.0f ? n / len : rig.startNormal[slot];
+    }
+  });
 }
 
 }  // namespace plegl
