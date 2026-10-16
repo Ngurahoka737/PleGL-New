@@ -341,3 +341,44 @@ Bagian subdivide di thread utama di bawah 7 ms. Menyimpan objek 3,5M face dengan
 - Drag padat di 500K menghitung normal live setiap frame, jadi sekitar 9 ms per frame (frame berikutnya dilewati kalau lebih dari 12 ms). Di 1M normal ditunda sampai slider dilepas, jadi frame lebih murah tetapi pelepasan lebih mahal.
 - Operasi utuh pada layer padat didominasi oleh `computeNormals` (sekitar 7 ms di 500K dengan 4 thread). Rentang angka menunjukkan variasi antar run di mesin ini.
 - Simpan: tambahan di thread utama adalah menyalin layer (daftar jarang atau array utuh); encoding dan CRC (sekitar 1,5–1,9 GB/s) berjalan di worker. Buka mencakup parse, CRC, dan build BVH untuk seluruh file (file 500K dengan layer sekitar 32 MB, tanpa layer 15 MB).
+
+## Hasil Phase 7 (simetri, Snake Hook, Pose)
+
+`plegl_bench`, mesin yang sama (4 worker thread), quad sphere. Waktu dalam ms.
+
+Simetri, rata-rata per dab Draw (50 dab):
+
+| Vertex | Radius | Tanpa | X, salinan berjauhan | X, di bidang | XYZ (8) | Radial 16 | X + radial 32 (64) |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 500K | 0,05 | 0,26 | 0,50 | 0,28 | 1,6 | 2,6 | 14 |
+| 500K | 0,15 | 0,96 | 1,5 | 0,64 | 5,8 | 9,6 | 51 |
+| 500K | 0,40 | 2,9 | 5,4 | 2,7 | 24 | 34 | – |
+| 1M | 0,05 | 0,42 | 0,69 | 0,40 | 2,2 | 3,9 | 18 |
+| 1M | 0,15 | 1,1 | 2,2 | 1,2 | 9,5 | 16 | 98 |
+| 1M | 0,40 | 5,2 | 11 | 5,0 | 49 | 65 | – |
+
+- Biaya naik kira-kira sebanding dengan jumlah salinan × vertex per salinan. Dab di bidang tengah (salinan bergabung) semurah dab tanpa simetri.
+- Salinan yang mahal tidak menahan layar: tick per frame menjalankan sampel sampai 10 ms lalu melanjutkan di frame berikutnya, jadi stroke melambat tetapi frame tetap jalan.
+
+Snake Hook (radius 0,15, 60 tick, cursor bergerak satu radius per tick, 6 sub-dab per tick):
+
+| Vertex | Dynamic topology | Tick rata-rata | Tick p95 | Per sub-dab | Akhir stroke |
+| ---: | :---: | ---: | ---: | ---: | ---: |
+| 500K | mati | 0,51 | 1,6 | 0,09 | 0,1 |
+| 500K | nyala | 1,05 | 2,8 | 0,18 | 30 |
+| 1M | mati | 0,59 | 1,9 | 0,10 | 0,1 |
+| 1M | nyala | 1,26 | 8,7 | 0,21 | 79 |
+
+Pose (klik di kutub atas, 30 putaran sampai 60 derajat):
+
+| Vertex | Mode | Vertex yang bergerak | Build saat klik | Klik memakai preview | Putaran rata-rata | Putaran p95 | Akhir stroke |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 500K | Topology | 55K | 45 | 0,4 | 1,2 | 1,3 | 2,8 |
+| 500K | Topology | 289K | 203 | 1,6 | 4,1 | 5,3 | 9,7 |
+| 500K | Mask | 251K | 55 | 1,5 | 1,9 | 3,2 | 10 |
+| 1M | Topology | 110K | 124 | 1,3 | 2,5 | 4,2 | 5,6 |
+| 1M | Topology | 577K | 448 | 3,6 | 7,9 | 12,6 | 19 |
+| 1M | Mask | 500K | 146 | 3,2 | 3,4 | 6,5 | 19 |
+
+- Build saat klik termasuk scan fan non-manifold pertama (sekitar 15–23 ms di 500K, sekali per versi topologi). Di aplikasi, cursor yang diam membangun preview lebih dulu, jadi klik biasanya hanya memakai hasilnya (kolom "klik memakai preview"); bagian yang terlalu besar untuk batas preview 8 ms dibangun saat klik.
+- Putaran memutar posisi awal setiap frame dan menghitung ulang normal di pita sendi saja; di atas 600K vertex yang bengkok, normal ditunda sampai akhir stroke.
