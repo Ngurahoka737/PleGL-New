@@ -68,6 +68,8 @@ void Sculptor::start(SceneObject& object, const StrokeOptions& options, std::str
   grabPins_.clear();
   snakeStroke_ = false;
   snakeClusterCount_ = 0;
+  poseStroke_ = false;
+  pose_ = PoseBuild{};
   options_ = options;
   tooManyCopies_ = false;
   if (const SymmetrySpec spec = options.symmetry(); !(spec == group_.spec())) group_ = SymmetryGroup(spec);
@@ -988,6 +990,102 @@ SnakeStep Sculptor::snakeTo(const Vec3& target, float radius, float gain, const 
   return step;
 }
 
+std::array<FaceSetFilter, kMaxSymmetryCopies> strokeFilters(const SceneObject& object, const StrokeOptions& options,
+                                                            const SymmetryGroup& group, const Vec3& center,
+                                                            float radius) {
+  // As Sculptor::resolveFaceSets and Sculptor::filter would set them.
+  std::array<FaceSetFilter, kMaxSymmetryCopies> out{};
+  const Mesh& m = object.mesh;
+  const bool hidden = m.anyHidden();
+  if (m.faceSets.empty() || (!hidden && !options.faceSetAutoMask && !options.lockFaceSetBoundaries)) return out;
+  for (int k = 0; k < group.size(); ++k) {
+    std::int32_t only = 0;
+    if (options.faceSetAutoMask) {
+      const Vec3 c = k == 0 ? center : transform(group.op(k).L, center);
+      Bvh::ClosestHit hit;
+      only = object.bvh.closestPoint(m, c, radius, hit, true) ? faceSetId(m.faceSets[hit.face]) : kNoFaceSet;
+    }
+    FaceSetFilter& f = out[static_cast<std::size_t>(k)];
+    f.faceSets = m.faceSets.data();
+    f.skipHidden = hidden;
+    f.onlySet = only;
+    f.lockBoundaries = options.lockFaceSetBoundaries;
+  }
+  return out;
+}
+
+PoseBuild buildPoseFor(const SceneObject& object, const StrokeOptions& options, const PoseOptions& pose,
+                       const Vec3& click, float radius, const PoseLimits& limits, FanCache& fans) {
+  const SymmetryGroup group(options.symmetry());
+  const auto filters = strokeFilters(object, options, group, click, radius);
+  return buildPose(object.mesh, object.bvh, nonManifoldFans(object, fans), group,
+                   std::span(filters.data(), static_cast<std::size_t>(group.size())), click, radius, pose, limits);
+}
+
+bool Sculptor::beginPose(SceneObject& object, const StrokeOptions& options, const PoseOptions& pose,
+                         const Vec3& click, float radius, std::string label, PoseBuild* reuse) {
+  lastPoseFailure_ = PoseFailure::None;
+  if (!(radius > 0.0f) || !layerTargetRefusal(object, nullptr, options.layerTarget).empty()) return false;
+  start(object, options, std::move(label));
+  beginLayers();
+  pose_ = reuse ? std::move(*reuse) : buildPoseFor(object, options, pose, click, radius, {}, fans_);
+  if (pose_.failure != PoseFailure::None || pose_.rigs.empty()) {
+    lastPoseFailure_ = pose_.failure != PoseFailure::None ? pose_.failure : PoseFailure::NoSurface;
+    pose_ = PoseBuild{};
+    object_ = nullptr;
+    return false;
+  }
+  for (Index l : pose_.snapshotLeaves) snapshot(l);
+  poseStroke_ = true;
+  poseClick_ = click;
+  poseAngle_ = 0.0f;
+  poseDeferNormals_ = pose_.bentNormals.size() > kLivePoseNormals;
+  return true;
+}
+
+void Sculptor::pose(const Vec3& target, const Vec3& viewNormal) {
+  if (!object_ || !poseStroke_) return;
+  Timer total;
+  lastDab_ = {};
+  Mesh& m = object_->mesh;
+  const Vec3 r = poseRotation(poseClick_, pose_.rigs[0].pivot, target, viewNormal);
+  Timer t;
+  for (const PoseRig& rig : pose_.rigs) applyPoseRig(m, rig, transform(rig.cluster.axial, r));
+  poseAngle_ = glm::degrees(glm::length(transform(pose_.rigs[0].cluster.axial, r)));
+  lastDab_.brushMs = t.ms();
+  t.reset();
+  if (!poseDeferNormals_) recomputeNormals(pose_.bentNormals);
+  lastDab_.normalsMs = t.ms();
+  // Bounds wait for the end of the stroke; the GPU takes the new positions now.
+  if (pose_.snapshotLeaves.size() > 64) {
+    object_->markPositionsDirtyAll(true);
+  } else {
+    for (Index l : pose_.snapshotLeaves) object_->markLeafDirty(l);
+  }
+  lastDab_.copies = group_.size();
+  lastDab_.clusters = static_cast<int>(pose_.rigs.size());
+  lastDab_.vertices = static_cast<int>(pose_.bentNormals.size());
+  lastDab_.leaves = static_cast<int>(pose_.snapshotLeaves.size());
+  lastDab_.totalMs = total.ms();
+  ++dabCount_;
+}
+
+void Sculptor::finishPose() {
+  // Exact normals for everything that moved and the ring around it, and bounds for every face
+  // that changed shape.
+  poseStroke_ = false;
+  Mesh& m = object_->mesh;
+  std::vector<Index> verts = pose_.bentNormals;
+  for (const PoseRig& rig : pose_.rigs) verts.insert(verts.end(), rig.verts.begin(), rig.verts.end());
+  std::sort(verts.begin(), verts.end());
+  verts.erase(std::unique(verts.begin(), verts.end()), verts.end());
+  recomputeNormals(verts);
+  object_->bvh.refitLeaves(m, pose_.refitLeaves);
+  strokeRefit_.insert(strokeRefit_.end(), pose_.refitLeaves.begin(), pose_.refitLeaves.end());
+  for (Index l : pose_.snapshotLeaves) object_->markLeafDirty(l);
+  pose_ = PoseBuild{};
+}
+
 std::optional<StrokeUndo> Sculptor::endDyntopoStroke(SceneObject& obj, DyntopoSession& session) {
   Timer t;
   Mesh& m = obj.mesh;
@@ -1141,6 +1239,7 @@ void Sculptor::commitLayerStroke() {
 
 std::optional<StrokeUndo> Sculptor::endStroke() {
   if (!object_) return std::nullopt;
+  if (poseStroke_) finishPose();
   // Commit the stroke into its layer target first: the after-snapshots must hold the committed
   // values. Dynamic topology never runs on layered meshes.
   if (layerArray_ && !dyntopo_ && !(brush_ && brush_->writesLayer()) && !undo_.before.empty()) commitLayerStroke();

@@ -12,6 +12,7 @@
 #include "sculpt/Brush.h"
 #include "sculpt/Dyntopo.h"
 #include "sculpt/Normals.h"
+#include "sculpt/PoseOps.h"
 #include "sculpt/Undo.h"
 
 namespace plegl {
@@ -77,6 +78,19 @@ struct SnakeStep {
   float remaining = 0.0f;  // Distance from the primary hook to the target after the tick.
   double ms = 0.0;
 };
+
+// Pose: above this many recomputed normals, the drag leaves them to the end of the stroke.
+inline constexpr std::size_t kLivePoseNormals = 600'000;
+
+// The face set limits a stroke with these options applies per symmetry op for a first dab at
+// `center` (local space), as Sculptor uses them.
+std::array<FaceSetFilter, kMaxSymmetryCopies> strokeFilters(const SceneObject& object, const StrokeOptions& options,
+                                                            const SymmetryGroup& group, const Vec3& center,
+                                                            float radius);
+// The Pose build a stroke with these options makes for a press at `click`: Sculptor::beginPose
+// takes it as `reuse` when nothing changed in between (the hover preview).
+PoseBuild buildPoseFor(const SceneObject& object, const StrokeOptions& options, const PoseOptions& pose,
+                       const Vec3& click, float radius, const PoseLimits& limits, FanCache& fans);
 
 // What the last ended stroke did to topology.
 struct StrokeTopologyStats {
@@ -160,6 +174,22 @@ class Sculptor {
     return snakeStroke_ && k >= 0 && k < snakeClusterCount_ ? snakeHooks_[static_cast<std::size_t>(k)] : kInvalid;
   }
 
+  // Pose stroke: finds the parts to turn for a press at `click` (local space, see buildPose), or
+  // takes `reuse`, a buildPoseFor result for the same object, options and press. Returns false,
+  // starting nothing, if the build fails (see lastPoseFailure) or the layer rules refuse it.
+  bool beginPose(SceneObject& object, const StrokeOptions& options, const PoseOptions& pose, const Vec3& click,
+                 float radius, std::string label, PoseBuild* reuse = nullptr);
+  // Turns the parts from their start positions so the press points from the joint toward
+  // `target` (local space); symmetric parts turn by the mirrored rotation, merged ones by the part
+  // of it they share. `viewNormal` picks the axis of a half turn. Normals follow (rigidly turned
+  // where a face turns whole); bounds are refit when the stroke ends.
+  void pose(const Vec3& target, const Vec3& viewNormal = {0.0f, 0.0f, 1.0f});
+  // The running Pose stroke's parts, or nullptr.
+  const PoseBuild* poseBuild() const { return poseStroke_ ? &pose_ : nullptr; }
+  PoseFailure lastPoseFailure() const { return lastPoseFailure_; }
+  // Angle of the last pose() on the part under the press, in degrees.
+  float poseAngle() const { return poseAngle_; }
+
   // Ends the stroke. Returns the undo entry, or nothing if the stroke changed nothing. Mask and
   // face set strokes keep only the leaves whose values actually changed. A dynamic topology
   // stroke is compacted here and returns a DyntopoUndo.
@@ -203,6 +233,7 @@ class Sculptor {
   double topologyBudget(int passes) const;
   Index findHook(const CopyCluster& cluster, float radius);
   void reglueHooks(float radius);
+  void finishPose();
   Mat3 snakeSteering(float radius) const;
   void mergeClaims();
   std::optional<StrokeUndo> endDyntopoStroke(SceneObject& obj, DyntopoSession& session);
@@ -262,6 +293,13 @@ class Sculptor {
   CopyClusters snakeClusters_;
   int snakeClusterCount_ = 0;
   std::array<Index, kMaxSymmetryCopies> snakeHooks_{};
+  // Pose state.
+  bool poseStroke_ = false;
+  PoseBuild pose_;
+  Vec3 poseClick_{0.0f};
+  float poseAngle_ = 0.0f;
+  bool poseDeferNormals_ = false;
+  PoseFailure lastPoseFailure_ = PoseFailure::None;
   StrokeOptions options_;
   // Sculpt layers: the target array of a position stroke on a layered mesh (else nullptr), and
   // the same as layer brushes see it.
