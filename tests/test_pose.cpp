@@ -777,3 +777,49 @@ TEST_CASE("pose: a loose part much smaller than the brush still turns") {
   REQUIRE(s.endStroke());
   CHECK(glm::length(obj.mesh.positions[0] - before.positions[0]) > 0.01f);
 }
+
+TEST_CASE("pose: where the root loop meets a locked or face set border, weights ramp to it") {
+  // The stripe x < 0 below y = 0.9 is another face set. The root loop at y = 0.7 runs into it, so
+  // the side that stays has vertices next to ones that may not move: their weights fall to 0
+  // there too, and no edge's weights step by more than the band's slope allows.
+  for (int c = 0; c < 2; ++c) {
+    INFO("case " << c);
+    Scene scene;
+    Mesh mesh = test::makeTube(16, 40, 0.1f, 2.0f);
+    mesh.ensureFaceSets();
+    for (Index f = 0; f < mesh.faceCount(); ++f) {
+      const Vec3 p = mesh.faceCentroid(f);
+      mesh.faceSets[f] = p.x < 0.0f && p.y < 0.9f ? 3 : 2;
+    }
+    SceneObject& obj = scene.add("T", std::move(mesh));
+    const Mesh before = obj.mesh;
+    StrokeOptions o = withSymmetry();
+    o.faceSetAutoMask = c == 0;
+    o.lockFaceSetBoundaries = c == 1;
+    PoseOptions pose;
+    pose.softness = 1.0f;
+    const float radius = 0.45f;
+    const Vec3 click = hitFrom(obj, {1.0f, 1.15f, 0.0f}, {-1, 0, 0});
+    Sculptor s;
+    REQUIRE(s.beginPose(obj, o, pose, click, radius, "Pose"));
+    REQUIRE(s.poseBuild()->rigs[0].pivot.y < 1.0f);  // The bottom loop is the root.
+    const std::vector<float> w = weights(obj.mesh, *s.poseBuild());
+    int ramped = 0;
+    for (Index f = 0; f < obj.mesh.faceCount(); ++f) {
+      std::vector<Index> corners;
+      obj.mesh.forEachFaceVertex(f, [&](Index v) { corners.push_back(v); });
+      for (std::size_t i = 0; i < corners.size(); ++i) {
+        const Index a = corners[i], b = corners[(i + 1) % corners.size()];
+        const float len = glm::length(obj.mesh.positions[a] - obj.mesh.positions[b]);
+        const float step = std::abs(w[a] - w[b]);
+        INFO("edge at " << obj.mesh.positions[a].x << ", " << obj.mesh.positions[a].y << ": " << w[a] << " to " << w[b]);
+        REQUIRE(step <= 1.5f * len / radius + 1e-4f);  // smoothStep's slope is at most 1.5.
+        ramped += step > 0.0f && std::min(w[a], w[b]) == 0.0f && obj.mesh.positions[a].y < 0.9f;
+      }
+    }
+    CHECK(ramped > 0);
+    s.pose(targetFor(click, s.poseBuild()->rigs[0].pivot, {0, 0, 1}, 0.5f), {0, 0, 1});
+    REQUIRE(s.endStroke());
+    CHECK(tearRatio(before, obj.mesh) < 0.35f);
+  }
+}

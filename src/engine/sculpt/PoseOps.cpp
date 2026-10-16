@@ -319,6 +319,7 @@ class PoseBuilder {
     Index v;
     float d;
     bool moving;
+    float lock;  // Side that stays: distance to the nearest vertex that may not move, at most half.
   };
 
   float maskAt(Index v) const { return m_.mask.empty() ? 0.0f : m_.mask[v]; }
@@ -723,7 +724,8 @@ bool PoseBuilder::race(RigWork& rig, int index, std::uint64_t& touchedRigs) {
 
 void PoseBuilder::reachDistal(RigWork& rig, int index) {
   // Only what the region reaches through vertices that may move turns with it: a part beyond a
-  // locked border or the mask stays, and the border becomes a joint.
+  // locked border (or, in Mask mode, the mask) stays, and the border becomes a joint. In Topology
+  // mode the mask only scales weights, as it does for the region.
   if (rig.distal.empty()) return;
   const OpMask members = rig.cluster.members;
   const std::uint32_t candidate = nextStamp();
@@ -859,8 +861,36 @@ void PoseBuilder::band(const RigWork& rig, int index, std::vector<BandEntry>& en
       offer(w, d + glm::length(m_.positions[w] - p));
     });
   }
+  // The side that stays falls to 0 at vertices that may not move too (where the root loop runs
+  // into a locked border or the mask): each of its band vertices takes its distance to the nearest
+  // one, through the band, up to half a width. Another rig's part moves, so it holds nothing.
+  const auto fixed = [&](Index w) { return live(w) && rigOf_[w] != index && !movable(w, rig.cluster.members); };
+  const std::uint32_t ls = next(weightStamp_, weightStampValue_);
+  const auto lockAt = [&](Index v) { return weightStamp_[v] == ls ? weight_[v] : half; };
+  VertexHeap locks(bandPos_);
+  const auto lower = [&](Index v, float d) {
+    if (!(d < lockAt(v))) return;
+    weightStamp_[v] = ls;
+    weight_[v] = d;
+    locks.lower(v, d, 0);
+  };
+  for (Index v : bandList_) {
+    if (moving(v)) continue;
+    const Vec3 p = m_.positions[v];
+    forEachFaceCorner(m_, fans_, v, [&](Index w) {
+      if (fixed(w)) lower(v, glm::length(m_.positions[w] - p));
+    });
+  }
+  while (!locks.empty()) {
+    const auto [d, tie, v] = locks.top();
+    locks.pop();
+    const Vec3 p = m_.positions[v];
+    forEachFaceCorner(m_, fans_, v, [&](Index w) {
+      if (inBand(w) && !moving(w)) lower(w, d + glm::length(m_.positions[w] - p));
+    });
+  }
   entries.reserve(bandList_.size());
-  for (Index v : bandList_) entries.push_back({v, dist_[v], moving(v)});
+  for (Index v : bandList_) entries.push_back({v, dist_[v], moving(v), moving(v) ? half : lockAt(v)});
 }
 
 void PoseBuilder::weigh(const RigWork& rig, int index, const std::vector<BandEntry>& entries, PoseRig& out) {
@@ -896,7 +926,7 @@ void PoseBuilder::weigh(const RigWork& rig, int index, const std::vector<BandEnt
   for (Index v : rig.region) add(v, movingWeight(v));
   for (Index v : rig.distal) add(v, movingWeight(v));
   for (const BandEntry& e : entries)
-    if (!e.moving && bandOwner_[e.v] == index) add(e.v, smoothStep((half - e.d) / width));
+    if (!e.moving && bandOwner_[e.v] == index) add(e.v, smoothStep(std::min(half - e.d, e.lock) / width));
   // Ascending: a scan of the stamps when the rig holds much of the mesh, else a sort.
   const Index nv = m_.vertexCount();
   if (picked.size() > static_cast<std::size_t>(nv) / 8) {

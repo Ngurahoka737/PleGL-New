@@ -421,10 +421,16 @@ void App::drawUi() {
         ImGui::PopStyleColor();
       } else if (sculpt.dyntopo && (sculpt.brush == BrushKind::Grab || sculpt.brush == BrushKind::Pose ||
                                     sculpt.brush == BrushKind::Mask || sculpt.brush == BrushKind::FaceSet)) {
-        // These strokes run with it on, sculpt layers or not.
+        // These strokes run with it on, sculpt layers or not; their Shift+drag Smooth does not.
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
         ImGui::TextWrapped("%s does not change topology.", kBrushLabels[static_cast<int>(sculpt.brush)]);
         ImGui::PopStyleColor();
+        if (sculpt.brush != BrushKind::Mask && sel && !sel->mesh.layers.empty()) {
+          ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.8f, 0.4f, 1.0f));
+          ImGui::TextWrapped("This object has sculpt layers, so Shift+drag (Smooth) is refused. Turn this off or "
+                             "apply all layers.");
+          ImGui::PopStyleColor();
+        }
       } else if (sculpt.dyntopo && sel && !sel->mesh.layers.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.8f, 0.4f, 1.0f));
         ImGui::TextWrapped("This object has sculpt layers, so strokes are refused. Turn this off or apply all layers.");
