@@ -1,9 +1,11 @@
 #pragma once
 
+#include <cmath>
 #include <cstdint>
 #include <span>
 
 #include "mesh/Mesh.h"
+#include "sculpt/Symmetry.h"
 #include "spatial/Bvh.h"
 
 namespace plegl {
@@ -33,6 +35,10 @@ struct Dab {
   bool invert = false;
   Vec3 areaNormal{0.0f, 1.0f, 0.0f};  // Falloff-weighted mean normal under the dab.
   Vec3 areaCenter{0.0f};              // Falloff-weighted mean position under the dab.
+  // Snake Hook only: how far this dab pulls the vertex at its centre, and how much the pulled part
+  // narrows (0..1).
+  Vec3 pull{0.0f};
+  float pinch = 0.0f;
 };
 
 // Face set limits on a stroke, on top of the mask. Off (the default) it costs nothing; on, it
@@ -74,6 +80,31 @@ struct LayerTarget {
   float strength = 1.0f;
 };
 
+// How symmetric copies of one dab share the vertices they overlap on. A vertex within reach of two
+// or more copies has a slot; each copy scales its move there by f^p / sum of f^p over the copies
+// (f: the copy's raw falloff), so the shares add up to 1 and copies never stack. Moves into
+// deferred slots wait in `pending` until every copy has run, so no copy reads another's writes.
+// Vertices without a slot (slotOf -1) take a share of 1 and are written at once.
+struct ShareView {
+  const std::uint32_t* stamp = nullptr;
+  std::uint32_t current = 0;
+  const std::uint32_t* slot = nullptr;
+  const float* denom = nullptr;
+  const std::uint8_t* count = nullptr;
+  Vec3* pending = nullptr;         // Position moves, or layer offset changes for layer brushes.
+  float* pendingScalar = nullptr;  // Mask changes.
+  float exponent = kShareExponent;
+  bool deferAll = false;           // Brushes that read neighbours defer every slot.
+
+  std::int64_t slotOf(Index v) const { return stamp[v] == current ? static_cast<std::int64_t>(slot[v]) : -1; }
+  float share(std::int64_t s, float f) const {
+    if (s < 0) return 1.0f;
+    const float d = denom[s];
+    return d > 0.0f ? (exponent == 1.0f ? f : std::pow(f, exponent)) / d : 0.0f;
+  }
+  bool deferred(std::int64_t s) const { return s >= 0 && (deferAll || count[s] >= 2); }
+};
+
 // What a brush may touch: the mesh positions (or, for mask brushes, mask values, and for face set
 // brushes, face sets) owned by `leaves`.
 struct BrushContext {
@@ -84,7 +115,30 @@ struct BrushContext {
   FaceSetFilter filter;
   std::int32_t paintFaceSet = kDefaultFaceSet;  // The set a face set brush paints.
   LayerTarget* layer = nullptr;                 // Set for layer brushes only.
+  // Symmetric copies that overlap: how this copy shares vertices with the others (nullptr when
+  // no copy overlaps another, which keeps the plain arithmetic).
+  const ShareView* shares = nullptr;
+  // Face set brushes with several copies: a face claimed by an earlier copy in this dab
+  // (faceClaim[f] == claimStamp) keeps that copy's set.
+  std::uint32_t* faceClaim = nullptr;
+  std::uint32_t claimStamp = 0;
 };
+
+// Adds a position move (already clamped) for vertex v with raw falloff f, scaled by the vertex's
+// share and deferred when copies overlap there.
+inline void writeMove(BrushContext& ctx, Index v, float f, Vec3 move) {
+  if (!ctx.shares) {
+    ctx.mesh.positions[v] += move;
+    return;
+  }
+  const std::int64_t s = ctx.shares->slotOf(v);
+  move *= ctx.shares->share(s, f);
+  if (ctx.shares->deferred(s)) {
+    ctx.shares->pending[s] += move;
+  } else {
+    ctx.mesh.positions[v] += move;
+  }
+}
 
 // A brush moves vertices; it never changes topology, normals or bounds. The sculptor recomputes
 // those, records undo and marks GPU ranges afterwards, so new brushes only implement apply().
@@ -110,11 +164,17 @@ class Brush {
   // its composite. Other brushes move positions only; on a mesh with sculpt layers the sculptor
   // commits that movement into the stroke's target when the stroke ends.
   virtual bool writesLayer() const { return false; }
+  // True if apply() reads neighbouring vertices, so overlapping copies must defer every write.
+  virtual bool readsNeighbours() const { return false; }
   virtual void apply(BrushContext& ctx) const = 0;
 };
 
 // Largest displacement a brush may apply to one vertex in one dab, as a fraction of the radius.
 inline constexpr float kMaxDabMove = 0.2f;
+// Snake Hook: the longest pull of one sub-dab (90% of kMaxDabMove, so the centre moves exactly
+// that far) and the share of the distance to the pull axis a full step with pinch 1 closes.
+inline constexpr float kSnakeStep = 0.18f;
+inline constexpr float kSnakePinch = 0.1f;
 
 // Pushes the surface out along the area normal (in when inverted).
 class DrawBrush final : public Brush {
@@ -129,6 +189,7 @@ class DrawBrush final : public Brush {
 class SmoothBrush final : public Brush {
  public:
   const char* name() const override { return "Smooth"; }
+  bool readsNeighbours() const override { return true; }
   void apply(BrushContext& ctx) const override;
 };
 
@@ -165,6 +226,16 @@ class CreaseBrush final : public Brush {
   void apply(BrushContext& ctx) const override;
 };
 
+// Snake Hook: moves the vertices around the dab centre by Dab::pull, weighted by falloff and
+// mask, and with Dab::pinch also draws them toward the line through the centre along the pull, so
+// pulled parts narrow. Strength is not used: the sculptor scales the pull (see
+// Sculptor::snakeTo), which runs this brush in sub-dabs glued to one vertex.
+class SnakeHookBrush final : public Brush {
+ public:
+  const char* name() const override { return "Snake Hook"; }
+  void apply(BrushContext& ctx) const override;
+};
+
 // Fades the target layer's offsets toward zero under the brush, so the surface returns to how it
 // looks without that layer. Inverting does nothing different.
 class EraseLayerBrush final : public Brush {
@@ -181,6 +252,7 @@ class LayerSmoothBrush final : public Brush {
  public:
   const char* name() const override { return "Smooth"; }
   bool writesLayer() const override { return true; }
+  bool readsNeighbours() const override { return true; }
   void apply(BrushContext& ctx) const override;
 };
 
@@ -199,6 +271,7 @@ class MaskSmoothBrush final : public Brush {
  public:
   const char* name() const override { return "Smooth Mask"; }
   bool editsMask() const override { return true; }
+  bool readsNeighbours() const override { return true; }
   void apply(BrushContext& ctx) const override;
 };
 

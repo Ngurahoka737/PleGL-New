@@ -2,6 +2,7 @@
 
 #include <SDL3/SDL.h>
 
+#include <array>
 #include <cstdint>
 #include <deque>
 #include <filesystem>
@@ -51,13 +52,38 @@ struct PrimitiveSettings {
 
 // Projects store the brush as its index here, so new brushes go at the end. Names are also
 // settings keys, so they have no spaces; labels are what the panel shows.
-enum class BrushKind { Draw, Clay, Smooth, Grab, Inflate, Flatten, Crease, Mask, FaceSet, EraseLayer };
-inline constexpr int kBrushCount = 10;
-inline constexpr const char* kBrushNames[kBrushCount] = {"Draw",    "Clay",   "Smooth", "Grab",    "Inflate",
-                                                         "Flatten", "Crease", "Mask",   "FaceSet", "EraseLayer"};
-inline constexpr const char* kBrushLabels[kBrushCount] = {"Draw",    "Clay",   "Smooth", "Grab",     "Inflate",
-                                                          "Flatten", "Crease", "Mask",   "Face Set", "Erase Layer"};
-inline constexpr const char* kBrushKeys[kBrushCount] = {"D", "C", "S", "G", "I", "T", "Shift+C", "M", "P", "E"};
+// Values are stored in projects: new brushes go at the end.
+enum class BrushKind { Draw, Clay, Smooth, Grab, Inflate, Flatten, Crease, Mask, FaceSet, EraseLayer, SnakeHook, Pose };
+inline constexpr int kBrushCount = 12;
+// Brush work per frame before the rest of a stroke's samples wait for the next frame.
+inline constexpr double kStrokeTickBudgetMs = 10.0;
+// Pose: the hover preview waits for the cursor to rest this long, runs at most kPosePreviewCapMs,
+// and is built again once the cursor moves more than kPoseRebuildPx; a press within kPoseReusePx
+// of it takes the preview as its build. A turn slower than kPoseSkipMs lets the next frame show
+// before the next turn.
+inline constexpr double kPosePreviewRestMs = 120.0, kPosePreviewCapMs = 8.0, kPoseSkipMs = 12.0;
+inline constexpr float kPoseRebuildPx = 4.0f, kPoseReusePx = 2.0f;
+// Added to every Pose status line of a stroke where a symmetric copy of the press hit nothing.
+inline constexpr const char* kPoseMissingNote = " (some symmetric copies found no surface)";
+// Each table has one entry per brush; the asserts catch a short initialiser list, which would
+// otherwise fill the rest with empty entries.
+inline constexpr std::array<const char*, kBrushCount> kBrushNames = {
+    "Draw", "Clay", "Smooth", "Grab", "Inflate", "Flatten", "Crease", "Mask", "FaceSet", "EraseLayer", "SnakeHook",
+    "Pose"};
+inline constexpr std::array<const char*, kBrushCount> kBrushLabels = {
+    "Draw", "Clay", "Smooth", "Grab", "Inflate", "Flatten", "Crease", "Mask", "Face Set", "Erase Layer", "Snake Hook",
+    "Pose"};
+inline constexpr std::array<const char*, kBrushCount> kBrushKeys = {"D", "C",       "S", "G", "I", "T",
+                                                                    "Shift+C", "M", "P", "E", "K", "O"};
+inline constexpr std::array<float, kBrushCount> kBrushDefaultStrength = {0.5f, 0.5f, 0.5f, 1.0f, 0.5f, 0.5f,
+                                                                         0.5f, 1.0f, 1.0f, 0.5f, 0.7f, 1.0f};
+// The order of the panel's brush buttons.
+inline constexpr std::array<BrushKind, kBrushCount> kBrushDisplayOrder = {
+    BrushKind::Draw,      BrushKind::Clay,    BrushKind::Smooth,  BrushKind::Grab,
+    BrushKind::SnakeHook, BrushKind::Pose,    BrushKind::Inflate, BrushKind::Flatten,
+    BrushKind::Crease,    BrushKind::Mask,    BrushKind::FaceSet, BrushKind::EraseLayer};
+static_assert(kBrushNames.back() != nullptr && kBrushLabels.back() != nullptr && kBrushKeys.back() != nullptr);
+static_assert(kBrushDefaultStrength.back() > 0.0f);
 enum class PressureMap { Strength, Radius, Both, None };
 // How the dynamic topology detail size is given: in screen pixels at the cursor (so zooming in
 // adds detail), or as a fixed edge length in object units.
@@ -66,11 +92,15 @@ enum class DetailMode { Relative, Constant };
 struct SculptSettings {
   BrushKind brush = BrushKind::Draw;
   float radiusPx = 60.0f;      // Screen-space radius, like most sculpting tools.
-  float strength[kBrushCount] = {0.5f, 0.5f, 0.5f, 1.0f, 0.5f, 0.5f, 0.5f, 1.0f, 1.0f, 0.5f};  // Per brush.
+  std::array<float, kBrushCount> strength = kBrushDefaultStrength;  // Per brush.
   Falloff falloff = Falloff::Smooth;
   bool invert = false;         // Brushes subtract instead of add (Ctrl flips it per stroke).
   PressureMap pressure = PressureMap::Strength;
   bool symmetryX = true;       // PRD default for character sculpting.
+  bool symmetryY = false;
+  bool symmetryZ = false;
+  Axis radialAxis = Axis::Y;   // Radial symmetry: radialCount copies around this local axis.
+  int radialCount = 1;         // 1 = off.
   float spacing = 0.1f;        // Dab spacing as a fraction of the radius.
   int maskFilterSteps = 2;     // Iterations per Blur Mask / Sharpen Mask.
   // Face set auto-masking for every brush: only the set under the stroke's start changes, and
@@ -86,6 +116,11 @@ struct SculptSettings {
   DetailMode detailMode = DetailMode::Relative;
   float detailPx = 8.0f;      // Relative: target edge length in screen pixels (hold R to change).
   float detailSize = 0.02f;   // Constant: target edge length in object units.
+  float snakePinch = 0.0f;    // Snake Hook: how much pulled parts narrow, 0..1.
+  PoseMode poseMode = PoseMode::Topology;  // Pose: how the part to turn is found.
+  float poseSoftness = 0.25f;  // Pose: width of the bend at the joint, as a share of the radius.
+
+  SymmetrySpec symmetry() const { return sanitized({symmetryX, symmetryY, symmetryZ, radialAxis, radialCount}); }
 };
 
 struct RemeshSettings {
@@ -111,6 +146,8 @@ struct FrameStats {
   int dabsLastFrame = 0;
   double maskOpMs = 0.0;        // Last whole-mesh mask or face set operation (invert, blur, hide...).
   double topologyMs = 0.0;      // Dynamic topology part of the last dab.
+  int dabCopies = 1;            // Symmetric copies the last dab ran (after merging).
+  int queuedSamples = 0;        // Stroke samples waiting for the next frame.
 };
 
 class App {
@@ -225,6 +262,11 @@ class App {
   // Detail size the next dab would use at a surface point, in object units (dynamic topology).
   float detailSizeAt(const SceneObject& obj, const Vec3& worldPoint) const;
   const std::optional<ScenePick>& hover() const { return hover_; }
+  // Symmetry toggles (X, Y, Z keys and the panel): flips a mirror, lowers the radial count if the
+  // copies would pass kMaxSymmetryCopies, and says what is on in the status line.
+  void toggleMirror(Axis axis);
+  void setRadialCount(int count);
+  std::string symmetryText() const;
 
  private:
   void handleEvent(const SDL_Event& e);
@@ -243,7 +285,28 @@ class App {
   void beginStroke(float x, float y, std::uint64_t timestampNs);
   void continueStroke(float x, float y, std::uint64_t timestampNs);
   void endStroke();
-  void applySamples(std::uint64_t timestampNs);
+  // Per frame: applies queued dab samples for up to kStrokeTickBudgetMs (always at least one), or
+  // the latest Grab position. Samples are never dropped; endStroke flushes them.
+  void tickStroke(bool flush = false);
+  void applySample(const StrokeSample& sample, const Ray& world);
+  // The stroke options for `brush` on `obj` from the panel, as a press would use them.
+  StrokeOptions strokeOptions(const SceneObject& obj, BrushKind brush, bool ctrl) const;
+  // The point under window position (x, y) on the drag plane (Grab, Snake Hook, Pose), in the
+  // stroke object's space, or nothing when the plane faces away.
+  std::optional<Vec3> dragPlanePoint(float x, float y) const;
+  PoseOptions poseOptions() const { return {sculpt.poseMode, sculpt.poseSoftness}; }
+  // The Pose radius in object units for a press at `world` (pen pressure does not change it).
+  float poseRadius(const SceneObject& obj, const Vec3& world) const;
+  // Builds the hover preview once the cursor rests (see PosePreview).
+  void updatePosePreview();
+  // Whether the preview was built for this object and panel state, with its press within `px`
+  // screen pixels of `click` (local) at this radius.
+  bool posePreviewMatches(const SceneObject& obj, const Vec3& click, float radius, float px) const;
+  void poseOverlay(SculptOverlay& overlay) const;
+  void noteInput(std::uint64_t timestampNs);
+  // Cursor rings for every symmetric copy of the brush, and the planes and axis overlay.
+  void symmetryCursors(const CursorMarker& primary, std::vector<CursorMarker>& out) const;
+  SculptOverlay sculptOverlay() const;
   float currentPressure() const;
   void exportFile(const std::filesystem::path& path);
   void drawProjectDialogs();
@@ -337,12 +400,65 @@ class App {
   MaskSmoothBrush maskSmoothBrush_;  // Shift with the Mask brush smooths the mask.
   FaceSetBrush faceSetBrush_;
   EraseLayerBrush eraseLayerBrush_;
+  SnakeHookBrush snakeBrush_;
   StrokeSampler sampler_;
   std::vector<StrokeSample> samples_;
+  struct PendingSample {
+    StrokeSample sample;
+    Ray world;                     // Taken when the sample came in, so a zoom mid-stroke does not move it.
+    std::uint64_t timestampNs = 0;
+  };
+  std::deque<PendingSample> pendingSamples_;
+  std::optional<Vec3> pendingGrab_;  // Latest Grab offset (local) not yet applied.
+  std::uint64_t pendingGrabNs_ = 0;
+  // Snake Hook: the cursor on the drag plane (local) and its pen pressure; the hook keeps moving
+  // toward it every frame until it gets there.
+  struct SnakeTarget {
+    Vec3 local{0.0f};
+    float pressure = 1.0f;
+  };
+  SnakeTarget snakeTarget_;
+  std::uint64_t snakeTargetNs_ = 0;   // Input not yet applied, 0 when none.
+  std::uint64_t lastSnakeTickNs_ = 0;
+  bool snakeSettled_ = false;         // The hook reached the target and no input came since.
+  void tickSnake(double budgetMs);
+  // Pose: the cursor on the drag plane (local), applied once per frame.
+  std::optional<Vec3> pendingPose_;
+  std::uint64_t pendingPoseNs_ = 0;
+  Vec3 poseClick_{0.0f};                    // The press (local).
+  Vec3 poseTarget_{0.0f};                   // The last applied cursor (local).
+  Vec3 poseViewNormal_{0.0f, 0.0f, 1.0f};   // The view direction in object space at the press.
+  float poseRadius_ = 0.0f;
+  bool poseSkipNext_ = false;               // The last turn took over kPoseSkipMs: let a frame show.
+  // Pose hover preview: built on the main thread with a time cap once the cursor rests, drawn as
+  // the overlay, and handed to the stroke when the press lands on it and nothing changed since.
+  struct PoseKey {
+    std::uint32_t objectId = 0;
+    std::uint64_t editCounter = 0, topologyVersion = 0;
+    Mat4 model{1.0f};
+    SymmetrySpec symmetry;
+    PoseOptions options;
+    bool faceSetAutoMask = false, lockFaceSetBorders = false;
+    bool operator==(const PoseKey&) const = default;
+  };
+  PoseKey poseKey(const SceneObject& obj) const;
+  struct PosePreview {
+    bool built = false;
+    PoseKey key;
+    Vec3 click{0.0f};
+    float radius = 0.0f;
+    PoseBuild build;
+  };
+  PosePreview posePreview_;
+  FanCache poseFans_;
+  float restX_ = -1e9f, restY_ = -1e9f;  // Where the cursor came to rest, and since when.
+  std::uint64_t restSinceNs_ = 0;
+  std::vector<CursorMarker> cursors_;
+  mutable SymmetryGroup cursorGroup_;  // The panel's symmetry, for cursor copies and the overlay.
   // Brush of the running stroke. Shift turns it into Smooth, except for Mask, which stays Mask and
   // smooths the mask instead.
   BrushKind strokeBrush_ = BrushKind::Draw;
-  // Grab drags the captured region in the plane through the grab point facing the camera.
+  // Grab (and Snake Hook) drag in the plane through the press point facing the camera.
   Vec3 grabStartWorld_{0.0f};
   Vec3 grabPlaneNormal_{0.0f, 0.0f, 1.0f};
   bool adjustingRadius_ = false;     // F held.

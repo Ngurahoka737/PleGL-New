@@ -2,7 +2,7 @@
 
 Software digital sculpting 3D untuk desktop yang fokus pada satu hal: sculpting yang cepat, stabil, dan mudah dipelajari.
 
-Status: **Phase 6e (Sculpt layers)**. Tujuh brush (Draw, Clay, Smooth, Grab, Inflate, Flatten, Crease), empat jenis falloff, tekanan pen, undo/redo, simetri X, dan quad remesh (voxel remesh lalu optimasi valence 4 sampai sekitar 99%, relaksasi, dan proyeksi ke permukaan asli) sudah jalan di atas engine Phase 0 (mesh, BVH, renderer, import/export OBJ). Project bisa disimpan dan dibuka sebagai `.psculpt`, dengan autosave tiap 5 menit dan pemulihan setelah crash. Mask melindungi area dari semua brush, bisa dicat, dibalik, dihapus, diperhalus, dan dipertajam, lalu ikut tersimpan di project dan ikut pindah saat remesh. Dynamic topology (Ctrl+D) menambah segitiga di tempat yang sedang di-sculpt dan menggabungkannya di tempat yang tidak butuh detail, dengan ukuran detail dalam pixel layar atau satuan objek, dan tetap bisa di-undo per stroke. Face set mengelompokkan poligon dengan warna untuk membatasi brush, membuat mask, atau menyembunyikan bagian model. Multiresolution (Ctrl+Page Up) menambah level subdivisi Catmull-Clark: bentuk besar dipahat di level rendah, detail di level tinggi, dan perubahan di satu level ikut menyebar ke level lain. Sculpt layer (Ctrl+L) menyimpan detail secara non-destruktif: setiap layer bisa dikecilkan, dibalik, disembunyikan, digabung, atau dihapus kapan saja, dan ikut tersimpan di project.
+Status: **Phase 7 (Pose, Snake Hook, simetri X/Y/Z/radial)**. Sembilan brush (Draw, Clay, Smooth, Grab, Snake Hook, Pose, Inflate, Flatten, Crease), empat jenis falloff, tekanan pen, undo/redo, simetri X, Y, Z, dan radial (sampai 64 salinan) untuk semua brush, dan quad remesh (voxel remesh lalu optimasi valence 4 sampai sekitar 99%, relaksasi, dan proyeksi ke permukaan asli) sudah jalan di atas engine Phase 0 (mesh, BVH, renderer, import/export OBJ). Project bisa disimpan dan dibuka sebagai `.psculpt`, dengan autosave tiap 5 menit dan pemulihan setelah crash. Mask melindungi area dari semua brush, bisa dicat, dibalik, dihapus, diperhalus, dan dipertajam, lalu ikut tersimpan di project dan ikut pindah saat remesh. Dynamic topology (Ctrl+D) menambah segitiga di tempat yang sedang di-sculpt dan menggabungkannya di tempat yang tidak butuh detail, dengan ukuran detail dalam pixel layar atau satuan objek, dan tetap bisa di-undo per stroke. Face set mengelompokkan poligon dengan warna untuk membatasi brush, membuat mask, atau menyembunyikan bagian model. Multiresolution (Ctrl+Page Up) menambah level subdivisi Catmull-Clark: bentuk besar dipahat di level rendah, detail di level tinggi, dan perubahan di satu level ikut menyebar ke level lain. Sculpt layer (Ctrl+L) menyimpan detail secara non-destruktif: setiap layer bisa dikecilkan, dibalik, disembunyikan, digabung, atau dihapus kapan saja, dan ikut tersimpan di project. Snake Hook (K) menarik tanduk dan tentakel mengikuti cursor, dan Pose (O) memutar satu bagian model, misalnya lengan atau jari, pada sendinya, dengan preview sendi saat cursor diam.
 
 ## Stack
 
@@ -80,11 +80,13 @@ cmake --build --preset engine-only
 | Radius brush | [ dan ], atau tahan F lalu geser mouse ke samping |
 | Dynamic topology on/off | Ctrl + D (di Sculpt mode) |
 | Ukuran detail dynamic topology | Tahan R lalu geser mouse ke samping (di Sculpt mode) |
-| Simetri X on/off | X (di Sculpt mode) |
+| Simetri X / Y / Z on/off | X / Y / Z (di Sculpt mode; simetri radial diatur di panel Symmetry) |
 | Remesh objek terpilih | Ctrl + R (menghapus level subdivisi dan memanggang layer; undo mengembalikannya) |
 | Layer sculpt baru (stroke masuk ke layer aktif) | Ctrl + L |
 | Tampilkan / sembunyikan layer aktif | L (di Sculpt mode) |
 | Brush Erase Layer (menghapus detail layer aktif) | E (di Sculpt mode) |
+| Brush Snake Hook (menarik permukaan mengikuti cursor, cocok untuk tanduk dan tentakel) | K (di Sculpt mode; paling bagus dengan dynamic topology) |
+| Brush Pose (memutar satu bagian pada sendinya, misalnya lengan, jari, atau ekor) | O (di Sculpt mode; tekan dekat ujung bagian lalu drag. Mode Mask: bagian yang tidak di-mask berputar pada batas mask) |
 | Tampilkan hanya satu layer | Alt + klik ikon mata di panel layer (lagi: tampilkan semua) |
 | Subdivide (tambah level multiresolution di atas) | Ctrl + Page Up |
 | Level subdivisi naik / turun | Page Up / Page Down |

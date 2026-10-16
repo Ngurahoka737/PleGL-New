@@ -53,9 +53,9 @@ const Brush& strokeBrush(const Brush& brush, const SceneObject& object, const St
 // ---- Recomposing -------------------------------------------------------------------------------
 
 std::size_t LayerWorkspace::bytes() const {
-  return (support.capacity() + changed.capacity() + ring.capacity() + leaves.capacity() + faces.capacity()) *
+  return (support.capacity() + changed.capacity() + ring.capacity() + leaves.capacity()) *
              sizeof(Index) +
-         (next.capacity() + oldP.capacity() + faceN.capacity()) * sizeof(Vec3) +
+         (next.capacity() + oldP.capacity()) * sizeof(Vec3) + normals.bytes() +
          (faceMark.mark.capacity() + vertMark.mark.capacity()) * sizeof(std::uint32_t) + fans.bytes();
 }
 
@@ -255,7 +255,7 @@ void finishPositions(SceneObject& object, std::span<const Index> changed, LayerW
   const std::size_t nv = m.positions.size();
   if (changed.size() * 2 > nv) {
     // Most of the mesh: whole-mesh passes give the same bits for less work.
-    if (normals) m.computeNormals(ws.faceN);
+    if (normals) m.computeNormals(ws.normals.faceN);
     if (refit) bvh.refit(m);
     object.markPositionsDirtyAll(normals);
     return;
@@ -306,31 +306,8 @@ void finishPositions(SceneObject& object, std::span<const Index> changed, LayerW
 }
 
 void leafNormals(Mesh& m, std::span<const Index> verts, LayerWorkspace& ws) {
-  if (verts.size() * 2 > m.positions.size()) {
-    m.computeNormals(ws.faceN);
-    return;
-  }
-  // Each face normal once, then the sums in Mesh::vertexNormal's order.
-  ws.faceMark.begin(m.faceHe.size());
-  ws.faces.clear();
-  for (Index v : verts) {
-    m.forEachOutgoing(v, [&](Index h) {
-      const Index f = m.heFace[h];
-      if (ws.faceMark.insert(f)) ws.faces.push_back(f);
-    });
-  }
-  if (ws.faceN.size() < m.faceHe.size()) ws.faceN.resize(m.faceHe.size());
-  parallelFor(0, ws.faces.size(), 2048, [&](std::size_t b, std::size_t e) {
-    for (std::size_t i = b; i < e; ++i) ws.faceN[ws.faces[i]] = m.faceAreaNormal(ws.faces[i]);
-  });
-  parallelFor(0, verts.size(), 2048, [&](std::size_t b, std::size_t e) {
-    for (std::size_t i = b; i < e; ++i) {
-      const Index v = verts[i];
-      Vec3 n{0.0f};
-      m.forEachOutgoing(v, [&](Index h) { n += ws.faceN[m.heFace[h]]; });
-      m.normals[v] = safeNormalize(n);
-    }
-  });
+  // Layered meshes never run dynamic topology, so they have no dead faces.
+  recomputeVertexNormals(m, verts, ws.normals, true);
 }
 
 void rebaseReference(Multires& stack, std::span<const Index> changed, std::span<const Vec3> oldP, const Mesh& live,

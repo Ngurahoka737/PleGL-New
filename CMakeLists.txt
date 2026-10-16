@@ -34,6 +34,7 @@ add_library(plegl_engine STATIC
   src/engine/mesh/Primitives.cpp
   src/engine/io/Obj.cpp
   src/engine/io/Project.cpp
+  src/engine/io/SettingsText.cpp
   src/engine/spatial/Bvh.cpp
   src/engine/spatial/LeafLayout.cpp
   src/engine/render/LeafIndexBlocks.cpp
@@ -46,6 +47,9 @@ add_library(plegl_engine STATIC
   src/engine/sculpt/Brush.cpp
   src/engine/sculpt/Dyntopo.cpp
   src/engine/sculpt/LayerOps.cpp
+  src/engine/sculpt/Normals.cpp
+  src/engine/sculpt/Symmetry.cpp
+  src/engine/sculpt/PoseOps.cpp
   src/engine/sculpt/MaskOps.cpp
   src/engine/sculpt/FaceSetOps.cpp
   src/engine/sculpt/Sculptor.cpp
@@ -111,6 +115,11 @@ if(PLEGL_BUILD_TESTS)
     tests/test_layers_undo.cpp
     tests/test_layers_multires.cpp
     tests/test_layers_io.cpp
+    tests/test_settings.cpp
+    tests/test_symmetry.cpp
+    tests/test_snakehook.cpp
+    tests/test_pose.cpp
+    tests/test_fuzz_symmetry.cpp
   )
   target_link_libraries(plegl_tests PRIVATE plegl_engine doctest::doctest plegl_warnings)
   add_test(NAME plegl_tests COMMAND plegl_tests)

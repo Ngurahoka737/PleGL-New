@@ -3,17 +3,14 @@
 #include <imgui.h>
 
 #include <cctype>
-#include <charconv>
 #include <chrono>
 #include <cmath>
-#include <cstring>
-#include <map>
 #include <new>
-#include <sstream>
 #include <system_error>
 
 #include "App.h"
 #include "core/Timer.h"
+#include "io/SettingsText.h"
 
 namespace plegl {
 
@@ -24,94 +21,6 @@ const SDL_DialogFileFilter kOpenFilter[] = {{"PleGL Sculpt project or OBJ mesh",
 
 constexpr const char* kAutosaveName = "autosave.psculpt";
 constexpr const char* kLockName = "session.lock";
-
-// ---- Settings text: one "key value" pair per line ----
-
-class SettingsWriter {
- public:
-  std::string text;
-
-  void put(const char* key, const std::string& value) {
-    text += key;
-    text += ' ';
-    text += value;
-    text += '\n';
-  }
-  void put(const char* key, float v) {
-    char buf[32];
-    const auto r = std::to_chars(buf, buf + sizeof(buf), v);  // Shortest exact form, locale free.
-    put(key, std::string(buf, r.ptr));
-  }
-  void put(const char* key, int v) { put(key, std::to_string(v)); }
-  void put(const char* key, bool v) { put(key, std::string(v ? "1" : "0")); }
-  void put(const char* key, const Vec3& v) {
-    std::string s;
-    for (int i = 0; i < 3; ++i) {
-      char buf[32];
-      const auto r = std::to_chars(buf, buf + sizeof(buf), v[i]);
-      if (i) s += ' ';
-      s.append(buf, r.ptr);
-    }
-    put(key, s);
-  }
-};
-
-class SettingsReader {
- public:
-  explicit SettingsReader(const std::string& text) {
-    std::istringstream in(text);
-    std::string line;
-    while (std::getline(in, line)) {
-      const auto space = line.find(' ');
-      if (space == std::string::npos || space == 0) continue;
-      values_[line.substr(0, space)] = line.substr(space + 1);
-    }
-  }
-
-  // Each getter leaves `out` unchanged when the key is missing or malformed, so files from older
-  // versions keep the current defaults for settings they do not have.
-  void get(const char* key, std::string& out) const {
-    if (auto it = values_.find(key); it != values_.end()) out = it->second;
-  }
-  void get(const char* key, float& out) const {
-    if (auto it = values_.find(key); it != values_.end()) parseFloats(it->second, &out, 1);
-  }
-  void get(const char* key, Vec3& out) const {
-    if (auto it = values_.find(key); it != values_.end()) parseFloats(it->second, &out.x, 3);
-  }
-  void get(const char* key, bool& out) const {
-    if (auto it = values_.find(key); it != values_.end()) out = it->second == "1";
-  }
-  void get(const char* key, int& out) const {
-    if (auto it = values_.find(key); it != values_.end()) {
-      int v = 0;
-      const char* s = it->second.data();
-      if (std::from_chars(s, s + it->second.size(), v).ec == std::errc()) out = v;
-    }
-  }
-  template <class E>
-  void getEnum(const char* key, E& out, int count) const {
-    int v = static_cast<int>(out);
-    get(key, v);
-    if (v >= 0 && v < count) out = static_cast<E>(v);
-  }
-
- private:
-  static void parseFloats(const std::string& s, float* out, int n) {
-    float tmp[3] = {};
-    const char* p = s.data();
-    const char* end = p + s.size();
-    for (int i = 0; i < n; ++i) {
-      while (p < end && *p == ' ') ++p;
-      const auto r = std::from_chars(p, end, tmp[i]);
-      if (r.ec != std::errc() || !std::isfinite(tmp[i])) return;
-      p = r.ptr;
-    }
-    std::memcpy(out, tmp, sizeof(float) * n);
-  }
-
-  std::map<std::string, std::string> values_;
-};
 
 std::uint64_t fnv(std::uint64_t h, const void* data, std::size_t n) {
   const auto* p = static_cast<const std::uint8_t*>(data);
@@ -187,7 +96,14 @@ std::string App::settingsText() const {
   w.put("brush.invert", sculpt.invert);
   w.put("brush.pressure", static_cast<int>(sculpt.pressure));
   w.put("brush.spacing", sculpt.spacing);
+  w.put("snake.pinch", sculpt.snakePinch);
+  w.put("pose.mode", static_cast<int>(sculpt.poseMode));
+  w.put("pose.softness", sculpt.poseSoftness);
   w.put("symmetry.x", sculpt.symmetryX);
+  w.put("symmetry.y", sculpt.symmetryY);
+  w.put("symmetry.z", sculpt.symmetryZ);
+  w.put("symmetry.radial_axis", static_cast<int>(sculpt.radialAxis));
+  w.put("symmetry.radial_count", sculpt.radialCount);
   w.put("mask.filter_steps", sculpt.maskFilterSteps);
   w.put("face_sets.automask", sculpt.faceSetAutoMask);
   w.put("face_sets.lock_borders", sculpt.lockFaceSetBorders);
@@ -208,6 +124,7 @@ std::string App::settingsText() const {
   w.put("view.mask_opacity", view.maskOpacity);
   w.put("view.face_sets", view.showFaceSets);
   w.put("view.face_set_opacity", view.faceSetOpacity);
+  w.put("view.symmetry_planes", view.symmetryPlanes);
 
   w.put("remesh.edge", remesh.voxelSize);
   w.put("remesh.optimize", remesh.optimizeQuads);
@@ -242,7 +159,17 @@ void App::applySettings(const std::string& text) {
   r.get("brush.invert", sculpt.invert);
   r.getEnum("brush.pressure", sculpt.pressure, 4);
   r.get("brush.spacing", sculpt.spacing);
+  r.get("snake.pinch", sculpt.snakePinch);
+  sculpt.snakePinch = std::isfinite(sculpt.snakePinch) ? std::clamp(sculpt.snakePinch, 0.0f, 1.0f) : 0.0f;
+  r.getEnum("pose.mode", sculpt.poseMode, 2);
+  r.get("pose.softness", sculpt.poseSoftness);
+  sculpt.poseSoftness = std::isfinite(sculpt.poseSoftness) ? std::clamp(sculpt.poseSoftness, 0.0f, 1.0f) : 0.25f;
   r.get("symmetry.x", sculpt.symmetryX);
+  r.get("symmetry.y", sculpt.symmetryY);
+  r.get("symmetry.z", sculpt.symmetryZ);
+  r.getEnum("symmetry.radial_axis", sculpt.radialAxis, 3);
+  r.get("symmetry.radial_count", sculpt.radialCount);
+  sculpt.radialCount = sculpt.symmetry().radialCount;
   r.get("mask.filter_steps", sculpt.maskFilterSteps);
   r.get("face_sets.automask", sculpt.faceSetAutoMask);
   r.get("face_sets.lock_borders", sculpt.lockFaceSetBorders);
@@ -268,6 +195,7 @@ void App::applySettings(const std::string& text) {
   r.get("view.mask_opacity", view.maskOpacity);
   r.get("view.face_sets", view.showFaceSets);
   r.get("view.face_set_opacity", view.faceSetOpacity);
+  r.get("view.symmetry_planes", view.symmetryPlanes);
   view.matcap = std::max(view.matcap, 0);
   view.maskOpacity = std::clamp(view.maskOpacity, 0.1f, 1.0f);
   view.faceSetOpacity = std::isfinite(view.faceSetOpacity) ? std::clamp(view.faceSetOpacity, 0.1f, 1.0f) : 0.6f;

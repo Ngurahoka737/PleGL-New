@@ -400,3 +400,16 @@ TEST_CASE("grab off the mesh starts nothing") {
   CHECK_FALSE(sculptor.beginGrab(obj, {}, {5, 5, 5}, 0.2f, "Grab"));
   CHECK_FALSE(sculptor.active());
 }
+
+TEST_CASE("grab at a pinched vertex updates the faces of every fan") {
+  // Only the shared corner is inside the sphere: the faces of both fans around it change shape.
+  Scene scene;
+  SceneObject& obj = scene.add("Bowtie", test::makeBowtie(4));
+  Sculptor sculptor;
+  REQUIRE(sculptor.beginGrab(obj, {.strength = 1.0f}, {0.0f, 0.0f, 0.0f}, 0.1f, "Grab"));
+  sculptor.grab({0.0f, 0.0f, 0.15f});
+  REQUIRE(sculptor.endStroke());
+  CHECK(obj.mesh.positions[0].z > 0.1f);
+  test::requireNormalsBitExact(obj.mesh);
+  test::requireBoundsContainPositions(obj);
+}
