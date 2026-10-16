@@ -1150,3 +1150,58 @@ TEST_CASE("a workspace shared with a bigger object does not hand its arrays to a
   CHECK(b.mesh.positions.capacity() < 2 * std::max<std::size_t>(smallCapacity, 65536) + 65536 * 2);
   CHECK(b.mesh.heNext.capacity() < 2'000'000);
 }
+
+TEST_CASE("a pass keeps the vertex it is asked to keep, in place") {
+  // Coarsening around a vertex merges it away unless the pass is told to keep it; then every
+  // merge that touches it pulls the other end onto it.
+  auto coarsen = [](Index keep, Index& nearest) {
+    Scene scene;
+    SceneObject& obj = scene.add("Ico", makeIcosphere(5));
+    const Vec3 c = surfacePoint(obj, {0.0f, 1.0f, 0.0f});
+    nearest = 0;
+    for (Index v = 1; v < obj.mesh.vertexCount(); ++v)
+      if (glm::length(obj.mesh.positions[v] - c) < glm::length(obj.mesh.positions[nearest] - c)) nearest = v;
+    DyntopoOptions options;
+    options.refine = DyntopoRefine::CollapseOnly;
+    options.timeBudgetMs = 0.0;
+    DyntopoSession session(obj, options);
+    DabTopology topo{0.3f, faceNear(obj, c, 0.4f)};
+    topo.keepVertex = keep == 0 ? kInvalid : nearest;
+    const Vec3 before = obj.mesh.positions[nearest];
+    int collapses = 0;
+    for (int d = 0; d < 6; ++d) {
+      const DyntopoPass& pass = session.pass(c, 0.4f, topo);
+      obj.bvh.refitLeaves(obj.mesh, pass.refitLeaves);
+      requireDynamic(obj);
+      collapses += pass.collapses;
+    }
+    CHECK(collapses > 100);
+    return obj.mesh.positions[nearest] == before;
+  };
+  Index nearest = 0;
+  CHECK_FALSE(coarsen(0, nearest));
+  CHECK(coarsen(1, nearest));
+}
+
+TEST_CASE("a dab's own time budget can only shorten a pass") {
+  auto splits = [](double optionsMs, double dabMs) {
+    Scene scene;
+    SceneObject& obj = scene.add("Ico", makeIcosphere(2));
+    DyntopoOptions options;
+    options.refine = DyntopoRefine::SplitOnly;
+    options.timeBudgetMs = optionsMs;
+    DyntopoSession session(obj, options);
+    const Vec3 c = surfacePoint(obj, {0.0f, 1.0f, 0.0f});
+    DabTopology topo{0.02f, faceNear(obj, c, 1.0f)};
+    topo.timeBudgetMs = dabMs;
+    const int n = session.pass(c, 1.0f, topo).splits;
+    obj.bvh.endDynamic();
+    return n;
+  };
+  const int full = splits(0.0, -1.0);
+  CHECK(full > 100);
+  CHECK(splits(0.0, 1e-9) == full);  // No limit in the options stays deterministic.
+  CHECK(splits(1e9, -1.0) == full);
+  CHECK(splits(1e9, 1e-9) < 32);     // The smaller budget wins.
+  CHECK(splits(1e-9, 1e9) < 32);
+}

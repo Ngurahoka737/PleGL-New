@@ -31,6 +31,11 @@ struct DabTopology {
   // sets meet moves or merges away.
   std::int32_t onlySet = 0;
   bool lockFaceSetBorders = false;
+  // Time budget for this pass in ms. Negative uses DyntopoOptions::timeBudgetMs; otherwise the
+  // smaller of the two applies (0 in the options still means no time limit).
+  double timeBudgetMs = -1.0;
+  // A vertex that must survive the pass: collapses keep it in place or leave the edge alone.
+  Index keepVertex = kInvalid;
 };
 
 // What one topology pass changed.
@@ -137,6 +142,8 @@ class DyntopoSession {
   DyntopoPass pass_;
   std::int32_t onlySet_ = 0;  // DabTopology::onlySet.
   bool lockBorders_ = false;  // DabTopology::lockFaceSetBorders.
+  double budgetMs_ = 0.0;     // Effective time budget, 0 = none.
+  Index keepVertex_ = kInvalid;  // DabTopology::keepVertex.
   std::vector<Index> leaves_;
   std::vector<std::vector<Edge>> perLeafSplits_, perLeafCollapses_;
   std::vector<Edge> splits_, collapses_;

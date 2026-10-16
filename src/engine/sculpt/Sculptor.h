@@ -9,6 +9,7 @@
 #include "multires/Propagate.h"
 #include "sculpt/Brush.h"
 #include "sculpt/Dyntopo.h"
+#include "sculpt/Normals.h"
 #include "sculpt/Undo.h"
 
 namespace plegl {
@@ -109,6 +110,9 @@ class Sculptor {
   // Scratch memory for compacting dynamic topology strokes, shared with the undo stack. Without
   // one the sculptor makes its own on first use.
   void setLayoutWorkspace(std::shared_ptr<LayoutWorkspace> workspace) { workspace_ = std::move(workspace); }
+  // Scratch for normal recomputation, may be shared with the layer operations. Without one the
+  // sculptor makes its own on first use.
+  void setNormalWorkspace(std::shared_ptr<NormalWorkspace> workspace) { normals_ = std::move(workspace); }
   // The running stroke's topology session, or nullptr.
   const DyntopoSession* dyntopo() const { return dyntopo_.get(); }
   // The face set the running (or last) face set stroke paints on the primary side.
@@ -171,6 +175,7 @@ class Sculptor {
   std::unique_ptr<DyntopoSession> dyntopo_;
   std::size_t mergedClaims_ = 0;  // Claims already merged with position snapshots.
   std::shared_ptr<LayoutWorkspace> workspace_;
+  std::shared_ptr<NormalWorkspace> normals_;
   StrokeTopologyStats lastStroke_;
 };
 

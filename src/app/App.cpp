@@ -113,6 +113,8 @@ bool App::init(std::string* error) {
   undoStack.setSyncWorkspace(syncWorkspace_);
   layerWorkspace_ = std::make_shared<LayerWorkspace>();
   undoStack.setLayerWorkspace(layerWorkspace_);
+  // Strokes and layer operations share one normal scratch (16 bytes per face).
+  sculptor_.setNormalWorkspace(std::shared_ptr<NormalWorkspace>(layerWorkspace_, &layerWorkspace_->normals));
   rendererReady_ = true;
 
   initRecovery();

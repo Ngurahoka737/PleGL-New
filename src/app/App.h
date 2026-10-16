@@ -2,6 +2,7 @@
 
 #include <SDL3/SDL.h>
 
+#include <array>
 #include <cstdint>
 #include <deque>
 #include <filesystem>
@@ -53,11 +54,18 @@ struct PrimitiveSettings {
 // settings keys, so they have no spaces; labels are what the panel shows.
 enum class BrushKind { Draw, Clay, Smooth, Grab, Inflate, Flatten, Crease, Mask, FaceSet, EraseLayer };
 inline constexpr int kBrushCount = 10;
-inline constexpr const char* kBrushNames[kBrushCount] = {"Draw",    "Clay",   "Smooth", "Grab",    "Inflate",
-                                                         "Flatten", "Crease", "Mask",   "FaceSet", "EraseLayer"};
-inline constexpr const char* kBrushLabels[kBrushCount] = {"Draw",    "Clay",   "Smooth", "Grab",     "Inflate",
-                                                          "Flatten", "Crease", "Mask",   "Face Set", "Erase Layer"};
-inline constexpr const char* kBrushKeys[kBrushCount] = {"D", "C", "S", "G", "I", "T", "Shift+C", "M", "P", "E"};
+// Each table has one entry per brush; the asserts catch a short initialiser list, which would
+// otherwise fill the rest with empty entries.
+inline constexpr std::array<const char*, kBrushCount> kBrushNames = {
+    "Draw", "Clay", "Smooth", "Grab", "Inflate", "Flatten", "Crease", "Mask", "FaceSet", "EraseLayer"};
+inline constexpr std::array<const char*, kBrushCount> kBrushLabels = {
+    "Draw", "Clay", "Smooth", "Grab", "Inflate", "Flatten", "Crease", "Mask", "Face Set", "Erase Layer"};
+inline constexpr std::array<const char*, kBrushCount> kBrushKeys = {"D", "C", "S", "G", "I",
+                                                                    "T", "Shift+C", "M", "P", "E"};
+inline constexpr std::array<float, kBrushCount> kBrushDefaultStrength = {0.5f, 0.5f, 0.5f, 1.0f, 0.5f,
+                                                                         0.5f, 0.5f, 1.0f, 1.0f, 0.5f};
+static_assert(kBrushNames.back() != nullptr && kBrushLabels.back() != nullptr && kBrushKeys.back() != nullptr);
+static_assert(kBrushDefaultStrength.back() > 0.0f);
 enum class PressureMap { Strength, Radius, Both, None };
 // How the dynamic topology detail size is given: in screen pixels at the cursor (so zooming in
 // adds detail), or as a fixed edge length in object units.
@@ -66,7 +74,7 @@ enum class DetailMode { Relative, Constant };
 struct SculptSettings {
   BrushKind brush = BrushKind::Draw;
   float radiusPx = 60.0f;      // Screen-space radius, like most sculpting tools.
-  float strength[kBrushCount] = {0.5f, 0.5f, 0.5f, 1.0f, 0.5f, 0.5f, 0.5f, 1.0f, 1.0f, 0.5f};  // Per brush.
+  std::array<float, kBrushCount> strength = kBrushDefaultStrength;  // Per brush.
   Falloff falloff = Falloff::Smooth;
   bool invert = false;         // Brushes subtract instead of add (Ctrl flips it per stroke).
   PressureMap pressure = PressureMap::Strength;

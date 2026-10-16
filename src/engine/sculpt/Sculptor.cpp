@@ -344,13 +344,9 @@ bool Sculptor::applyOne(const Dab& dabIn, const DabTopology& topology, int side)
 }
 
 void Sculptor::recomputeNormals(std::span<const Index> verts) {
-  Mesh& m = object_->mesh;
-  parallelFor(0, verts.size(), 2048, [&](std::size_t b, std::size_t e) {
-    for (std::size_t i = b; i < e; ++i) {
-      const Index v = verts[i];
-      m.normals[v] = m.vertexNormal(v);
-    }
-  });
+  if (!normals_) normals_ = std::make_shared<NormalWorkspace>();
+  // Dynamic topology leaves dead faces until the stroke ends, so only whole-mesh passes are off.
+  recomputeVertexNormals(object_->mesh, verts, *normals_, !object_->bvh.dynamic());
 }
 
 bool Sculptor::beginGrab(SceneObject& object, const StrokeOptions& options, const Vec3& center, float radius,
@@ -398,13 +394,10 @@ bool Sculptor::beginGrab(SceneObject& object, const StrokeOptions& options, cons
     std::fill(vertexStamp_.begin(), vertexStamp_.end(), 0);
     stamp_ = 1;
   }
+  // Every fan of a pinched vertex: faces in its other fans change shape too.
+  const std::span<const std::pair<Index, Index>> fans = nonManifoldFans(object, fans_);
   std::vector<Index> faces;
-  for (const GrabVertex& g : grabVerts_) {
-    m.forEachOutgoing(g.v, [&](Index h) {
-      const Index f = m.heFace[h];
-      if (f != kInvalid) faces.push_back(f);
-    });
-  }
+  for (const GrabVertex& g : grabVerts_) forEachFaceAt(m, fans, g.v, [&](Index f) { faces.push_back(f); });
   std::sort(faces.begin(), faces.end());
   faces.erase(std::unique(faces.begin(), faces.end()), faces.end());
   grabNormalVerts_.clear();

@@ -10,6 +10,7 @@
 #include "multires/Propagate.h"
 #include "scene/Scene.h"
 #include "sculpt/Brush.h"
+#include "sculpt/Normals.h"
 #include "sculpt/Sculptor.h"
 #include "sculpt/Undo.h"
 
@@ -45,10 +46,10 @@ const Brush& strokeBrush(const Brush& brush, const SceneObject& object, const St
 
 // Scratch memory for layer operations, kept between them.
 struct LayerWorkspace {
-  std::vector<Index> support, changed, ring, leaves, faces;
+  std::vector<Index> support, changed, ring, leaves;
   std::vector<Vec3> next;  // New positions, parallel to the vertices being recomposed.
   std::vector<Vec3> oldP;  // Old positions, parallel to `changed`.
-  std::vector<Vec3> faceN;
+  NormalWorkspace normals;
   SyncStamps faceMark, vertMark;
   FanCache fans;
   std::size_t bytes() const;
