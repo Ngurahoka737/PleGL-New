@@ -232,7 +232,7 @@ class Sculptor {
   void applyTopology(const Dab& dab, const DabTopology& topology);
   double topologyBudget(int passes) const;
   Index findHook(const CopyCluster& cluster, float radius);
-  void reglueHooks(float radius);
+  void reglueHooks(float radius, std::span<const Vec3> before);
   void finishPose();
   Mat3 snakeSteering(float radius) const;
   void mergeClaims();

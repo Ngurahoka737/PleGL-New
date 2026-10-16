@@ -721,7 +721,7 @@ void App::beginStroke(float x, float y, std::uint64_t timestampNs) {
     pendingPoseNs_ = 0;
     poseSkipNext_ = false;
     statusMessage = "Pose: drag to turn";
-    if (sculptor_.poseBuild()->missingOps != 0) statusMessage += " (some symmetric copies found no surface)";
+    if (sculptor_.poseBuild()->missingOps != 0) statusMessage += kPoseMissingNote;
     if (timestampNs != 0 && (oldestInputThisFrameNs_ == 0 || timestampNs < oldestInputThisFrameNs_))
       oldestInputThisFrameNs_ = timestampNs;
     return;
@@ -821,6 +821,7 @@ void App::tickStroke(bool flush) {
     noteInput(pendingPoseNs_);
     pendingPoseNs_ = 0;
     statusMessage = "Pose, " + std::to_string(std::lround(sculptor_.poseAngle())) + " degrees";
+    if (sculptor_.poseBuild() && sculptor_.poseBuild()->missingOps != 0) statusMessage += kPoseMissingNote;
     return;
   }
   if (strokeBrush_ == BrushKind::Grab) {
@@ -945,6 +946,7 @@ void App::endStroke() {
   const SceneObject* obj = sculptor_.object();
   const bool levels = obj && obj->multires;
   const std::size_t poseGroups = sculptor_.poseBuild() ? sculptor_.poseBuild()->rigs.size() : 0;
+  const bool poseMissing = sculptor_.poseBuild() && sculptor_.poseBuild()->missingOps != 0;
   const float poseAngle = sculptor_.poseAngle();
   auto entry = sculptor_.endStroke();
   const StrokeTopologyStats& topo = sculptor_.lastStrokeTopology();
@@ -956,6 +958,7 @@ void App::endStroke() {
     if (poseGroups > 0) {
       statusMessage = label + ", " + std::to_string(std::lround(poseAngle)) + " degrees";
       if (poseGroups > 1) statusMessage += ", " + std::to_string(poseGroups) + " groups";
+      if (poseMissing) statusMessage += kPoseMissingNote;
     }
     if (topo.dyntopo) {
       const long long diff = static_cast<long long>(topo.facesAfter) - topo.facesBefore;
@@ -973,6 +976,9 @@ void App::endStroke() {
   if (topo.outOfRoom) statusMessage += " (dynamic topology stopped: stroke too large)";
   if (topo.tooManyCopies) statusMessage += " (dynamic topology is off above 24 symmetry copies)";
   if (topo.faulted) statusMessage += " (dynamic topology stopped on a damaged area)";
+  // A Pose stroke kept the pick from before it (see updateHover): a press before the next frame
+  // must find the surface the stroke left.
+  if (strokeBrush_ == BrushKind::Pose) hover_ = pickUnderMouse();
 }
 
 std::string App::symmetryText() const {

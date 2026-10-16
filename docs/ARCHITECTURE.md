@@ -43,7 +43,7 @@ Setiap dab:
 2. Daun itu disalin ke snapshot undo sebelum brush menyentuhnya (sekali per stroke per daun).
 3. Brush memindahkan posisi secara paralel per daun. Kontraknya: vertex hanya bergerak di dalam bola dab.
 4. Normal dihitung ulang hanya untuk vertex dari face yang berada dalam 1,25 × radius, lalu bounds daun di-refit dan daun ditandai dirty untuk upload GPU parsial.
-5. Dengan simetri X, dab cermin dijalankan di (−x, y, z), kecuali dab sudah menyentuh bidang tengah.
+5. Dengan simetri, setiap salinan dab (cermin X/Y/Z dan salinan radial) dijalankan sekaligus; lihat bagian Simetri.
 
 Radius brush ditentukan dalam pixel layar, lalu diubah ke satuan dunia di titik kena, jadi ukuran brush terasa sama di layar pada zoom berapa pun. Tekanan pen bisa memengaruhi strength, radius, keduanya, atau tidak sama sekali.
 
@@ -58,10 +58,47 @@ Brush yang ada:
 | Flatten | Menarik vertex ke bidang yang melewati pusat area. |
 | Crease | Mendorong ke dalam seperti Draw sambil menjepit vertex ke pusat brush. |
 | Grab | Menangkap vertex di dalam radius saat klik, lalu memindahkannya mengikuti cursor pada bidang yang menghadap kamera. |
+| Snake Hook | Menarik permukaan mengikuti cursor dari satu vertex "kait", cocok untuk tanduk dan tentakel (lihat bagian Snake Hook). |
+| Pose | Memutar satu bagian model pada sendinya, misalnya lengan atau jari (lihat bagian Pose). |
 
 Semua brush kecuali Grab lewat `Brush::apply` dan dibatasi `kMaxDabMove` (0,2 × radius per dab) supaya pencarian normal basi tetap benar. Grab punya jalur sendiri di `Sculptor::beginGrab/grab`: daftar vertex, face, dan daun yang terpengaruh dihitung sekali saat klik, lalu tiap gerakan cursor hanya menulis posisi, normal, dan refit daun itu.
 
 Undo menyimpan keadaan sebelum dan sesudah untuk daun yang berubah saja (posisi dan normal, nilai mask untuk stroke dan operasi mask, atau nilai face set per face untuk stroke dan operasi face set), dengan batas memori 1 GB. Stroke yang tidak mengubah apa pun (misalnya seluruhnya di area ter-mask) tidak membuat entry, jadi riwayat redo tetap utuh. Entry yang topologinya sudah berubah (misalnya setelah remesh nanti) dilewati, bukan diterapkan ke mesh yang salah.
+
+## Simetri (`sculpt/Symmetry.h`)
+
+Simetri adalah grup operasi linear `L = R_j · D`: D adalah kombinasi cermin X, Y, dan Z yang aktif, R_j adalah putaran radial ke-j (1 sampai 32 salinan di sekitar sumbu X, Y, atau Z lokal objek). Paling banyak 64 salinan; panel memperingatkan di atas 16 dan dynamic topology mati di atas 24.
+
+- **Cluster.** Salinan dab yang hampir berimpit (dalam 0,05 × radius dari salinan lain, atau dari bidang atau sumbu yang dipertahankan sebagian op) digabung menjadi satu cluster, yaitu satu coset dari subgrup yang mempertahankan titik itu. Gerakan cluster gabungan diproyeksikan ke arah yang disepakati semua anggotanya, jadi dab di bidang tengah tidak menggandakan tarikan dan tidak mendorong vertex keluar dari bidang.
+- **Salinan yang bertumpuk.** Salinan yang saling mendekat berbagi vertex di daerah tumpang tindih menurut falloff masing-masing (share), jadi sambungan tidak terdorong dua kali. Salinan yang berjauhan bekerja persis seperti dab terpisah.
+- **Baca dulu, baru tulis.** Satu dab simetris berjalan dalam beberapa fase: semua salinan membaca posisi dan normal awal, lalu menulis, sehingga hasilnya tidak bergantung urutan salinan atau jumlah thread. Normal dihitung sekali untuk gabungan semua daun yang tersentuh.
+- **Pin sambungan.** Vertex yang mulai dalam 1e-5 × diagonal bounds dari bidang cermin atau sumbu radial dan digerakkan dab dikembalikan tepat ke bidang atau sumbu itu (koordinatnya menjadi +0 persis). Vertex yang tidak digerakkan dab (ter-mask, di luar falloff, ditolak face set) dibiarkan.
+- **Grab, mask, face set, layer, multires, dynamic topology** semuanya ikut simetri. Dynamic topology menjaga vertex di bidang tetap di bidang lewat aturan split dan collapse.
+- **Aplikasi.** Tombol X, Y, dan Z menyalakan atau mematikan cermin; jumlah radial dan sumbunya ada di panel Symmetry. Cursor menggambar satu cincin per cluster, dan "Show planes" menggambar bidang cermin dan sumbu radial.
+
+## Tick stroke per frame (`App::tickStroke`)
+
+Event input hanya mengantre pekerjaan; pekerjaan brush dijalankan sekali per frame setelah semua event diproses. Brush dab menjalankan sampel yang mengantre sampai 10 ms per frame (minimal satu sampel), sisanya lanjut di frame berikutnya, dan akhir stroke menjalankan semua sisa. Sampel tidak pernah dibuang, jadi brush berat memperlambat stroke, bukan layar. Grab, Snake Hook, dan Pose hanya menyimpan posisi cursor terbaru dan menerapkannya sekali per frame.
+
+## Snake Hook (`SnakeHookBrush`, `Sculptor::beginSnake/snakeTo`)
+
+- **Kait.** Saat klik, setiap cluster simetri memilih vertex terdekat sebagai kaitnya. Cluster tetap sama sepanjang stroke, jadi setiap salinan menarik tentakelnya sendiri.
+- **Mengikuti cursor.** Setiap frame kait bergerak sebagian jalan ke cursor dengan gain `1 − (1 − s)^(dt / 16,7 ms)` (s = strength, "follow" di panel), jadi rasanya sama pada frame rate berapa pun. Gerakan dipotong menjadi sub-dab paling jauh 0,18 × radius yang menempel di kait, paling banyak 32 per frame; sisanya dikejar frame berikutnya.
+- **Steering.** Kalau salinan lain atau mask menahan kait, tarikan dikoreksi dengan kuadrat terkecil teregulasi (λ = 0,01, paling besar 3 × tarikan biasa) supaya kait tetap sampai ke cursor. Kait yang ditahan pin di bidang cermin hanya diperintah sepanjang bidang, dan tarikan di bawah jarak float di posisi kait dihitung nol, jadi stroke berhenti begitu kait tidak bisa lebih dekat.
+- **Pinch** menyempitkan bagian yang tertarik. Normal dihitung sekali per frame untuk semua sub-dab.
+- **Dynamic topology.** Dengan Ctrl+D, setiap pass topologi di sekitar kait mempertahankan vertex kait, jadi tentakel terisi segitiga baru. Kait salinan lain yang terhapus oleh pass itu dipindah ke vertex hidup terdekat dari posisinya sebelum pass. Tanpa dynamic topology permukaan hanya meregang (seperti di Blender), jadi hasilnya tanduk tipis.
+
+## Pose (`sculpt/PoseOps.h`, `Sculptor::beginPose/pose`)
+
+Pose dibangun sekali saat klik, lalu drag hanya memutar.
+
+- **Daerah.** Mode Topology: semua vertex dalam satu radius brush dari titik klik, diukur di sepanjang permukaan (Dijkstra lewat garis lurus melintasi face). Mode Mask: seluruh bagian yang tidak ter-mask yang terhubung ke titik klik. Setiap salinan simetri menumbuhkan daerahnya sendiri; salinan yang daerahnya bersentuhan menjadi satu rig.
+- **Sendi.** Batas daerah memberi loop kandidat sendi. Dari setiap loop sebuah front berjalan ke sisa mesh, satu ring per putaran; front yang bertemu berarti bagiannya sama. Setelah tinggal satu front yang masih tumbuh, front itu tumbuh sendiri sampai jumlah vertexnya melewati setiap bagian yang sudah habis. Loop bagian terbesar (dihitung dari jumlah vertex, bukan kedalaman ring) adalah akar yang diam; bagian di balik loop lain, yang sudah dijelajahi utuh, ikut berputar kaku. Kalau batas kunjungan (1M, atau 2 × daerah) habis, setiap front yang masih tumbuh dianggap bagian yang terlalu besar dan ikut diam, jadi tidak ada bagian yang berputar setengah. Pivot adalah pusat loop akar yang ditimbang panjang segmen.
+- **Bagian kaku hanya lewat vertex yang boleh bergerak.** Bagian di balik loop lain hanya ikut berputar sejauh bisa dicapai dari daerah lewat vertex yang boleh bergerak. Bagian di balik border face set terkunci atau mask tetap diam, dan border itu menjadi sendi.
+- **Bobot.** Bobot turun dari 1 ke 0 dengan smoothstep di pita selebar "joint softness" × radius, lalu dikali (1 − mask). Di loop akar, pita setengah di tiap sisi. Di sendi yang sisi luarnya tidak boleh bergerak (border terkunci, mask, vertex yang tersembunyi atau milik rig lain), seluruh pita ada di sisi yang berputar, jadi bobot sudah 0 di border dan tidak ada sobekan. Pita satu rig berhenti di daerah dan bagian kaku rig lain; vertex yang masuk pita sisi diam beberapa rig ikut sendi yang paling dekat.
+- **Drag.** Setiap update memutar posisi awal (bukan posisi frame sebelumnya) dengan Rodrigues sebesar bobot × sudut, jadi tidak ada drift. Rig cermin berputar dengan putaran tercermin, rig gabungan hanya dengan bagian putaran yang disepakati. Vertex yang mulai di bidang cermin atau sumbu radial tetap tepat di sana (pin sambungan yang sama dengan brush lain). Normal face yang berputar utuh ikut diputar; normal di pita dihitung ulang (ditunda sampai akhir stroke kalau lebih dari 600K). Akhir stroke menghitung normal persis dan me-refit bounds.
+- **Preview.** Di aplikasi, saat cursor diam 120 ms, Pose dibangun dengan batas waktu 8 ms dan loop sendi serta pivot digambar. Klik dalam 2 px dari titik preview, tanpa edit sejak itu, memakai hasil preview, jadi klik tidak perlu membangun ulang. Bagian besar yang melewati 8 ms dibangun saat klik.
+- **Gagal.** Klik di area ter-mask, di luar permukaan, atau di tempat sendi berada tepat di bawah klik (area datar) tidak memulai stroke dan menampilkan alasannya. Bagian lepas (tanpa loop) selalu berputar di sekitar centroidnya, sekecil apa pun dibanding brush.
 
 ## Mask (`sculpt/MaskOps.h`, `Mesh::mask`)
 

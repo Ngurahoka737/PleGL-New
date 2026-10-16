@@ -63,6 +63,8 @@ inline constexpr double kStrokeTickBudgetMs = 10.0;
 // before the next turn.
 inline constexpr double kPosePreviewRestMs = 120.0, kPosePreviewCapMs = 8.0, kPoseSkipMs = 12.0;
 inline constexpr float kPoseRebuildPx = 4.0f, kPoseReusePx = 2.0f;
+// Added to every Pose status line of a stroke where a symmetric copy of the press hit nothing.
+inline constexpr const char* kPoseMissingNote = " (some symmetric copies found no surface)";
 // Each table has one entry per brush; the asserts catch a short initialiser list, which would
 // otherwise fill the rest with empty entries.
 inline constexpr std::array<const char*, kBrushCount> kBrushNames = {

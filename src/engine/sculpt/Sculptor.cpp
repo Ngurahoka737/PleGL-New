@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cmath>
 #include <iterator>
+#include <limits>
 #include <span>
 #include <unordered_map>
 
@@ -846,15 +847,15 @@ bool Sculptor::beginSnake(SceneObject& object, const Brush& snake, const StrokeO
   return true;
 }
 
-void Sculptor::reglueHooks(float radius) {
+void Sculptor::reglueHooks(float radius, std::span<const Vec3> before) {
   // A topology pass keeps only its own hook; one that another copy's pass merged away moves to
-  // the nearest live vertex that may move.
+  // the live vertex nearest where it was (a removed vertex's position is kDeadPosition).
   const Mesh& m = object_->mesh;
   for (int k = 0; k < snakeClusterCount_; ++k) {
     Index& hook = snakeHooks_[static_cast<std::size_t>(k)];
     if (hook == kInvalid || m.vertHe[hook] != kInvalid) continue;
     CopyCluster around = snakeClusters_[static_cast<std::size_t>(k)];
-    around.center = m.positions[hook];  // Removed vertices keep their last position.
+    around.center = before[static_cast<std::size_t>(k)];
     hook = findHook(around, radius);
   }
 }
@@ -882,6 +883,10 @@ Mat3 Sculptor::snakeSteering(float radius) const {
     const float share = (kShareExponent == 1.0f ? fk : std::pow(fk, kShareExponent)) / sum;
     E += snakeClusters_[static_cast<std::size_t>(k)].polar * (share * fk);
   }
+  // A hook the seam pins hold on a plane or axis moves only along it, whatever the copies pull.
+  if (const OpMask ops = group_.size() > 1 && !brush_->writesLayer() ? pinOps(p0, radius) : 0;
+      ops && pinCandidate(p0, ops))
+    E = seamPin(group_, p0, pinEps_).P * E;
   const float free = m.mask.empty() ? 1.0f : 1.0f - m.mask[h0];
   return E * free;
 }
@@ -901,7 +906,10 @@ SnakeStep Sculptor::snakeTo(const Vec3& target, float radius, float gain, const 
     for (int k = 0; k < snakeClusterCount_; ++k)
       passes += hookAt(k) != kInvalid && onlySet_[snakeClusters_[static_cast<std::size_t>(k)].op] != kNoFaceSet;
     const double perPass = topologyBudget(passes);
+    std::array<Vec3, kMaxSymmetryCopies> before{};
     for (int k = 0; k < snakeClusterCount_; ++k) {
+      for (int j = 0; j < snakeClusterCount_; ++j)
+        if (hookAt(j) != kInvalid) before[static_cast<std::size_t>(j)] = m.positions[hookAt(j)];
       const Index hook = hookAt(k);
       const std::int32_t only = onlySet_[snakeClusters_[static_cast<std::size_t>(k)].op];
       if (hook == kInvalid || only == kNoFaceSet || m.vertHe[hook] == kInvalid) continue;
@@ -915,7 +923,7 @@ SnakeStep Sculptor::snakeTo(const Vec3& target, float radius, float gain, const 
       d.center = m.positions[hook];
       d.radius = radius;
       applyTopology(d, t);
-      reglueHooks(radius);
+      reglueHooks(radius, before);
     }
     if (hookAt(0) == kInvalid) {  // Nothing left to pull (a damaged area).
       step.ms = total.ms();
@@ -941,10 +949,12 @@ SnakeStep Sculptor::snakeTo(const Vec3& target, float radius, float gain, const 
   }
 
   // 3. Sub-dabs glued to the hooks. One that would pull farther than a step is cut to a step and
-  // the next tick covers the rest.
+  // the next tick covers the rest. A pull below the float spacing at the hook would round away.
   const float length = glm::length(command);
   const float stepLen = kSnakeStep * radius;
-  if (length > 1e-7f * radius) {
+  const float resolution = std::numeric_limits<float>::epsilon() *
+                           std::max({std::abs(p0.x), std::abs(p0.y), std::abs(p0.z)});
+  if (length > std::max(1e-7f * radius, resolution)) {
     const int n = std::clamp(static_cast<int>(std::ceil(length / stepLen)), 1, kMaxSnakeSubDabs);
     Vec3 part = command / static_cast<float>(n);
     if (glm::length(part) > stepLen) part *= stepLen / glm::length(part);
@@ -1036,6 +1046,21 @@ bool Sculptor::beginPose(SceneObject& object, const StrokeOptions& options, cons
     pose_ = PoseBuild{};
     object_ = nullptr;
     return false;
+  }
+  // Vertices on a symmetry plane or axis stay on it, as under every other brush.
+  OpMask allOps = 0;
+  for (int k = 1; k < group_.size(); ++k) allOps |= OpMask{1} << k;
+  for (PoseRig& rig : pose_.rigs) {
+    rig.pins.clear();
+    if (!allOps) continue;
+    std::vector<std::vector<std::pair<std::uint32_t, SeamPin>>> found((rig.verts.size() + 8191) / 8192);
+    parallelFor(0, found.size(), 1, [&](std::size_t cb, std::size_t ce) {
+      for (std::size_t c = cb; c < ce; ++c)
+        for (std::size_t i = c * 8192; i < std::min(rig.verts.size(), (c + 1) * 8192); ++i)
+          if (pinCandidate(rig.start[i], allOps))
+            found[c].emplace_back(static_cast<std::uint32_t>(i), seamPin(group_, rig.start[i], pinEps_));
+    });
+    for (const auto& f : found) rig.pins.insert(rig.pins.end(), f.begin(), f.end());
   }
   for (Index l : pose_.snapshotLeaves) snapshot(l);
   poseStroke_ = true;

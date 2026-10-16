@@ -49,6 +49,8 @@ struct PoseRig {
   std::vector<Vec3> start, startNormal;
   std::vector<std::uint32_t> rigidSlots;  // Indices into verts whose faces all turn rigidly.
   std::vector<Vec3> rootLoop;        // The joint loop as segment end point pairs, at most kPoseLoopPoints.
+  // Slots that start on a symmetry plane or axis, held on it as they turn (set by the sculptor).
+  std::vector<std::pair<std::uint32_t, SeamPin>> pins;
 };
 
 inline constexpr std::size_t kPoseLoopPoints = 512;
@@ -84,7 +86,8 @@ PoseBuild buildPose(const Mesh& mesh, const Bvh& bvh, std::span<const std::pair<
 Vec3 poseRotation(const Vec3& from, const Vec3& pivot, const Vec3& target, const Vec3& viewNormal);
 
 // Moves a rig's vertices to their start positions turned by `rotation` (this rig's frame) about
-// its pivot, each by its weight's share of the angle, and turns the normals of its rigid slots.
+// its pivot, each by its weight's share of the angle, snaps its pins back onto their plane or
+// axis, and turns the normals of its rigid slots.
 void applyPoseRig(Mesh& mesh, const PoseRig& rig, const Vec3& rotation);
 
 }  // namespace plegl

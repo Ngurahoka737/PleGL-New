@@ -389,3 +389,110 @@ TEST_CASE("snake hook: the follow gain does not depend on the tick length") {
   CHECK(snakeGain(1.0f, 3.0) == 1.0f);
   CHECK(snakeGain(0.0f, 16.0) == 0.0f);
 }
+
+TEST_CASE("snake hook: a hook another copy's topology pass removes is glued to the nearest live vertex") {
+  // Two mirror copies close together: the pass around one hook collapses edges at the other.
+  Scene scene;
+  SceneObject& obj = scene.add("S", makeQuadSphere(64));
+  SnakeHookBrush snake;
+  Sculptor s;
+  const float r = 0.2f;
+  StrokeOptions o = snakeOptions({true, false, false});
+  o.dyntopo = true;
+  o.dyntopoOptions.timeBudgetMs = 0.0;
+  REQUIRE(s.beginSnake(obj, snake, o, test::surfacePoint(obj, {0.04f, 1.0f, 0.0f}), r, 0.0f, "Snake Hook"));
+  REQUIRE(s.snakeHook(1) != kInvalid);
+  const Vec3 start = obj.mesh.positions[s.snakeHook()];
+  bool moved = false;
+  for (int i = 1; i <= 10; ++i) {
+    const Index before = s.snakeHook(1);
+    DabTopology topo;
+    topo.detail = 0.15f;
+    s.snakeTo(start + Vec3{0.0f, 0.15f * r * static_cast<float>(i), 0.0f}, r, 1.0f, topo);
+    REQUIRE(s.snakeHook() != kInvalid);
+    REQUIRE(s.snakeHook(1) != kInvalid);
+    REQUIRE(obj.mesh.vertHe[s.snakeHook(1)] != kInvalid);
+    moved = moved || s.snakeHook(1) != before;
+  }
+  CHECK(moved);  // The case this test is about happened.
+  // Both copies pulled their tentacle.
+  const Vec3 p0 = obj.mesh.positions[s.snakeHook()], p1 = obj.mesh.positions[s.snakeHook(1)];
+  CHECK(p0.y > start.y + 1.2f * r);
+  CHECK(p1.y > start.y + 1.2f * r);
+  CHECK(std::abs(p0.x + p1.x) < 0.1f * r);
+  REQUIRE(s.endStroke());
+  test::requireValid(obj.mesh);
+}
+
+TEST_CASE("snake hook: a hook pinned on the mirror plane settles when the mirror hook is another vertex") {
+  // An uneven mesh at the seam: the copy across the plane hooks a different vertex, so the copies
+  // disagree, but the pin holds the primary hook on the plane. The pull stays along the plane
+  // and the stroke settles instead of spreading the surface sideways every tick.
+  Scene scene;
+  Mesh mesh = makeQuadSphere(16);
+  const float r = 0.25f;
+  Index seam = kInvalid;
+  for (Index v = 0; v < mesh.vertexCount(); ++v)
+    if (mesh.positions[v].x == 0.0f && mesh.positions[v].y > 0.0f &&
+        (seam == kInvalid || mesh.positions[v].y > mesh.positions[seam].y))
+      seam = v;
+  REQUIRE(seam != kInvalid);
+  const Vec3 s0 = mesh.positions[seam];
+  const Vec3 press = s0 + Vec3{0.08f * r, 0.0f, 0.0f};  // Far enough off the plane not to merge.
+  // The nearest vertex on the other side moves right under the mirrored press.
+  Index across = kInvalid;
+  for (Index v = 0; v < mesh.vertexCount(); ++v)
+    if (mesh.positions[v].x < 0.0f &&
+        (across == kInvalid ||
+         glm::length(mesh.positions[v] - s0) < glm::length(mesh.positions[across] - s0)))
+      across = v;
+  REQUIRE(across != kInvalid);
+  mesh.positions[across] = Vec3{-press.x, press.y, press.z};
+  mesh.computeNormals();
+  const Vec3 a0 = mesh.positions[across];
+  SceneObject& obj = scene.add("S", std::move(mesh));
+  // Adding the object reorders its vertices.
+  for (Index v = 0; v < obj.mesh.vertexCount(); ++v) {
+    if (obj.mesh.positions[v] == s0) seam = v;
+    if (obj.mesh.positions[v] == a0) across = v;
+  }
+  SnakeHookBrush snake;
+  Sculptor s;
+  REQUIRE(s.beginSnake(obj, snake, snakeOptions({true, false, false}), press, r, 0.0f, "Snake Hook"));
+  REQUIRE(s.snakeHook() == seam);
+  REQUIRE(s.snakeHook(1) == across);
+  const Vec3 target = s0 + Vec3{0.5f * r, 1.5f * r, 0.2f * r};
+  SnakeStep step;
+  int still = 0;
+  for (int i = 0; i < 200 && still < 3; ++i) {
+    step = s.snakeTo(target, r, 0.7f);
+    still = step.subDabs == 0 ? still + 1 : 0;
+  }
+  CHECK(still == 3);
+  const Vec3 hook = obj.mesh.positions[seam];
+  CHECK(hook.x == 0.0f);
+  CHECK(std::abs(hook.y - target.y) < 1e-4f * r);
+  CHECK(std::abs(hook.z - target.z) < 1e-4f * r);
+  REQUIRE(s.endStroke());
+}
+
+TEST_CASE("snake hook: a hook on the plane following an off-plane cursor at low gain settles") {
+  // The pull along the plane shrinks to under a float step at the hook; it must count as none.
+  for (const float gain : {0.2f, 0.4f}) {
+    Scene scene;
+    SceneObject& obj = scene.add("S", makeQuadSphere(16));
+    SnakeHookBrush snake;
+    Sculptor s;
+    const float r = 0.15f;
+    REQUIRE(s.beginSnake(obj, snake, snakeOptions({true, false, false}), test::surfacePoint(obj, {0, 1, 0}), r, 0.0f,
+                         "Snake Hook"));
+    const Vec3 start = obj.mesh.positions[s.snakeHook()];
+    REQUIRE(start.x == 0.0f);
+    const Vec3 target = start + Vec3{0.4f * r, 0.73f * r, 0.31f * r};
+    int still = 0, ticks = 0;
+    for (; ticks < 600 && still < 3; ++ticks) still = s.snakeTo(target, r, gain).subDabs == 0 ? still + 1 : 0;
+    INFO("gain " << gain << " ticks " << ticks);
+    CHECK(still == 3);
+    REQUIRE(s.endStroke());
+  }
+}

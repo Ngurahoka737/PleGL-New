@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <tuple>
 #include <unordered_map>
@@ -310,6 +311,14 @@ class PoseBuilder {
     std::vector<Segment> segments;
     std::vector<char> rootLoop;  // Per loop.
     std::vector<Index> distal;   // Vertices beyond the other loops: they turn rigidly.
+    // Distal vertices next to a vertex that may not move, with the distance to it.
+    std::vector<std::pair<Index, float>> anchors;
+  };
+  // A vertex within half a band of a joint, on the side that turns or the side that stays.
+  struct BandEntry {
+    Index v;
+    float d;
+    bool moving;
   };
 
   float maskAt(Index v) const { return m_.mask.empty() ? 0.0f : m_.mask[v]; }
@@ -338,8 +347,10 @@ class PoseBuilder {
   Crossing crossing(Index u, Index v) const;
   void findLoops(RigWork& rig, int index);
   bool race(RigWork& rig, int index, std::uint64_t& touchedRigs);
+  void reachDistal(RigWork& rig, int index);
   Vec3 pivotOf(const RigWork& rig, bool& loose);
-  void weigh(const RigWork& rig, PoseRig& out);
+  void band(const RigWork& rig, int index, std::vector<BandEntry>& entries);
+  void weigh(const RigWork& rig, int index, const std::vector<BandEntry>& entries, PoseRig& out);
   void finish();
 
   const Mesh& m_;
@@ -365,6 +376,8 @@ class PoseBuilder {
   std::vector<std::uint32_t> faceStamp_;
   std::uint32_t faceStampValue_ = 0;
   std::vector<std::uint8_t> claimed_;  // Moves with an earlier rig.
+  std::vector<std::int16_t> moverOf_;  // The rig whose region or distal part holds the vertex, -1 none.
+  std::vector<std::int16_t> bandOwner_;  // The rig whose joint is nearest a vertex on a side that stays.
   std::vector<Index> region_;          // In the order the flood reached them.
   std::vector<std::int32_t> bandPos_;  // weigh: the band heap's slots.
   std::vector<std::uint8_t> onCut_;    // findLoops: a region vertex of a face with a corner outside.
@@ -584,8 +597,10 @@ void PoseBuilder::findLoops(RigWork& rig, int index) {
 
 bool PoseBuilder::race(RigWork& rig, int index, std::uint64_t& touchedRigs) {
   // Every loop sends a front into the rest of the mesh, one ring per round, in loop order. Fronts
-  // that meet border the same part. Once a single front still grows, its loop borders the
-  // largest part, the root; every other front has walked its whole part, which turns rigidly.
+  // that meet border the same part. Once a single front still grows, it grows on alone until it
+  // has visited more than any part that is done, or is done too: the loop of the largest part is
+  // the root, which stays, and every other part, walked whole, turns rigidly. Fronts still
+  // growing when the visit cap runs out border parts too large to walk: they stay as well.
   const int n = rig.loops;
   if (n < 2) return true;
   const std::uint32_t s = nextStamp();
@@ -622,6 +637,25 @@ bool PoseBuilder::race(RigWork& rig, int index, std::uint64_t& touchedRigs) {
     }
     meets.clear();
   };
+  const auto growing = [&](int c) { return classes.find(c) == c && !front[static_cast<std::size_t>(c)].empty(); };
+  std::vector<Index> next;
+  // One ring of class c's front.
+  const auto grow = [&](int c) {
+    next.clear();
+    for (Index v : front[static_cast<std::size_t>(c)]) {
+      forEachNeighbour(m_, fans_, v, [&](Index w) {
+        if (capped || rigOf_[w] == index || !live(w)) return;
+        if (stamp_[w] == s) {
+          if (classes.find(owner_[w]) != c) meets.emplace_back(owner_[w], c);
+          return;
+        }
+        visit(w, c);
+        next.push_back(w);
+      });
+      if (capped) break;
+    }
+    front[static_cast<std::size_t>(c)].swap(next);
+  };
   for (std::size_t c = 0; c < rig.crossings.size(); ++c) {
     const Index v = rig.crossings[c].v;
     const int loop = rig.loopOf[c];
@@ -635,52 +669,85 @@ bool PoseBuilder::race(RigWork& rig, int index, std::uint64_t& touchedRigs) {
     }
   }
   merge();
-  std::vector<Index> next;
+  // Every front a ring per round while two or more grow.
   for (;;) {
-    int growing = 0;
-    for (int c = 0; c < n; ++c) growing += classes.find(c) == c && !front[static_cast<std::size_t>(c)].empty();
-    if (growing <= 1 || capped) break;
+    int alive = 0;
+    for (int c = 0; c < n; ++c) alive += growing(c);
+    if (alive <= 1 || capped) break;
     for (int c = 0; c < n && !capped; ++c) {
       if (classes.find(c) != c) continue;
-      next.clear();
-      for (Index v : front[static_cast<std::size_t>(c)]) {
-        forEachNeighbour(m_, fans_, v, [&](Index w) {
-          if (capped || rigOf_[w] == index || !live(w)) return;
-          if (stamp_[w] == s) {
-            if (classes.find(owner_[w]) != c) meets.emplace_back(owner_[w], c);
-            return;
-          }
-          visit(w, c);
-          next.push_back(w);
-        });
-        if (capped) break;
-      }
-      front[static_cast<std::size_t>(c)].swap(next);
+      grow(c);
       if (overTime()) return false;
     }
     merge();
   }
-  // The one front still growing, else (all done at once, or capped) the one that visited most.
-  int root = -1;
-  int growing = 0;
-  for (int c = 0; c < n; ++c) {
-    if (classes.find(c) != c || front[static_cast<std::size_t>(c)].empty()) continue;
-    ++growing;
-    root = c;
+  // The last front alone, until it has visited more than any part that is done.
+  for (;;) {
+    int last = -1;
+    for (int c = 0; c < n; ++c)
+      if (growing(c)) last = c;
+    if (last < 0 || capped) break;
+    std::size_t most = 0;
+    for (int c = 0; c < n; ++c)
+      if (classes.find(c) == c && c != last) most = std::max(most, count[static_cast<std::size_t>(c)]);
+    if (count[static_cast<std::size_t>(last)] > most) break;
+    grow(last);
+    if (overTime()) return false;
+    merge();
   }
-  if (growing != 1) {
-    root = -1;
+  // The roots: every front still growing (after a cap there can be several), else, with every
+  // part walked, the part that visited most.
+  std::vector<char> isRoot(static_cast<std::size_t>(n), 0);
+  int roots = 0;
+  for (int c = 0; c < n; ++c) {
+    if (!growing(c)) continue;
+    isRoot[static_cast<std::size_t>(c)] = 1;
+    ++roots;
+  }
+  if (roots == 0) {
+    int root = -1;
     for (int c = 0; c < n; ++c) {
       if (classes.find(c) != c) continue;
       if (root < 0 || count[static_cast<std::size_t>(c)] > count[static_cast<std::size_t>(root)]) root = c;
     }
+    isRoot[static_cast<std::size_t>(root)] = 1;
   }
-  for (int l = 0; l < n; ++l) rig.rootLoop[static_cast<std::size_t>(l)] = classes.find(l) == root;
+  const auto rootClass = [&](int c) { return isRoot[static_cast<std::size_t>(classes.find(c))] != 0; };
+  for (int l = 0; l < n; ++l) rig.rootLoop[static_cast<std::size_t>(l)] = rootClass(l);
   for (Index v : visitedList)
-    if (classes.find(owner_[v]) != root) rig.distal.push_back(v);
+    if (!rootClass(owner_[v])) rig.distal.push_back(v);
   for (int c = 0; c < n; ++c)
-    if (classes.find(c) == c && c != root) touchedRigs |= touched[static_cast<std::size_t>(c)];
+    if (classes.find(c) == c && !isRoot[static_cast<std::size_t>(c)]) touchedRigs |= touched[static_cast<std::size_t>(c)];
   return true;
+}
+
+void PoseBuilder::reachDistal(RigWork& rig, int index) {
+  // Only what the region reaches through vertices that may move turns with it: a part beyond a
+  // locked border or the mask stays, and the border becomes a joint.
+  if (rig.distal.empty()) return;
+  const OpMask members = rig.cluster.members;
+  const std::uint32_t candidate = nextStamp();
+  for (Index v : rig.distal) stamp_[v] = candidate;
+  const std::uint32_t reached = nextStamp();
+  std::vector<Index> out;
+  const auto reach = [&](Index v) {
+    if (stamp_[v] != candidate || !movable(v, members)) return;
+    stamp_[v] = reached;
+    out.push_back(v);
+  };
+  for (std::size_t c = 0; c < rig.crossings.size(); ++c)
+    if (!rig.rootLoop[static_cast<std::size_t>(rig.loopOf[c])]) reach(rig.crossings[c].v);
+  for (std::size_t i = 0; i < out.size(); ++i) {
+    const Index v = out[i];
+    const Vec3 p = m_.positions[v];
+    forEachNeighbour(m_, fans_, v, [&](Index w) {
+      reach(w);
+      if (stamp_[w] != reached && rigOf_[w] != index && live(w) && !movable(w, members))
+        rig.anchors.emplace_back(v, glm::length(m_.positions[w] - p));
+    });
+  }
+  std::sort(out.begin(), out.end());
+  rig.distal = std::move(out);
 }
 
 Vec3 PoseBuilder::pivotOf(const RigWork& rig, bool& loose) {
@@ -739,52 +806,75 @@ Vec3 PoseBuilder::pivotOf(const RigWork& rig, bool& loose) {
   return pivot;
 }
 
-void PoseBuilder::weigh(const RigWork& rig, PoseRig& out) {
-  // The moving side: the region and the parts beyond its other loops.
+void PoseBuilder::band(const RigWork& rig, int index, std::vector<BandEntry>& entries) {
+  // Distance to the joints, up to half the band, on the side that turns (the region and the parts
+  // beyond its other loops) and the side that stays, each grown separately. A joint is where the
+  // turning side meets a vertex that does not turn with it: across the root loop the band reaches
+  // half a width into each side; where the far side may not move (a locked border, the mask, a
+  // vertex another rig moves) the whole width lies on the turning side, so nothing tears there.
+  entries.clear();
+  const float width = std::clamp(options_.softness, 0.0f, 1.0f) * radius_;
+  const float half = 0.5f * width;
+  if (!(width > 0.0f) || rig.crossings.empty()) return;
   const std::uint32_t side = nextStamp();
   for (Index v : rig.region) stamp_[v] = side;
   for (Index v : rig.distal) stamp_[v] = side;
   const auto moving = [&](Index v) { return stamp_[v] == side; };
-  // Distance to the root loop on both sides, up to half the band.
-  const float band = std::clamp(options_.softness, 0.0f, 1.0f) * radius_;
-  const float half = 0.5f * band;
+  const auto other = [&](Index v) { return moverOf_[v] >= 0 && moverOf_[v] != index; };
   const std::uint32_t bs = next(bandStamp_, bandStampValue_);
   const auto inBand = [&](Index v) { return bandStamp_[v] == bs; };
   bandList_.clear();
-  if (!out.loose && band > 0.0f) {
-    VertexHeap queue(bandPos_);
-    // Vertices that may not move hold the band back: a joint along a locked border or the mask
-    // does not bend the far side.
-    const auto offer = [&](Index v, float d) {
-      if (!(d < half)) return;
-      if (inBand(v)) {
-        if (!(d < dist_[v])) return;
-      } else {
-        if (claimed_[v] || !movable(v, rig.cluster.members)) return;
-        bandStamp_[v] = bs;
-        bandPos_[v] = -1;
-        bandList_.push_back(v);
-      }
-      dist_[v] = d;
-      queue.lower(v, d, 0);
-    };
-    for (std::size_t c = 0; c < rig.crossings.size(); ++c) {
-      if (!rig.rootLoop[static_cast<std::size_t>(rig.loopOf[c])]) continue;
-      const Crossing& x = rig.crossings[c];
+  VertexHeap queue(bandPos_);
+  // Vertices that may not move hold the band back, and it never takes another rig's part.
+  const auto offer = [&](Index v, float d) {
+    if (!(d < half)) return;
+    if (inBand(v)) {
+      if (!(d < dist_[v])) return;
+    } else {
+      if (!movable(v, rig.cluster.members) || other(v)) return;
+      bandStamp_[v] = bs;
+      bandPos_[v] = -1;
+      bandList_.push_back(v);
+    }
+    dist_[v] = d;
+    queue.lower(v, d, 0);
+  };
+  for (const Crossing& x : rig.crossings) {
+    if (moving(x.v)) continue;  // A part that turns rigidly with the region: no joint.
+    if (movable(x.v, rig.cluster.members) && !other(x.v)) {
       offer(x.u, x.t * x.len);
       offer(x.v, (1.0f - x.t) * x.len);
-    }
-    while (!queue.empty()) {
-      const auto [d, tie, v] = queue.top();
-      queue.pop();
-      const bool vSide = moving(v);
-      const Vec3 p = m_.positions[v];
-      forEachFaceCorner(m_, fans_, v, [&](Index w) {
-        if (moving(w) != vSide) return;  // The band grows on each side separately.
-        offer(w, d + glm::length(m_.positions[w] - p));
-      });
+    } else {
+      offer(x.u, x.len - half);
     }
   }
+  for (const auto& [v, d] : rig.anchors) offer(v, d - half);
+  while (!queue.empty()) {
+    const auto [d, tie, v] = queue.top();
+    queue.pop();
+    const bool vSide = moving(v);
+    const Vec3 p = m_.positions[v];
+    forEachFaceCorner(m_, fans_, v, [&](Index w) {
+      if (moving(w) != vSide) return;
+      offer(w, d + glm::length(m_.positions[w] - p));
+    });
+  }
+  entries.reserve(bandList_.size());
+  for (Index v : bandList_) entries.push_back({v, dist_[v], moving(v)});
+}
+
+void PoseBuilder::weigh(const RigWork& rig, int index, const std::vector<BandEntry>& entries, PoseRig& out) {
+  // Weights fall from 1 to 0 across the band, centred on the root loop and all on the turning side
+  // of a joint whose far side stays; the side that stays takes the vertices of its band whose
+  // nearest joint is this rig's.
+  const float width = std::clamp(options_.softness, 0.0f, 1.0f) * radius_;
+  const float half = 0.5f * width;
+  const std::uint32_t bs = next(bandStamp_, bandStampValue_);
+  for (const BandEntry& e : entries) {
+    bandStamp_[e.v] = bs;
+    dist_[e.v] = e.d;
+  }
+  const auto inBand = [&](Index v) { return bandStamp_[v] == bs; };
   const std::uint32_t ws = next(weightStamp_, weightStampValue_);
   std::vector<Index> picked;
   const auto add = [&](Index v, float w) {
@@ -800,13 +890,13 @@ void PoseBuilder::weigh(const RigWork& rig, PoseRig& out) {
     }
   };
   const auto movingWeight = [&](Index v) {
-    if (band <= 0.0f || out.loose || !inBand(v)) return 1.0f;
-    return smoothStep((dist_[v] + half) / band);
+    if (!(width > 0.0f) || out.loose || !inBand(v)) return 1.0f;
+    return smoothStep((dist_[v] + half) / width);
   };
   for (Index v : rig.region) add(v, movingWeight(v));
   for (Index v : rig.distal) add(v, movingWeight(v));
-  for (Index v : bandList_)
-    if (!moving(v)) add(v, smoothStep((half - dist_[v]) / band));
+  for (const BandEntry& e : entries)
+    if (!e.moving && bandOwner_[e.v] == index) add(e.v, smoothStep((half - e.d) / width));
   // Ascending: a scan of the stamps when the rig holds much of the mesh, else a sort.
   const Index nv = m_.vertexCount();
   if (picked.size() > static_cast<std::size_t>(nv) / 8) {
@@ -942,6 +1032,8 @@ PoseBuild PoseBuilder::run() {
   stamp_.assign(nv, 0);
   owner_.assign(nv, -1);
   claimed_.assign(nv, 0);
+  moverOf_.assign(nv, -1);
+  bandOwner_.resize(nv);
   onCut_.assign(nv, 0);
   bandStamp_.assign(nv, 0);
   weightStamp_.assign(nv, 0);
@@ -1012,6 +1104,7 @@ PoseBuild PoseBuilder::run() {
         out_.buildMs = timer_.ms();
         return std::move(out_);
       }
+      reachDistal(rig, i);
       for (int j = 0; j < n; ++j)
         if (j != i && (touched >> j & 1))
           grow |= OpMask{1} << group_.mul(group_.inverse(rig.cluster.op), rigs[static_cast<std::size_t>(j)].cluster.op);
@@ -1020,18 +1113,42 @@ PoseBuild PoseBuilder::run() {
     subgroup = group_.closure(subgroup | grow);
   }
 
+  std::vector<PoseRig> built(rigs.size());
   for (std::size_t i = 0; i < rigs.size(); ++i) {
     const RigWork& work = rigs[i];
     if (work.region.empty()) continue;
-    PoseRig rig;
+    PoseRig& rig = built[i];
     rig.cluster = work.cluster;
     rig.pivot = pivotOf(work, rig.loose);
-    if (out_.rigs.empty() && glm::length(click_ - rig.pivot) < 0.1f * radius_) {
+    // A loose part turns about its centroid, wherever the press is.
+    if (i == 0 && !rig.loose && glm::length(click_ - rig.pivot) < 0.1f * radius_) {
       out_.failure = PoseFailure::NoJoint;
       out_.buildMs = timer_.ms();
       return std::move(out_);
     }
-    weigh(work, rig);
+  }
+  // Which rig moves each vertex, the first one when parts overlap; then every rig's band, which
+  // stops at the others' parts.
+  for (std::size_t i = 0; i < rigs.size(); ++i)
+    for (const std::vector<Index>* part : {&rigs[i].region, &rigs[i].distal})
+      for (Index v : *part)
+        if (moverOf_[v] < 0) moverOf_[v] = static_cast<std::int16_t>(i);
+  std::vector<std::vector<BandEntry>> bands(rigs.size());
+  for (std::size_t i = 0; i < rigs.size(); ++i)
+    if (!rigs[i].region.empty() && !built[i].loose) band(rigs[i], static_cast<int>(i), bands[i]);
+  // A vertex in the bands of several rigs on the side that stays goes to the nearest joint.
+  const std::uint32_t nearest = next(weightStamp_, weightStampValue_);
+  for (std::size_t i = 0; i < rigs.size(); ++i)
+    for (const BandEntry& e : bands[i]) {
+      if (e.moving || (weightStamp_[e.v] == nearest && !(e.d < weight_[e.v]))) continue;
+      weightStamp_[e.v] = nearest;
+      weight_[e.v] = e.d;
+      bandOwner_[e.v] = static_cast<std::int16_t>(i);
+    }
+  for (std::size_t i = 0; i < rigs.size(); ++i) {
+    if (rigs[i].region.empty()) continue;
+    PoseRig& rig = built[i];
+    weigh(rigs[i], static_cast<int>(i), bands[i], rig);
     if (!rig.verts.empty() || out_.rigs.empty()) out_.rigs.push_back(std::move(rig));
   }
   finish();
@@ -1091,6 +1208,10 @@ void applyPoseRig(Mesh& mesh, const PoseRig& rig, const Vec3& rotation) {
       mesh.positions[rig.verts[i]] = o + (w == 1.0f ? R * x : rodrigues(x, axis, angle * w));
     }
   });
+  for (const auto& [slot, pin] : rig.pins) {
+    Vec3& p = mesh.positions[rig.verts[slot]];
+    if (std::memcmp(&p, &rig.start[slot], sizeof(Vec3)) != 0) p = snapPinned(pin, rig.start[slot], p);
+  }
   parallelFor(0, rig.rigidSlots.size(), 4096, [&](std::size_t b, std::size_t e) {
     for (std::size_t i = b; i < e; ++i) {
       const std::uint32_t slot = rig.rigidSlots[i];

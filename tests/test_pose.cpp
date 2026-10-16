@@ -118,6 +118,58 @@ std::vector<float> weights(const Mesh& m, const PoseBuild& build) {
 
 const Mat3 kMirrorX{Vec3{-1, 0, 0}, Vec3{0, 1, 0}, Vec3{0, 0, 1}};
 
+// A flat mesh of the grid cells (x, y), x < w and y < h, for which inside(x, y) holds, each a
+// quad `cell` wide.
+template <class Fn>
+Mesh gridShape(int w, int h, float cell, Fn&& inside) {
+  std::vector<Index> id(static_cast<std::size_t>((w + 1) * (h + 1)), kInvalid);
+  std::vector<Vec3> p;
+  std::vector<Index> idx, sizes;
+  const auto vert = [&](int x, int y) {
+    Index& i = id[static_cast<std::size_t>(y * (w + 1) + x)];
+    if (i == kInvalid) {
+      i = static_cast<Index>(p.size());
+      p.push_back({static_cast<float>(x) * cell, static_cast<float>(y) * cell, 0.0f});
+    }
+    return i;
+  };
+  for (int y = 0; y < h; ++y)
+    for (int x = 0; x < w; ++x) {
+      if (!inside(x, y)) continue;
+      idx.insert(idx.end(), {vert(x, y), vert(x + 1, y), vert(x + 1, y + 1), vert(x, y + 1)});
+      sizes.push_back(4);
+    }
+  Mesh m = buildMesh(std::move(p), idx, sizes);
+  m.computeNormals();
+  return m;
+}
+
+// The tube of test::makeTube laid along X and centred on the origin, so X mirrors it onto itself.
+Mesh tubeAlongX(int segments, int rings, float radius, float length) {
+  Mesh m = test::makeTube(segments, rings, radius, length);
+  for (Vec3& p : m.positions) p = {p.y - 0.5f * length, -p.x, p.z};
+  m.computeNormals();
+  return m;
+}
+
+// The largest change in displacement along any edge, over the largest displacement.
+float tearRatio(const Mesh& before, const Mesh& after) {
+  float most = 0.0f, step = 0.0f;
+  for (Index v = 0; v < before.vertexCount(); ++v)
+    most = std::max(most, glm::length(after.positions[v] - before.positions[v]));
+  for (Index f = 0; f < before.faceCount(); ++f) {
+    std::vector<Index> corners;
+    before.forEachFaceVertex(f, [&](Index v) { corners.push_back(v); });
+    for (std::size_t i = 0; i < corners.size(); ++i) {
+      const Index a = corners[i], b = corners[(i + 1) % corners.size()];
+      const Vec3 da = after.positions[a] - before.positions[a];
+      const Vec3 db = after.positions[b] - before.positions[b];
+      step = std::max(step, glm::length(da - db));
+    }
+  }
+  return most > 0.0f ? step / most : 0.0f;
+}
+
 }  // namespace
 
 TEST_CASE("pose: topology mode bends a tube end about the loop one radius away") {
@@ -606,4 +658,122 @@ TEST_CASE("pose: failures and a reused build") {
     };
     CHECK(run(true) == run(false));
   }
+}
+
+TEST_CASE("pose: the root is the largest part even when a smaller one reaches deeper") {
+  // A wide block (441 vertices, about 30 rings deep from the neck) and a long thin strip (213
+  // vertices, 70 rings) on either side of the press: the block stays and the strip turns.
+  Scene scene;
+  const float cell = 0.02f;
+  SceneObject& obj = scene.add("G", gridShape(100, 20, cell, [](int x, int y) {
+    return (x < 20) || (x < 30 && y >= 8 && y < 12) || (y >= 9 && y < 11);
+  }));
+  const auto fans = findNonManifoldFans(obj.mesh);
+  const SymmetryGroup group{SymmetrySpec{}};
+  const Vec3 click{25.0f * cell, 10.0f * cell, 0.0f};
+  const PoseBuild build = buildPose(obj.mesh, obj.bvh, fans, group, {}, click, 6.0f * cell, {});
+  REQUIRE(build.failure == PoseFailure::None);
+  REQUIRE(build.rigs.size() == 1);
+  CHECK(build.rigs[0].pivot.x < 21.0f * cell);  // The joint at the block, not the strip.
+  const std::vector<float> w = weights(obj.mesh, build);
+  for (Index v = 0; v < obj.mesh.vertexCount(); ++v) {
+    const float x = obj.mesh.positions[v].x / cell;
+    if (x < 15.0f) REQUIRE(w[v] == 0.0f);
+    if (x > 35.0f) REQUIRE(w[v] == 1.0f);
+  }
+}
+
+TEST_CASE("pose: a part the visit cap cuts off stays rather than turning half of it") {
+  // Both loops lead to parts larger than the cap: both stay, and only the region bends.
+  Scene scene;
+  SceneObject& obj = scene.add("T", test::makeTube(16, 40, 0.1f, 2.0f));
+  const auto fans = findNonManifoldFans(obj.mesh);
+  const SymmetryGroup group{SymmetrySpec{}};
+  const Vec3 click = hitFrom(obj, {1.0f, 1.0f, 0.0f}, {-1, 0, 0});
+  PoseLimits capped;
+  capped.raceVisitCap = 150;  // About half of either part.
+  const float radius = 0.45f;
+  const PoseBuild build = buildPose(obj.mesh, obj.bvh, fans, group, {}, click, radius, {}, capped);
+  REQUIRE(build.failure == PoseFailure::None);
+  REQUIRE(build.visited <= 150);
+  const std::vector<float> w = weights(obj.mesh, build);
+  int moving = 0;
+  for (Index v = 0; v < obj.mesh.vertexCount(); ++v) {
+    if (std::abs(obj.mesh.positions[v].y - 1.0f) > radius + 0.5f * 0.25f * radius + 0.01f) REQUIRE(w[v] == 0.0f);
+    moving += w[v] > 0.0f;
+  }
+  CHECK(moving > 100);
+}
+
+TEST_CASE("pose: a locked face set border on the far loop is a joint, not a tear") {
+  Scene scene;
+  Mesh mesh = test::makeTube(16, 40, 0.1f, 2.0f);
+  mesh.ensureFaceSets();
+  for (Index f = 0; f < mesh.faceCount(); ++f) mesh.faceSets[f] = mesh.faceCentroid(f).y > 1.5f ? 3 : 2;
+  SceneObject& obj = scene.add("T", std::move(mesh));
+  const Mesh before = obj.mesh;
+  StrokeOptions o = withSymmetry();
+  o.lockFaceSetBoundaries = true;
+  PoseOptions pose;
+  pose.softness = 1.0f;
+  const Vec3 click = hitFrom(obj, {1.0f, 1.15f, 0.0f}, {-1, 0, 0});
+  Sculptor s;
+  REQUIRE(s.beginPose(obj, o, pose, click, 0.45f, "Pose"));
+  const Vec3 pivot = s.poseBuild()->rigs[0].pivot;
+  CHECK(pivot.y < 1.0f);  // The bottom loop is the root.
+  s.pose(targetFor(click, pivot, {0, 0, 1}, 0.5f), {0, 0, 1});
+  REQUIRE(s.endStroke());
+  float most = 0.0f;
+  for (Index v = 0; v < before.vertexCount(); ++v) {
+    const Vec3 p = before.positions[v];
+    const float moved = glm::length(obj.mesh.positions[v] - p);
+    most = std::max(most, moved);
+    if (p.y > 1.49f) REQUIRE(moved == 0.0f);  // The border and the tip beyond it stay.
+  }
+  CHECK(most > 0.05f);
+  CHECK(tearRatio(before, obj.mesh) < 0.35f);
+}
+
+TEST_CASE("pose: mirrored rigs close to the plane keep their bands to themselves") {
+  // Each rig's root band reaches past the plane; it stops at the other rig's region, the gap
+  // goes to the nearer joint, and the plane stays the plane.
+  Scene scene;
+  SceneObject& obj = scene.add("T", tubeAlongX(16, 40, 0.1f, 2.0f));
+  const Mesh before = obj.mesh;
+  const std::vector<Index> image = imageMap(before, kMirrorX);
+  PoseOptions pose;
+  pose.softness = 1.0f;
+  const Vec3 click = hitFrom(obj, {0.6f, 1.0f, 0.0f}, {0, -1, 0});
+  Sculptor s;
+  REQUIRE(s.beginPose(obj, withSymmetry({true, false, false}), pose, click, 0.5f, "Pose"));
+  const PoseBuild& build = *s.poseBuild();
+  REQUIRE(build.rigs.size() == 2);
+  const std::vector<float> w = weights(obj.mesh, build);
+  for (Index v = 0; v < before.vertexCount(); ++v) {
+    if (image[v] == kInvalid || before.positions[v].x == 0.0f) continue;
+    INFO("vertex at x " << before.positions[v].x);
+    REQUIRE(std::abs(w[v] - w[image[v]]) < 1e-4f);
+  }
+  const Vec3 pivot = build.rigs[0].pivot;
+  s.pose(targetFor(click, pivot, {0, 0, 1}, 0.4f), {0, 0, 1});
+  REQUIRE(s.endStroke());
+  requireMirrored(obj.mesh, image, kMirrorX, 1e-4f);
+  for (Index v = 0; v < before.vertexCount(); ++v)
+    if (before.positions[v].x == 0.0f) REQUIRE(obj.mesh.positions[v].x == 0.0f);
+}
+
+TEST_CASE("pose: a loose part much smaller than the brush still turns") {
+  Mesh small = makeQuadSphere(12);
+  for (Vec3& p : small.positions) p *= 0.04f;
+  small.computeNormals();
+  Scene scene;
+  SceneObject& obj = scene.add("S", combine(small, makeQuadSphere(12), {3.0f, 0.0f, 0.0f}));
+  const Mesh before = obj.mesh;
+  const Vec3 click = hitFrom(obj, {0.0f, 1.0f, 0.0f}, {0, -1, 0});
+  Sculptor s;
+  REQUIRE(s.beginPose(obj, withSymmetry(), {}, click, 1.0f, "Pose"));
+  CHECK(s.poseBuild()->rigs[0].loose);
+  s.pose(targetFor(click, s.poseBuild()->rigs[0].pivot, {0, 0, 1}, 1.0f), {0, 0, 1});
+  REQUIRE(s.endStroke());
+  CHECK(glm::length(obj.mesh.positions[0] - before.positions[0]) > 0.01f);
 }
