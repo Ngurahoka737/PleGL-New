@@ -80,7 +80,7 @@ cmake --build --preset engine-only
 | Radius brush | [ dan ], atau tahan F lalu geser mouse ke samping |
 | Dynamic topology on/off | Ctrl + D (di Sculpt mode) |
 | Ukuran detail dynamic topology | Tahan R lalu geser mouse ke samping (di Sculpt mode) |
-| Simetri X on/off | X (di Sculpt mode) |
+| Simetri X / Y / Z on/off | X / Y / Z (di Sculpt mode; simetri radial diatur di panel Symmetry) |
 | Remesh objek terpilih | Ctrl + R (menghapus level subdivisi dan memanggang layer; undo mengembalikannya) |
 | Layer sculpt baru (stroke masuk ke layer aktif) | Ctrl + L |
 | Tampilkan / sembunyikan layer aktif | L (di Sculpt mode) |

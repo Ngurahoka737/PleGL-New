@@ -219,6 +219,7 @@ void App::drawUi() {
       ImGui::TextUnformatted("L                   Show / hide the active sculpt layer");
       ImGui::TextUnformatted("E                   Erase Layer brush");
       ImGui::TextUnformatted("F / R + move        Brush radius / detail size");
+      ImGui::TextUnformatted("X / Y / Z           Mirror X / Y / Z on or off");
       ImGui::EndMenu();
     }
     ImGui::EndMainMenuBar();
@@ -313,7 +314,50 @@ void App::drawUi() {
       if (ImGui::Combo("##pressure", &pm, kPressure, 4)) sculpt.pressure = static_cast<PressureMap>(pm);
 
       sectionHeader("Symmetry");
-      ImGui::Checkbox("Mirror X (X)", &sculpt.symmetryX);
+      {
+        bool mirror[3] = {sculpt.symmetryX, sculpt.symmetryY, sculpt.symmetryZ};
+        static const char* kMirror[3] = {"X##mirror", "Y##mirror", "Z##mirror"};
+        static const char* kKey[3] = {"Mirror across the object's local X = 0 plane (key X)",
+                                      "Mirror across the object's local Y = 0 plane (key Y)",
+                                      "Mirror across the object's local Z = 0 plane (key Z)"};
+        for (int a = 0; a < 3; ++a) {
+          if (a > 0) ImGui::SameLine();
+          if (ImGui::Checkbox(kMirror[a], &mirror[a])) toggleMirror(static_cast<Axis>(a));
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", kKey[a]);
+        }
+        const SymmetrySpec spec = sculpt.symmetry();
+        int radial = sculpt.radialCount;
+        const float comboW = ImGui::CalcTextSize("around Y").x + ImGui::GetFrameHeight() * 1.6f;
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - comboW - ImGui::GetStyle().ItemSpacing.x);
+        if (ImGui::SliderInt("##radial", &radial, 1, maxRadialCount(spec), radial <= 1 ? "radial off" : "radial %d",
+                             ImGuiSliderFlags_AlwaysClamp))
+          setRadialCount(radial);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Copies around an axis through the object's origin");
+        ImGui::SameLine();
+        static const char* kAround[] = {"around X", "around Y", "around Z"};
+        int axis = static_cast<int>(sculpt.radialAxis);
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::Combo("##radialAxis", &axis, kAround, 3)) {
+          sculpt.radialAxis = static_cast<Axis>(axis);
+          sculpt.radialCount = sculpt.symmetry().radialCount;
+        }
+        const int copies = copyCount(spec);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::Text(copies == 1 ? "1 copy (off)" : "%d copies", copies);
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        ImGui::Checkbox("Show planes", &view.symmetryPlanes);
+        if (copies > kManySymmetryCopies) {
+          ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.8f, 0.4f, 1.0f));
+          ImGui::TextWrapped("Many copies: strokes may lag.");
+          ImGui::PopStyleColor();
+        }
+        if (sculpt.dyntopo && copies > kMaxDyntopoCopies) {
+          ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.8f, 0.4f, 1.0f));
+          ImGui::TextWrapped("Dynamic topology is off above %d copies.", kMaxDyntopoCopies);
+          ImGui::PopStyleColor();
+        }
+      }
 
       sectionHeader("Dynamic topology");
       ImGui::Checkbox("Enabled (Ctrl+D)", &sculpt.dyntopo);

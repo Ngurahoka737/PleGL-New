@@ -25,6 +25,7 @@ struct ViewSettings {
   float maskOpacity = 0.7f;  // How dark fully masked areas are drawn.
   bool showFaceSets = true;
   float faceSetOpacity = 0.6f;  // How strongly face set colours tint the surface.
+  bool symmetryPlanes = false;  // Outline the selected object's symmetry planes in Sculpt mode.
 };
 
 struct ViewportRect {
@@ -36,6 +37,19 @@ struct CursorMarker {
   Vec3 position{0.0f};
   Vec3 normal{0.0f, 1.0f, 0.0f};
   float radius = 0.05f;
+  float alpha = 0.9f;  // Symmetric copies are drawn fainter.
+};
+
+// Sculpt mode guides drawn over the scene: the selected object's mirror planes (outlines at its
+// local bounds) and radial axis.
+struct SculptOverlay {
+  bool planes = false;
+  Mat4 model{1.0f};
+  Vec3 boundsMin{0.0f}, boundsMax{0.0f};
+  std::uint8_t mirrorBits = 0;  // Bit a: the plane local p_a = 0.
+  int radialAxis = -1;          // -1: no radial symmetry.
+  std::vector<Vec3> points;     // Extra world-space line segments (pairs), for brush guides.
+  Vec4 pointColor{1.0f, 0.8f, 0.3f, 0.9f};
 };
 
 struct RenderStats {
@@ -63,8 +77,10 @@ class Renderer {
   // rebuilt when it is turned on.
   void sync(Scene& scene, bool wireframe);
 
+  // At most kMaxCursors cursor rings are drawn.
+  static constexpr int kMaxCursors = 64;
   void render(const Scene& scene, const Camera& camera, const ViewportRect& rect, const ViewSettings& settings,
-              std::uint32_t selectedId, const CursorMarker& cursor);
+              std::uint32_t selectedId, std::span<const CursorMarker> cursors, const SculptOverlay& overlay);
 
   const RenderStats& stats() const { return stats_; }
 
@@ -120,6 +136,7 @@ class Renderer {
   GLuint gridVao_ = 0, gridVbo_ = 0;
   GLsizei gridVertexCount_ = 0;
   GLuint cursorVao_ = 0, cursorVbo_ = 0;
+  GLuint overlayVao_ = 0, overlayVbo_ = 0;
   std::unordered_map<std::uint32_t, GpuMesh> meshes_;
   std::vector<std::uint32_t> scratch_;
   std::vector<std::int32_t> faceSetScratch_;

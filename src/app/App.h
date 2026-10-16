@@ -54,6 +54,8 @@ struct PrimitiveSettings {
 // settings keys, so they have no spaces; labels are what the panel shows.
 enum class BrushKind { Draw, Clay, Smooth, Grab, Inflate, Flatten, Crease, Mask, FaceSet, EraseLayer };
 inline constexpr int kBrushCount = 10;
+// Brush work per frame before the rest of a stroke's samples wait for the next frame.
+inline constexpr double kStrokeTickBudgetMs = 10.0;
 // Each table has one entry per brush; the asserts catch a short initialiser list, which would
 // otherwise fill the rest with empty entries.
 inline constexpr std::array<const char*, kBrushCount> kBrushNames = {
@@ -79,6 +81,10 @@ struct SculptSettings {
   bool invert = false;         // Brushes subtract instead of add (Ctrl flips it per stroke).
   PressureMap pressure = PressureMap::Strength;
   bool symmetryX = true;       // PRD default for character sculpting.
+  bool symmetryY = false;
+  bool symmetryZ = false;
+  Axis radialAxis = Axis::Y;   // Radial symmetry: radialCount copies around this local axis.
+  int radialCount = 1;         // 1 = off.
   float spacing = 0.1f;        // Dab spacing as a fraction of the radius.
   int maskFilterSteps = 2;     // Iterations per Blur Mask / Sharpen Mask.
   // Face set auto-masking for every brush: only the set under the stroke's start changes, and
@@ -94,6 +100,8 @@ struct SculptSettings {
   DetailMode detailMode = DetailMode::Relative;
   float detailPx = 8.0f;      // Relative: target edge length in screen pixels (hold R to change).
   float detailSize = 0.02f;   // Constant: target edge length in object units.
+
+  SymmetrySpec symmetry() const { return sanitized({symmetryX, symmetryY, symmetryZ, radialAxis, radialCount}); }
 };
 
 struct RemeshSettings {
@@ -119,6 +127,8 @@ struct FrameStats {
   int dabsLastFrame = 0;
   double maskOpMs = 0.0;        // Last whole-mesh mask or face set operation (invert, blur, hide...).
   double topologyMs = 0.0;      // Dynamic topology part of the last dab.
+  int dabCopies = 1;            // Symmetric copies the last dab ran (after merging).
+  int queuedSamples = 0;        // Stroke samples waiting for the next frame.
 };
 
 class App {
@@ -233,6 +243,11 @@ class App {
   // Detail size the next dab would use at a surface point, in object units (dynamic topology).
   float detailSizeAt(const SceneObject& obj, const Vec3& worldPoint) const;
   const std::optional<ScenePick>& hover() const { return hover_; }
+  // Symmetry toggles (X, Y, Z keys and the panel): flips a mirror, lowers the radial count if the
+  // copies would pass kMaxSymmetryCopies, and says what is on in the status line.
+  void toggleMirror(Axis axis);
+  void setRadialCount(int count);
+  std::string symmetryText() const;
 
  private:
   void handleEvent(const SDL_Event& e);
@@ -251,7 +266,14 @@ class App {
   void beginStroke(float x, float y, std::uint64_t timestampNs);
   void continueStroke(float x, float y, std::uint64_t timestampNs);
   void endStroke();
-  void applySamples(std::uint64_t timestampNs);
+  // Per frame: applies queued dab samples for up to kStrokeTickBudgetMs (always at least one), or
+  // the latest Grab position. Samples are never dropped; endStroke flushes them.
+  void tickStroke(bool flush = false);
+  void applySample(const StrokeSample& sample, const Ray& world);
+  void noteInput(std::uint64_t timestampNs);
+  // Cursor rings for every symmetric copy of the brush, and the planes and axis overlay.
+  void symmetryCursors(const CursorMarker& primary, std::vector<CursorMarker>& out) const;
+  SculptOverlay sculptOverlay() const;
   float currentPressure() const;
   void exportFile(const std::filesystem::path& path);
   void drawProjectDialogs();
@@ -347,6 +369,16 @@ class App {
   EraseLayerBrush eraseLayerBrush_;
   StrokeSampler sampler_;
   std::vector<StrokeSample> samples_;
+  struct PendingSample {
+    StrokeSample sample;
+    Ray world;                     // Taken when the sample came in, so a zoom mid-stroke does not move it.
+    std::uint64_t timestampNs = 0;
+  };
+  std::deque<PendingSample> pendingSamples_;
+  std::optional<Vec3> pendingGrab_;  // Latest Grab offset (local) not yet applied.
+  std::uint64_t pendingGrabNs_ = 0;
+  std::vector<CursorMarker> cursors_;
+  mutable SymmetryGroup cursorGroup_;  // The panel's symmetry, for cursor copies and the overlay.
   // Brush of the running stroke. Shift turns it into Smooth, except for Mask, which stays Mask and
   // smooths the mask instead.
   BrushKind strokeBrush_ = BrushKind::Draw;

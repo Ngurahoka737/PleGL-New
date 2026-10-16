@@ -155,6 +155,7 @@ void App::run() {
       ImGui_ImplSDL3_ProcessEvent(&e);
       handleEvent(e);
     }
+    tickStroke();
     processAsyncResults();
     autosaveTick();
     updateWindowTitle();
@@ -193,7 +194,8 @@ void App::run() {
       const float px = mode == Mode::Sculpt ? sculpt.radiusPx : 14.0f;
       cursor.radius = camera.worldPerPixel(cursor.position) * px;
     }
-    renderer_.render(scene, camera, rect, view, selectedId, cursor);
+    symmetryCursors(cursor, cursors_);
+    renderer_.render(scene, camera, rect, view, selectedId, cursors_, sculptOverlay());
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
     SDL_GL_SwapWindow(window_);
     if (oldestInputThisFrameNs_ != 0) {
@@ -421,7 +423,9 @@ void App::handleShortcut(const SDL_KeyboardEvent& key) {
       case SDLK_R: adjustingDetail_ = true; break;  // The same for the dynamic topology detail.
       case SDLK_LEFTBRACKET: sculpt.radiusPx = std::max(2.0f, sculpt.radiusPx / 1.15f); break;
       case SDLK_RIGHTBRACKET: sculpt.radiusPx = std::min(1000.0f, sculpt.radiusPx * 1.15f); break;
-      case SDLK_X: sculpt.symmetryX = !sculpt.symmetryX; break;
+      case SDLK_X: toggleMirror(Axis::X); break;
+      case SDLK_Y: toggleMirror(Axis::Y); break;
+      case SDLK_Z: toggleMirror(Axis::Z); break;
       default: break;
     }
     return;
@@ -618,7 +622,12 @@ void App::beginStroke(float x, float y, std::uint64_t timestampNs) {
   strokeBrush_ = shift && !masking ? BrushKind::Smooth : sculpt.brush;
   StrokeOptions opts;
   opts.falloff = sculpt.falloff;
-  opts.symmetryX = sculpt.symmetryX;
+  const SymmetrySpec symmetry = sculpt.symmetry();
+  opts.symmetryX = symmetry.x;
+  opts.symmetryY = symmetry.y;
+  opts.symmetryZ = symmetry.z;
+  opts.radialAxis = symmetry.radialAxis;
+  opts.radialCount = symmetry.radialCount;
   opts.strength = sculpt.strength[static_cast<int>(strokeBrush_)];
   // The Mask brush ignores Add/Subtract: it paints, and erases with Ctrl or the pen's eraser end.
   opts.invert = masking ? ctrl || (pen.down && pen.eraser) : sculpt.invert != ctrl;
@@ -655,19 +664,26 @@ void App::beginStroke(float x, float y, std::uint64_t timestampNs) {
     const float radius = camera.worldPerPixel(grabStartWorld_) * px / std::max(scale, 1e-6f);
     if (sculptor_.beginGrab(*obj, opts, Vec3(inv * Vec4(grabStartWorld_, 1.0f)), radius, label)) {
       stats.dabMs = 0.0;
+      pendingGrab_.reset();
       if (timestampNs != 0 && (oldestInputThisFrameNs_ == 0 || timestampNs < oldestInputThisFrameNs_))
         oldestInputThisFrameNs_ = timestampNs;
     }
     return;
   }
   sculptor_.beginStroke(*obj, *brush, opts, label);
+  if (!sculptor_.active()) return;
+  if (sculptor_.topologyOffForCopies())
+    statusMessage = "Dynamic topology is off above " + std::to_string(kMaxDyntopoCopies) + " symmetry copies";
+  pendingSamples_.clear();
   samples_.clear();
   sampler_.begin({x - vpX_, y - vpY_, currentPressure()}, std::max(1.0f, sculpt.radiusPx * sculpt.spacing), samples_);
-  applySamples(timestampNs);
+  for (const StrokeSample& smp : samples_)
+    pendingSamples_.push_back({smp, camera.rayThroughPixel(smp.x, smp.y), timestampNs});
 }
 
 void App::continueStroke(float x, float y, std::uint64_t timestampNs) {
   if (strokeBrush_ == BrushKind::Grab) {
+    // Only the latest position matters; the frame's tick applies it once.
     SceneObject* obj = sculptor_.object();
     const Ray ray = camera.rayThroughPixel(x - vpX_, y - vpY_);
     const float denom = glm::dot(ray.dir, grabPlaneNormal_);
@@ -675,60 +691,91 @@ void App::continueStroke(float x, float y, std::uint64_t timestampNs) {
     const float t = glm::dot(grabStartWorld_ - ray.origin, grabPlaneNormal_) / denom;
     const Vec3 offsetWorld = ray.origin + ray.dir * t - grabStartWorld_;
     const Mat4 inv = glm::inverse(obj->transform.matrix());
-    sculptor_.grab(Vec3(inv * Vec4(offsetWorld, 0.0f)));
-    ++dabsThisFrame_;
-    stats.dabMs = sculptor_.lastDab().totalMs;
-    if (timestampNs != 0) {
-      const double ms = static_cast<double>(SDL_GetTicksNS() - timestampNs) / 1e6;
-      stats.inputToDabMs = stats.inputToDabMs == 0.0 ? ms : stats.inputToDabMs * 0.8 + ms * 0.2;
-      if (oldestInputThisFrameNs_ == 0 || timestampNs < oldestInputThisFrameNs_) oldestInputThisFrameNs_ = timestampNs;
-    }
+    pendingGrab_ = Vec3(inv * Vec4(offsetWorld, 0.0f));
+    if (pendingGrabNs_ == 0) pendingGrabNs_ = timestampNs;
     return;
   }
   samples_.clear();
   sampler_.setSpacing(std::max(1.0f, sculpt.radiusPx * sculpt.spacing));
   sampler_.moveTo({x - vpX_, y - vpY_, currentPressure()}, samples_);
-  applySamples(timestampNs);
+  for (const StrokeSample& smp : samples_)
+    pendingSamples_.push_back({smp, camera.rayThroughPixel(smp.x, smp.y), timestampNs});
 }
 
-void App::applySamples(std::uint64_t timestampNs) {
+void App::noteInput(std::uint64_t timestampNs) {
+  if (timestampNs == 0) return;
+  const double ms = static_cast<double>(SDL_GetTicksNS() - timestampNs) / 1e6;
+  stats.inputToDabMs = stats.inputToDabMs == 0.0 ? ms : stats.inputToDabMs * 0.8 + ms * 0.2;
+  if (oldestInputThisFrameNs_ == 0 || timestampNs < oldestInputThisFrameNs_) oldestInputThisFrameNs_ = timestampNs;
+}
+
+void App::tickStroke(bool flush) {
+  if (!sculptor_.active()) {
+    pendingSamples_.clear();
+    pendingGrab_.reset();
+    pendingGrabNs_ = 0;
+    return;
+  }
+  if (strokeBrush_ == BrushKind::Grab) {
+    if (!pendingGrab_) return;
+    sculptor_.grab(*pendingGrab_);
+    pendingGrab_.reset();
+    ++dabsThisFrame_;
+    stats.dabMs = sculptor_.lastDab().totalMs;
+    noteInput(pendingGrabNs_);
+    pendingGrabNs_ = 0;
+    return;
+  }
+  // Samples in order until the frame's brush budget is spent, at least one per frame; the rest
+  // wait for the next frame, so a heavy brush slows the stroke down instead of the screen.
+  Timer budget;
+  std::uint64_t noted = 0;
+  bool first = true;
+  while (!pendingSamples_.empty() && (flush || first || budget.ms() < kStrokeTickBudgetMs)) {
+    const PendingSample p = pendingSamples_.front();
+    pendingSamples_.pop_front();
+    applySample(p.sample, p.world);
+    if (p.timestampNs != noted) {
+      noteInput(p.timestampNs);
+      noted = p.timestampNs;
+    }
+    first = false;
+  }
+  stats.queuedSamples = static_cast<int>(pendingSamples_.size());
+}
+
+void App::applySample(const StrokeSample& smp, const Ray& world) {
   SceneObject* obj = sculptor_.object();
-  if (!obj || samples_.empty()) return;
+  if (!obj) return;
   const Mat4 model = obj->transform.matrix();
   const Mat4 inv = glm::inverse(model);
   const float scale = (obj->transform.scale.x + obj->transform.scale.y + obj->transform.scale.z) / 3.0f;
   const float baseStrength = sculpt.strength[static_cast<int>(strokeBrush_)];
-  for (const StrokeSample& smp : samples_) {
-    const Ray world = camera.rayThroughPixel(smp.x, smp.y);
-    Ray local{Vec3(inv * Vec4(world.origin, 1.0f)), Vec3(inv * Vec4(world.dir, 0.0f))};
-    RayHit hit;
-    if (!obj->bvh.raycast(obj->mesh, local, hit, std::numeric_limits<float>::infinity(), true)) continue;  // Off the mesh: no dab.
-    const Vec3 worldHit = world.origin + world.dir * hit.t;
-    const float p = smp.pressure;
-    const bool mapRadius = sculpt.pressure == PressureMap::Radius || sculpt.pressure == PressureMap::Both;
-    const bool mapStrength = sculpt.pressure == PressureMap::Strength || sculpt.pressure == PressureMap::Both;
-    const float px = sculpt.radiusPx * (mapRadius ? std::max(p, 0.1f) : 1.0f);
-    const float radius = camera.worldPerPixel(worldHit) * px / std::max(scale, 1e-6f);
-    const float strength = baseStrength * (mapStrength ? p : 1.0f);
-    DabTopology topology;
-    if (sculpt.dyntopo) {
-      topology.detail = detailSizeAt(*obj, worldHit);
-      topology.hintFace = hit.face;
-    }
-    if (sculptor_.dab(hit.position, radius, strength, topology)) {
-      ++dabsThisFrame_;
-      stats.dabMs = sculptor_.lastDab().totalMs;
-      stats.topologyMs = sculptor_.lastDab().topologyMs;
-    }
+  const Ray local{Vec3(inv * Vec4(world.origin, 1.0f)), Vec3(inv * Vec4(world.dir, 0.0f))};
+  RayHit hit;
+  if (!obj->bvh.raycast(obj->mesh, local, hit, std::numeric_limits<float>::infinity(), true)) return;  // Off the mesh: no dab.
+  const Vec3 worldHit = world.origin + world.dir * hit.t;
+  const float p = smp.pressure;
+  const bool mapRadius = sculpt.pressure == PressureMap::Radius || sculpt.pressure == PressureMap::Both;
+  const bool mapStrength = sculpt.pressure == PressureMap::Strength || sculpt.pressure == PressureMap::Both;
+  const float px = sculpt.radiusPx * (mapRadius ? std::max(p, 0.1f) : 1.0f);
+  const float radius = camera.worldPerPixel(worldHit) * px / std::max(scale, 1e-6f);
+  const float strength = baseStrength * (mapStrength ? p : 1.0f);
+  DabTopology topology;
+  if (sculpt.dyntopo) {
+    topology.detail = detailSizeAt(*obj, worldHit);
+    topology.hintFace = hit.face;
   }
-  if (timestampNs != 0) {
-    const double ms = static_cast<double>(SDL_GetTicksNS() - timestampNs) / 1e6;
-    stats.inputToDabMs = stats.inputToDabMs == 0.0 ? ms : stats.inputToDabMs * 0.8 + ms * 0.2;
-    if (oldestInputThisFrameNs_ == 0 || timestampNs < oldestInputThisFrameNs_) oldestInputThisFrameNs_ = timestampNs;
+  if (sculptor_.dab(hit.position, radius, strength, topology)) {
+    ++dabsThisFrame_;
+    stats.dabMs = sculptor_.lastDab().totalMs;
+    stats.topologyMs = sculptor_.lastDab().topologyMs;
+    stats.dabCopies = sculptor_.lastDab().clusters;
   }
 }
 
 void App::endStroke() {
+  tickStroke(true);  // Every sample and the last Grab position land before the stroke ends.
   const SceneObject* obj = sculptor_.object();
   const bool levels = obj && obj->multires;
   auto entry = sculptor_.endStroke();
@@ -752,7 +799,84 @@ void App::endStroke() {
       strokeBrush_ != BrushKind::FaceSet)
     statusMessage += " (dynamic topology is off on objects with subdivision levels)";
   if (topo.outOfRoom) statusMessage += " (dynamic topology stopped: stroke too large)";
+  if (topo.tooManyCopies) statusMessage += " (dynamic topology is off above 24 symmetry copies)";
   if (topo.faulted) statusMessage += " (dynamic topology stopped on a damaged area)";
+}
+
+std::string App::symmetryText() const {
+  const SymmetrySpec s = sculpt.symmetry();
+  static const char* kAxis[] = {"X", "Y", "Z"};
+  std::string text;
+  if (s.x) text += "X ";
+  if (s.y) text += "Y ";
+  if (s.z) text += "Z ";
+  if (s.radialCount > 1)
+    text += "radial " + std::to_string(s.radialCount) + " around " + kAxis[static_cast<int>(s.radialAxis)] + " ";
+  if (text.empty()) return "off";
+  return text + "(" + std::to_string(copyCount(s)) + " copies)";
+}
+
+void App::toggleMirror(Axis axis) {
+  bool& on = axis == Axis::X ? sculpt.symmetryX : axis == Axis::Y ? sculpt.symmetryY : sculpt.symmetryZ;
+  on = !on;
+  // A new mirror can double the copies; the radial count gives way.
+  const int before = sculpt.radialCount;
+  sculpt.radialCount = sculpt.symmetry().radialCount;
+  statusMessage = "Symmetry: " + symmetryText();
+  if (sculpt.radialCount != before)
+    statusMessage += ". Radial count lowered to " + std::to_string(sculpt.radialCount) + " to stay within " +
+                     std::to_string(kMaxSymmetryCopies) + " copies";
+}
+
+void App::setRadialCount(int count) {
+  SymmetrySpec s = sculpt.symmetry();
+  s.radialCount = std::clamp(count, 1, maxRadialCount(s));
+  sculpt.radialCount = sanitized(s).radialCount;
+}
+
+void App::symmetryCursors(const CursorMarker& primary, std::vector<CursorMarker>& out) const {
+  out.assign(1, primary);
+  if (mode != Mode::Sculpt || !primary.visible || !hover_) return;
+  const SceneObject* obj = scene.find(hover_->objectId);
+  const SymmetrySpec spec = sculpt.symmetry();
+  if (!obj || copyCount(spec) <= 1) return;
+  if (!(cursorGroup_.spec() == spec)) cursorGroup_ = SymmetryGroup(spec);
+  const Mat4 model = obj->transform.matrix();
+  const Mat3 linear{model};
+  const Mat3 normalMat = glm::transpose(glm::inverse(linear));
+  const float scale = (obj->transform.scale.x + obj->transform.scale.y + obj->transform.scale.z) / 3.0f;
+  const Vec3 p = hover_->localHit.position;
+  const Vec3 n = glm::normalize(glm::transpose(linear) * hover_->worldNormal);
+  const float localRadius = primary.radius / std::max(scale, 1e-6f);
+  CopyClusters clusters;
+  // As a dab would: copies that nearly coincide are one ring on the plane or axis.
+  const int count = clusterCopies(cursorGroup_, p, kCopyMergeFraction * localRadius, clusters);
+  out.clear();
+  for (int i = 0; i < count && i < Renderer::kMaxCursors; ++i) {
+    const CopyCluster& cl = clusters[static_cast<std::size_t>(i)];
+    Vec3 cn = transform(cl.polar, n);
+    if (glm::length(cn) < 0.1f) cn = transform(cursorGroup_.op(cl.op).L, n);
+    CursorMarker c = primary;
+    c.position = Vec3(model * Vec4(cl.center, 1.0f));
+    c.normal = glm::normalize(normalMat * cn);
+    c.alpha = i == 0 ? primary.alpha : 0.5f;
+    out.push_back(c);
+  }
+}
+
+SculptOverlay App::sculptOverlay() const {
+  SculptOverlay o;
+  const SceneObject* obj = scene.find(selectedId);
+  if (mode != Mode::Sculpt || !view.symmetryPlanes || !obj) return o;
+  const SymmetrySpec spec = sculpt.symmetry();
+  if (!(cursorGroup_.spec() == spec)) cursorGroup_ = SymmetryGroup(spec);
+  o.planes = true;
+  o.model = obj->transform.matrix();
+  o.boundsMin = obj->bvh.bounds().min;
+  o.boundsMax = obj->bvh.bounds().max;
+  o.mirrorBits = cursorGroup_.mirrorPlanes();
+  o.radialAxis = spec.radialCount > 1 ? static_cast<int>(spec.radialAxis) : -1;
+  return o;
 }
 
 float App::detailSizeAt(const SceneObject& obj, const Vec3& worldPoint) const {
