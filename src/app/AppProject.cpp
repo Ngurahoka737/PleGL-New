@@ -96,6 +96,7 @@ std::string App::settingsText() const {
   w.put("brush.invert", sculpt.invert);
   w.put("brush.pressure", static_cast<int>(sculpt.pressure));
   w.put("brush.spacing", sculpt.spacing);
+  w.put("snake.pinch", sculpt.snakePinch);
   w.put("symmetry.x", sculpt.symmetryX);
   w.put("symmetry.y", sculpt.symmetryY);
   w.put("symmetry.z", sculpt.symmetryZ);
@@ -156,6 +157,8 @@ void App::applySettings(const std::string& text) {
   r.get("brush.invert", sculpt.invert);
   r.getEnum("brush.pressure", sculpt.pressure, 4);
   r.get("brush.spacing", sculpt.spacing);
+  r.get("snake.pinch", sculpt.snakePinch);
+  sculpt.snakePinch = std::isfinite(sculpt.snakePinch) ? std::clamp(sculpt.snakePinch, 0.0f, 1.0f) : 0.0f;
   r.get("symmetry.x", sculpt.symmetryX);
   r.get("symmetry.y", sculpt.symmetryY);
   r.get("symmetry.z", sculpt.symmetryZ);

@@ -218,6 +218,7 @@ void App::drawUi() {
       ImGui::TextUnformatted("Ctrl + D            Dynamic topology on / off");
       ImGui::TextUnformatted("L                   Show / hide the active sculpt layer");
       ImGui::TextUnformatted("E                   Erase Layer brush");
+      ImGui::TextUnformatted("K                   Snake Hook brush (pulls the surface after the cursor)");
       ImGui::TextUnformatted("F / R + move        Brush radius / detail size");
       ImGui::TextUnformatted("X / Y / Z           Mirror X / Y / Z on or off");
       ImGui::EndMenu();
@@ -248,8 +249,9 @@ void App::drawUi() {
       const float bw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
       const SceneObject* target = scene.find(selectedId);
       const bool onLayer = target && target->mesh.layers.active != 0;
-      for (int i = 0; i < kBrushCount; ++i) {
-        if (i % 2 == 1) ImGui::SameLine();
+      for (int slot = 0; slot < kBrushCount; ++slot) {
+        if (slot % 2 == 1) ImGui::SameLine();
+        const int i = static_cast<int>(kBrushDisplayOrder[static_cast<std::size_t>(slot)]);
         const bool active = static_cast<int>(sculpt.brush) == i;
         // Erase Layer takes detail out of a layer, so it needs one to be the target.
         const bool erase = static_cast<BrushKind>(i) == BrushKind::EraseLayer;
@@ -271,7 +273,9 @@ void App::drawUi() {
       ImGui::SliderFloat("##radius", &sculpt.radiusPx, 2.0f, 1000.0f, "radius %.0f px", ImGuiSliderFlags_Logarithmic);
       float& strength = sculpt.strength[static_cast<int>(sculpt.brush)];
       ImGui::SetNextItemWidth(-1);
-      ImGui::SliderFloat("##strength", &strength, 0.0f, 1.0f, "strength %.2f");
+      // Snake Hook's strength is how tightly the hook follows the cursor.
+      ImGui::SliderFloat("##strength", &strength, 0.0f, 1.0f,
+                         sculpt.brush == BrushKind::SnakeHook ? "follow %.2f" : "strength %.2f");
       if (sculpt.brush == BrushKind::Mask) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
         ImGui::TextWrapped("Masked areas are protected from every brush. Ctrl+drag: erase. Shift+drag: smooth mask.");
@@ -284,6 +288,13 @@ void App::drawUi() {
       } else if (sculpt.brush == BrushKind::EraseLayer) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
         ImGui::TextWrapped("Takes the active layer's detail back out. The base and other layers stay.");
+        ImGui::PopStyleColor();
+      } else if (sculpt.brush == BrushKind::SnakeHook) {
+        ImGui::SetNextItemWidth(-1);
+        ImGui::SliderFloat("##pinch", &sculpt.snakePinch, 0.0f, 1.0f, "pinch %.2f");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Narrows the pulled part as it stretches.");
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextWrapped("Pulls the surface after the cursor. Works best with Dynamic topology (Ctrl+D).");
         ImGui::PopStyleColor();
       } else if (sculpt.brush != BrushKind::Smooth && sculpt.brush != BrushKind::Grab) {
         int inv = sculpt.invert ? 1 : 0;
@@ -302,7 +313,7 @@ void App::drawUi() {
       int f = static_cast<int>(sculpt.falloff);
       ImGui::SetNextItemWidth(-1);
       if (ImGui::Combo("##falloff", &f, kFalloffs, 4)) sculpt.falloff = static_cast<Falloff>(f);
-      if (sculpt.brush != BrushKind::Grab) {
+      if (sculpt.brush != BrushKind::Grab && sculpt.brush != BrushKind::SnakeHook) {
         ImGui::SetNextItemWidth(-1);
         ImGui::SliderFloat("##spacing", &sculpt.spacing, 0.02f, 1.0f, "spacing %.2f");
       }

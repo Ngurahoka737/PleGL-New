@@ -63,6 +63,21 @@ struct DabTiming {
   int pinned = 0;          // Vertices held on a symmetry plane or axis.
 };
 
+// Snake Hook follow gain for one tick: the share of the way to the cursor the hook covers in
+// dtMs, from the brush strength s (1 sticks to the cursor). Ticks of any length compose the same
+// as one long tick, so the feel does not depend on the frame rate. dtMs is clamped to [1, 50].
+float snakeGain(float strength, double dtMs);
+
+// Most sub-dabs one Snake Hook tick runs; the rest of the way waits for the next tick.
+inline constexpr int kMaxSnakeSubDabs = 32;
+
+// What one Snake Hook tick did.
+struct SnakeStep {
+  int subDabs = 0;
+  float remaining = 0.0f;  // Distance from the primary hook to the target after the tick.
+  double ms = 0.0;
+};
+
 // What the last ended stroke did to topology.
 struct StrokeTopologyStats {
   bool dyntopo = false;    // The stroke ran with dynamic topology and changed the mesh.
@@ -125,6 +140,26 @@ class Sculptor {
   // Moves the captured vertices to their start position plus `offset` (local space).
   void grab(const Vec3& offset);
 
+  // Snake Hook stroke: picks a hook vertex near `center` (local space) for every cluster of
+  // symmetric copies, the nearest that may move (on the plane or axis for merged copies when one
+  // lies within the merge distance). Returns false, starting nothing, if none lies within
+  // `radius` of the press, the hook is fully masked, or the layer rules refuse the stroke.
+  bool beginSnake(SceneObject& object, const Brush& snake, const StrokeOptions& options, const Vec3& center,
+                  float radius, float pinch, std::string label);
+  // One tick: with dynamic topology refines around every hook (keeping the hook), then pulls the
+  // primary hook `gain` of the way to `target` (local space) in sub-dabs of at most kSnakeStep *
+  // radius, each centred on the hook vertex, with every copy pulling its mirrored share. Steers
+  // the pull so a hook that copies or the mask hold back still reaches the target. Stops after
+  // kMaxSnakeSubDabs sub-dabs or once budgetMs (negative: none) has passed after a sub-dab; the
+  // next tick picks up the rest from the hook's real position.
+  SnakeStep snakeTo(const Vec3& target, float radius, float gain, const DabTopology& topology = {},
+                    double budgetMs = -1.0);
+  // The running Snake Hook stroke's hook vertex for cluster k (cluster 0 is under the cursor),
+  // or kInvalid.
+  Index snakeHook(int k = 0) const {
+    return snakeStroke_ && k >= 0 && k < snakeClusterCount_ ? snakeHooks_[static_cast<std::size_t>(k)] : kInvalid;
+  }
+
   // Ends the stroke. Returns the undo entry, or nothing if the stroke changed nothing. Mask and
   // face set strokes keep only the leaves whose values actually changed. A dynamic topology
   // stroke is compacted here and returns a DyntopoUndo.
@@ -165,6 +200,10 @@ class Sculptor {
   void resolveFaceSets(const Vec3& center, float radius);
   FaceSetFilter filter(int op) const;
   void applyTopology(const Dab& dab, const DabTopology& topology);
+  double topologyBudget(int passes) const;
+  Index findHook(const CopyCluster& cluster, float radius);
+  void reglueHooks(float radius);
+  Mat3 snakeSteering(float radius) const;
   void mergeClaims();
   std::optional<StrokeUndo> endDyntopoStroke(SceneObject& obj, DyntopoSession& session);
   void recomputeNormals(std::span<const Index> verts);
@@ -217,6 +256,12 @@ class Sculptor {
   std::vector<std::uint32_t> faceClaim_;
   std::uint32_t claimStamp_ = 0;
   std::vector<Index> pendingNormals_;
+  // Snake Hook state: clusters fixed at the press and each one's hook vertex (kInvalid: none).
+  bool snakeStroke_ = false;
+  float snakePinch_ = 0.0f;
+  CopyClusters snakeClusters_;
+  int snakeClusterCount_ = 0;
+  std::array<Index, kMaxSymmetryCopies> snakeHooks_{};
   StrokeOptions options_;
   // Sculpt layers: the target array of a position stroke on a layered mesh (else nullptr), and
   // the same as layer brushes see it.

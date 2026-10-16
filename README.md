@@ -85,6 +85,7 @@ cmake --build --preset engine-only
 | Layer sculpt baru (stroke masuk ke layer aktif) | Ctrl + L |
 | Tampilkan / sembunyikan layer aktif | L (di Sculpt mode) |
 | Brush Erase Layer (menghapus detail layer aktif) | E (di Sculpt mode) |
+| Brush Snake Hook (menarik permukaan mengikuti cursor, cocok untuk tanduk dan tentakel) | K (di Sculpt mode; paling bagus dengan dynamic topology) |
 | Tampilkan hanya satu layer | Alt + klik ikon mata di panel layer (lagi: tampilkan semua) |
 | Subdivide (tambah level multiresolution di atas) | Ctrl + Page Up |
 | Level subdivisi naik / turun | Page Up / Page Down |

@@ -35,6 +35,10 @@ struct Dab {
   bool invert = false;
   Vec3 areaNormal{0.0f, 1.0f, 0.0f};  // Falloff-weighted mean normal under the dab.
   Vec3 areaCenter{0.0f};              // Falloff-weighted mean position under the dab.
+  // Snake Hook only: how far this dab pulls the vertex at its centre, and how much the pulled part
+  // narrows (0..1).
+  Vec3 pull{0.0f};
+  float pinch = 0.0f;
 };
 
 // Face set limits on a stroke, on top of the mask. Off (the default) it costs nothing; on, it
@@ -167,6 +171,10 @@ class Brush {
 
 // Largest displacement a brush may apply to one vertex in one dab, as a fraction of the radius.
 inline constexpr float kMaxDabMove = 0.2f;
+// Snake Hook: the longest pull of one sub-dab (90% of kMaxDabMove, so the centre moves exactly
+// that far) and the share of the distance to the pull axis a full step with pinch 1 closes.
+inline constexpr float kSnakeStep = 0.18f;
+inline constexpr float kSnakePinch = 0.1f;
 
 // Pushes the surface out along the area normal (in when inverted).
 class DrawBrush final : public Brush {
@@ -215,6 +223,16 @@ class CreaseBrush final : public Brush {
  public:
   const char* name() const override { return "Crease"; }
   bool needsArea() const override { return true; }
+  void apply(BrushContext& ctx) const override;
+};
+
+// Snake Hook: moves the vertices around the dab centre by Dab::pull, weighted by falloff and
+// mask, and with Dab::pinch also draws them toward the line through the centre along the pull, so
+// pulled parts narrow. Strength is not used: the sculptor scales the pull (see
+// Sculptor::snakeTo), which runs this brush in sub-dabs glued to one vertex.
+class SnakeHookBrush final : public Brush {
+ public:
+  const char* name() const override { return "Snake Hook"; }
   void apply(BrushContext& ctx) const override;
 };
 

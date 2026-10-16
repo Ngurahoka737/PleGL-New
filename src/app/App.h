@@ -52,20 +52,26 @@ struct PrimitiveSettings {
 
 // Projects store the brush as its index here, so new brushes go at the end. Names are also
 // settings keys, so they have no spaces; labels are what the panel shows.
-enum class BrushKind { Draw, Clay, Smooth, Grab, Inflate, Flatten, Crease, Mask, FaceSet, EraseLayer };
-inline constexpr int kBrushCount = 10;
+// Values are stored in projects: new brushes go at the end.
+enum class BrushKind { Draw, Clay, Smooth, Grab, Inflate, Flatten, Crease, Mask, FaceSet, EraseLayer, SnakeHook };
+inline constexpr int kBrushCount = 11;
 // Brush work per frame before the rest of a stroke's samples wait for the next frame.
 inline constexpr double kStrokeTickBudgetMs = 10.0;
 // Each table has one entry per brush; the asserts catch a short initialiser list, which would
 // otherwise fill the rest with empty entries.
 inline constexpr std::array<const char*, kBrushCount> kBrushNames = {
-    "Draw", "Clay", "Smooth", "Grab", "Inflate", "Flatten", "Crease", "Mask", "FaceSet", "EraseLayer"};
+    "Draw", "Clay", "Smooth", "Grab", "Inflate", "Flatten", "Crease", "Mask", "FaceSet", "EraseLayer", "SnakeHook"};
 inline constexpr std::array<const char*, kBrushCount> kBrushLabels = {
-    "Draw", "Clay", "Smooth", "Grab", "Inflate", "Flatten", "Crease", "Mask", "Face Set", "Erase Layer"};
-inline constexpr std::array<const char*, kBrushCount> kBrushKeys = {"D", "C", "S", "G", "I",
-                                                                    "T", "Shift+C", "M", "P", "E"};
-inline constexpr std::array<float, kBrushCount> kBrushDefaultStrength = {0.5f, 0.5f, 0.5f, 1.0f, 0.5f,
-                                                                         0.5f, 0.5f, 1.0f, 1.0f, 0.5f};
+    "Draw", "Clay", "Smooth", "Grab", "Inflate", "Flatten", "Crease", "Mask", "Face Set", "Erase Layer", "Snake Hook"};
+inline constexpr std::array<const char*, kBrushCount> kBrushKeys = {"D", "C",       "S", "G", "I", "T",
+                                                                    "Shift+C", "M", "P", "E", "K"};
+inline constexpr std::array<float, kBrushCount> kBrushDefaultStrength = {0.5f, 0.5f, 0.5f, 1.0f, 0.5f, 0.5f,
+                                                                         0.5f, 1.0f, 1.0f, 0.5f, 0.7f};
+// The order of the panel's brush buttons.
+inline constexpr std::array<BrushKind, kBrushCount> kBrushDisplayOrder = {
+    BrushKind::Draw,    BrushKind::Clay, BrushKind::Smooth,  BrushKind::Grab,       BrushKind::SnakeHook,
+    BrushKind::Inflate, BrushKind::Flatten, BrushKind::Crease, BrushKind::Mask,     BrushKind::FaceSet,
+    BrushKind::EraseLayer};
 static_assert(kBrushNames.back() != nullptr && kBrushLabels.back() != nullptr && kBrushKeys.back() != nullptr);
 static_assert(kBrushDefaultStrength.back() > 0.0f);
 enum class PressureMap { Strength, Radius, Both, None };
@@ -100,6 +106,7 @@ struct SculptSettings {
   DetailMode detailMode = DetailMode::Relative;
   float detailPx = 8.0f;      // Relative: target edge length in screen pixels (hold R to change).
   float detailSize = 0.02f;   // Constant: target edge length in object units.
+  float snakePinch = 0.0f;    // Snake Hook: how much pulled parts narrow, 0..1.
 
   SymmetrySpec symmetry() const { return sanitized({symmetryX, symmetryY, symmetryZ, radialAxis, radialCount}); }
 };
@@ -367,6 +374,7 @@ class App {
   MaskSmoothBrush maskSmoothBrush_;  // Shift with the Mask brush smooths the mask.
   FaceSetBrush faceSetBrush_;
   EraseLayerBrush eraseLayerBrush_;
+  SnakeHookBrush snakeBrush_;
   StrokeSampler sampler_;
   std::vector<StrokeSample> samples_;
   struct PendingSample {
@@ -377,12 +385,23 @@ class App {
   std::deque<PendingSample> pendingSamples_;
   std::optional<Vec3> pendingGrab_;  // Latest Grab offset (local) not yet applied.
   std::uint64_t pendingGrabNs_ = 0;
+  // Snake Hook: the cursor on the drag plane (local) and its pen pressure; the hook keeps moving
+  // toward it every frame until it gets there.
+  struct SnakeTarget {
+    Vec3 local{0.0f};
+    float pressure = 1.0f;
+  };
+  SnakeTarget snakeTarget_;
+  std::uint64_t snakeTargetNs_ = 0;   // Input not yet applied, 0 when none.
+  std::uint64_t lastSnakeTickNs_ = 0;
+  bool snakeSettled_ = false;         // The hook reached the target and no input came since.
+  void tickSnake(double budgetMs);
   std::vector<CursorMarker> cursors_;
   mutable SymmetryGroup cursorGroup_;  // The panel's symmetry, for cursor copies and the overlay.
   // Brush of the running stroke. Shift turns it into Smooth, except for Mask, which stays Mask and
   // smooths the mask instead.
   BrushKind strokeBrush_ = BrushKind::Draw;
-  // Grab drags the captured region in the plane through the grab point facing the camera.
+  // Grab (and Snake Hook) drag in the plane through the press point facing the camera.
   Vec3 grabStartWorld_{0.0f};
   Vec3 grabPlaneNormal_{0.0f, 0.0f, 1.0f};
   bool adjustingRadius_ = false;     // F held.

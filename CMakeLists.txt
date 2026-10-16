@@ -116,6 +116,7 @@ if(PLEGL_BUILD_TESTS)
     tests/test_layers_io.cpp
     tests/test_settings.cpp
     tests/test_symmetry.cpp
+    tests/test_snakehook.cpp
   )
   target_link_libraries(plegl_tests PRIVATE plegl_engine doctest::doctest plegl_warnings)
   add_test(NAME plegl_tests COMMAND plegl_tests)

@@ -66,6 +66,8 @@ void Sculptor::start(SceneObject& object, const StrokeOptions& options, std::str
   grabVerts_.clear();
   grabEntries_.clear();
   grabPins_.clear();
+  snakeStroke_ = false;
+  snakeClusterCount_ = 0;
   options_ = options;
   tooManyCopies_ = false;
   if (const SymmetrySpec spec = options.symmetry(); !(spec == group_.spec())) group_ = SymmetryGroup(spec);
@@ -396,6 +398,12 @@ void Sculptor::applyTopology(const Dab& dab, const DabTopology& topology) {
   lastDab_.topologyMs += t.ms();
 }
 
+double Sculptor::topologyBudget(int passes) const {
+  // Symmetric dabs spend at most twice a single pass, split evenly; -1 leaves the options' budget.
+  const double budget = options_.dyntopoOptions.timeBudgetMs;
+  return budget > 0.0 && passes > 0 ? std::max(0.25, std::min(2.0 * budget, budget * passes) / passes) : -1.0;
+}
+
 bool Sculptor::applyCopies(int count, const ApplyFlags& flags) {
   Mesh& m = object_->mesh;
   Bvh& bvh = object_->bvh;
@@ -410,9 +418,7 @@ bool Sculptor::applyCopies(int count, const ApplyFlags& flags) {
     int passes = 0;
     for (int i = 0; i < count; ++i)
       passes += !skipped(copy(i)) && copy(i).topology.detail > 0.0f && onlySet_[copy(i).cluster.op] != kNoFaceSet;
-    const double budget = options_.dyntopoOptions.timeBudgetMs;
-    const double perPass =
-        budget > 0.0 && passes > 0 ? std::max(0.25, std::min(2.0 * budget, budget * passes) / passes) : -1.0;
+    const double perPass = topologyBudget(passes);
     for (int i = 0; i < count; ++i) {
       CopyDab& c = copy(i);
       const std::int32_t only = onlySet_[c.cluster.op];
@@ -770,6 +776,216 @@ void Sculptor::grab(const Vec3& offset) {
   lastDab_.leaves = static_cast<int>(grabRefitLeaves_.size());
   lastDab_.totalMs = total.ms();
   ++dabCount_;
+}
+
+float snakeGain(float strength, double dtMs) {
+  const double s = std::clamp(static_cast<double>(strength), 0.0, 1.0);
+  if (s >= 1.0) return 1.0f;
+  const double dt = std::clamp(dtMs, 1.0, 50.0);
+  return static_cast<float>(1.0 - std::pow(1.0 - s, dt / (1000.0 / 60.0)));
+}
+
+Index Sculptor::findHook(const CopyCluster& cluster, float radius) {
+  const Mesh& m = object_->mesh;
+  const FaceSetFilter allowed = filter(cluster.op);
+  // Coordinates the merged copies agree are zero: a hook with those zero stays on the plane or
+  // axis, where the pins keep it.
+  std::uint8_t onSeam = 0;
+  if (cluster.merged())
+    for (int a = 0; a < 3; ++a)
+      if (cluster.localProjector[a] == Vec3{0.0f}) onSeam |= static_cast<std::uint8_t>(1 << a);
+  const float seamDist2 = kCopyMergeFraction * radius * kCopyMergeFraction * radius;
+  Index best = kInvalid, seam = kInvalid;
+  float bestDist2 = radius * radius, bestSeam2 = seamDist2;
+  leaves_.clear();
+  object_->bvh.querySphere(cluster.center, radius, leaves_);
+  for (Index li : leaves_) {
+    const BvhLeaf& leaf = object_->bvh.leaves()[li];
+    for (Index v = leaf.vertBegin; v < leaf.vertEnd; ++v) {
+      const Vec3 d = m.positions[v] - cluster.center;
+      const float dist2 = glm::dot(d, d);
+      // Removed and isolated vertices have no face; hidden ones none that is visible.
+      if ((dist2 >= bestDist2 && dist2 >= bestSeam2) || m.vertHe[v] == kInvalid || !allowed.allows(m, v)) continue;
+      if (dist2 < bestDist2 || (dist2 == bestDist2 && v < best)) {
+        bestDist2 = dist2;
+        best = v;
+      }
+      if (onSeam && dist2 < bestSeam2 &&
+          (pinnedAxes(group_.mirrorPlanes(), group_.rotationAxes(), m.positions[v], pinEps_) & onSeam) == onSeam) {
+        bestSeam2 = dist2;
+        seam = v;
+      }
+    }
+  }
+  return seam != kInvalid ? seam : best;
+}
+
+bool Sculptor::beginSnake(SceneObject& object, const Brush& snake, const StrokeOptions& options, const Vec3& center,
+                          float radius, float pinch, std::string label) {
+  if (!(radius > 0.0f)) return false;
+  beginStroke(object, snake, options, std::move(label));
+  if (!active()) return false;
+  resolveFaceSets(center, radius);
+  snakePinch_ = std::clamp(pinch, 0.0f, 1.0f);
+  // The clusters stay as they are at the press for the whole stroke, so the copies keep their
+  // roles however far the hook travels.
+  snakeClusterCount_ = clusterCopies(group_, center, kCopyMergeFraction * radius, snakeClusters_);
+  for (int k = 0; k < snakeClusterCount_; ++k)
+    snakeHooks_[static_cast<std::size_t>(k)] = findHook(snakeClusters_[static_cast<std::size_t>(k)], radius);
+  const Index hook = snakeHooks_[0];
+  const Mesh& m = object.mesh;
+  if (hook == kInvalid || (!m.mask.empty() && m.mask[hook] >= 0.999f)) {
+    endStroke();
+    return false;
+  }
+  snakeStroke_ = true;
+  return true;
+}
+
+void Sculptor::reglueHooks(float radius) {
+  // A topology pass keeps only its own hook; one that another copy's pass merged away moves to
+  // the nearest live vertex that may move.
+  const Mesh& m = object_->mesh;
+  for (int k = 0; k < snakeClusterCount_; ++k) {
+    Index& hook = snakeHooks_[static_cast<std::size_t>(k)];
+    if (hook == kInvalid || m.vertHe[hook] != kInvalid) continue;
+    CopyCluster around = snakeClusters_[static_cast<std::size_t>(k)];
+    around.center = m.positions[hook];  // Removed vertices keep their last position.
+    hook = findHook(around, radius);
+  }
+}
+
+Mat3 Sculptor::snakeSteering(float radius) const {
+  // How the primary hook moves for a primary pull of one: every copy reaching it adds its mirrored
+  // pull, weighted by its falloff there and its share, all scaled by the mask.
+  const Mesh& m = object_->mesh;
+  const Index h0 = snakeHooks_[0];
+  const Vec3 p0 = m.positions[h0];
+  std::array<float, kMaxSymmetryCopies> f{};
+  float sum = 0.0f;
+  for (int k = 0; k < snakeClusterCount_; ++k) {
+    const Index h = snakeHooks_[static_cast<std::size_t>(k)];
+    if (h == kInvalid || (k > 0 && !filter(snakeClusters_[static_cast<std::size_t>(k)].op).allows(m, h0))) continue;
+    const float fk = k == 0 ? 1.0f : falloffWeight(options_.falloff, glm::length(p0 - m.positions[h]) / radius);
+    f[static_cast<std::size_t>(k)] = fk;
+    sum += kShareExponent == 1.0f ? fk : std::pow(fk, kShareExponent);
+  }
+  Mat3 E{0.0f};
+  if (sum <= 0.0f) return E;
+  for (int k = 0; k < snakeClusterCount_; ++k) {
+    const float fk = f[static_cast<std::size_t>(k)];
+    if (fk <= 0.0f) continue;
+    const float share = (kShareExponent == 1.0f ? fk : std::pow(fk, kShareExponent)) / sum;
+    E += snakeClusters_[static_cast<std::size_t>(k)].polar * (share * fk);
+  }
+  const float free = m.mask.empty() ? 1.0f : 1.0f - m.mask[h0];
+  return E * free;
+}
+
+SnakeStep Sculptor::snakeTo(const Vec3& target, float radius, float gain, const DabTopology& topology,
+                            double budgetMs) {
+  SnakeStep step;
+  if (!object_ || !snakeStroke_ || !(radius > 0.0f)) return step;
+  Timer total;
+  lastDab_ = {};
+  Mesh& m = object_->mesh;
+  const auto hookAt = [&](int k) { return snakeHooks_[static_cast<std::size_t>(k)]; };
+
+  // 1. Topology around every hook, each pass keeping its hook vertex.
+  if (dyntopo_ && topology.detail > 0.0f) {
+    int passes = 0;
+    for (int k = 0; k < snakeClusterCount_; ++k)
+      passes += hookAt(k) != kInvalid && onlySet_[snakeClusters_[static_cast<std::size_t>(k)].op] != kNoFaceSet;
+    const double perPass = topologyBudget(passes);
+    for (int k = 0; k < snakeClusterCount_; ++k) {
+      const Index hook = hookAt(k);
+      const std::int32_t only = onlySet_[snakeClusters_[static_cast<std::size_t>(k)].op];
+      if (hook == kInvalid || only == kNoFaceSet || m.vertHe[hook] == kInvalid) continue;
+      DabTopology t = topology;
+      t.keepVertex = hook;
+      t.hintFace = m.heFace[m.vertHe[hook]];
+      t.onlySet = only;
+      t.lockFaceSetBorders = options_.lockFaceSetBoundaries;
+      t.timeBudgetMs = perPass;
+      Dab d;
+      d.center = m.positions[hook];
+      d.radius = radius;
+      applyTopology(d, t);
+      reglueHooks(radius);
+    }
+    if (hookAt(0) == kInvalid) {  // Nothing left to pull (a damaged area).
+      step.ms = total.ms();
+      return step;
+    }
+  }
+
+  // 2. The commanded pull: gain of the way to the target, steered so the hook really gets there
+  // where copies or the mask hold it back, but never more than three times the plain pull.
+  const Vec3 p0 = m.positions[hookAt(0)];
+  const Vec3 tick = (target - p0) * std::clamp(gain, 0.0f, 1.0f);
+  Vec3 command = tick;
+  const Mat3 E = snakeSteering(radius);
+  float offIdentity = 0.0f;
+  for (int c = 0; c < 3; ++c)
+    for (int r = 0; r < 3; ++r) offIdentity = std::max(offIdentity, std::abs(E[c][r] - (c == r ? 1.0f : 0.0f)));
+  if (offIdentity >= 1e-6f) {
+    constexpr float kLambda = 0.01f;
+    const Mat3 Et = glm::transpose(E);
+    command = glm::inverse(Et * E + Mat3{kLambda}) * (Et * tick);
+    const float cap = 3.0f * glm::length(tick);
+    if (const float len = glm::length(command); len > cap) command *= cap / len;
+  }
+
+  // 3. Sub-dabs glued to the hooks. One that would pull farther than a step is cut to a step and
+  // the next tick covers the rest.
+  const float length = glm::length(command);
+  const float stepLen = kSnakeStep * radius;
+  if (length > 1e-7f * radius) {
+    const int n = std::clamp(static_cast<int>(std::ceil(length / stepLen)), 1, kMaxSnakeSubDabs);
+    Vec3 part = command / static_cast<float>(n);
+    if (glm::length(part) > stepLen) part *= stepLen / glm::length(part);
+    pendingNormals_.clear();
+    Dab base;
+    base.radius = radius;
+    base.strength = 1.0f;
+    base.falloff = options_.falloff;
+    base.pinch = snakePinch_;
+    for (int i = 0; i < n; ++i) {
+      int count = 0;
+      for (int k = 0; k < snakeClusterCount_; ++k) {
+        const Index hook = hookAt(k);
+        if (hook == kInvalid) continue;
+        if (copies_.size() <= static_cast<std::size_t>(count)) copies_.resize(static_cast<std::size_t>(count) + 1);
+        CopyDab& c = copies_[static_cast<std::size_t>(count++)];
+        c.cluster = snakeClusters_[static_cast<std::size_t>(k)];
+        c.dab = base;
+        c.dab.center = m.positions[hook];
+        c.dab.pull = transform(c.cluster.polar, part);
+        c.topology = {};
+        c.live = false;
+      }
+      lastDab_.copies = group_.size();
+      lastDab_.clusters = count;
+      if (!applyCopies(count, {.deferNormals = true})) break;
+      ++step.subDabs;
+      if (budgetMs >= 0.0 && total.ms() >= budgetMs) break;
+    }
+    // 4. Normals once for every sub-dab of the tick; their owners were snapshotted already.
+    if (!pendingNormals_.empty()) {
+      Timer t;
+      std::sort(pendingNormals_.begin(), pendingNormals_.end());
+      pendingNormals_.erase(std::unique(pendingNormals_.begin(), pendingNormals_.end()), pendingNormals_.end());
+      recomputeNormals(pendingNormals_);
+      lastDab_.normalsMs += t.ms();
+      lastDab_.vertices = static_cast<int>(pendingNormals_.size());
+      pendingNormals_.clear();
+    }
+  }
+  if (step.subDabs > 0) ++dabCount_;
+  step.remaining = glm::length(target - m.positions[hookAt(0)]);
+  step.ms = total.ms();
+  lastDab_.totalMs = step.ms;
+  return step;
 }
 
 std::optional<StrokeUndo> Sculptor::endDyntopoStroke(SceneObject& obj, DyntopoSession& session) {

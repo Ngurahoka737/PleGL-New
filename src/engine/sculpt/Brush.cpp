@@ -187,6 +187,45 @@ void CreaseBrush::apply(BrushContext& ctx) const {
   });
 }
 
+void SnakeHookBrush::apply(BrushContext& ctx) const {
+  const Dab& d = ctx.dab;
+  Mesh& m = ctx.mesh;
+  const float pullLen = glm::length(d.pull);
+  if (!(pullLen > 0.0f)) return;
+  const float r2 = d.radius * d.radius;
+  const float invR = 1.0f / d.radius;
+  const float maxMove = d.radius * kMaxDabMove;
+  const float maxMove2 = maxMove * maxMove;
+  // Pinch draws vertices toward the pull axis by a share that grows with the step, so a pull split
+  // into more sub-dabs narrows the same.
+  const bool pinching = d.pinch > 0.0f && pullLen >= 1e-9f * d.radius;
+  const Vec3 axis = d.pull / pullLen;
+  const float pinchRate = pinching ? d.pinch * kSnakePinch * pullLen / (kSnakeStep * d.radius) : 0.0f;
+  const float* mask = m.mask.empty() ? nullptr : m.mask.data();
+  parallelFor(0, ctx.leaves.size(), 1, [&](std::size_t b, std::size_t e) {
+    for (std::size_t i = b; i < e; ++i) {
+      const BvhLeaf& leaf = ctx.bvh.leaves()[ctx.leaves[i]];
+      for (Index v = leaf.vertBegin; v < leaf.vertEnd; ++v) {
+        const Vec3& p = m.positions[v];
+        const Vec3 delta = p - d.center;
+        const float dist2 = glm::dot(delta, delta);
+        if (dist2 >= r2) continue;
+        const float f = falloffWeight(d.falloff, std::sqrt(dist2) * invR);
+        const float w = f * unmasked(ctx, mask, v);
+        if (w <= 0.0f) continue;
+        Vec3 move = d.pull * w;
+        if (pinching) {
+          const Vec3 toCenter = -delta;
+          move += (toCenter - axis * glm::dot(axis, toCenter)) * (pinchRate * w);
+        }
+        const float len2 = glm::dot(move, move);
+        if (len2 > maxMove2) move *= maxMove / std::sqrt(len2);
+        writeMove(ctx, v, f, move);
+      }
+    }
+  });
+}
+
 namespace {
 // Adds `delta` to a layer offset and returns the vertex's new composite position.
 Vec3 addToLayer(const LayerTarget& t, Index v, const Vec3& delta) {

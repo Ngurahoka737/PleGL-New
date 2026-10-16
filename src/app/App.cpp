@@ -418,6 +418,7 @@ void App::handleShortcut(const SDL_KeyboardEvent& key) {
       case SDLK_I: sculpt.brush = BrushKind::Inflate; break;
       case SDLK_T: sculpt.brush = BrushKind::Flatten; break;
       case SDLK_E: sculpt.brush = BrushKind::EraseLayer; break;
+      case SDLK_K: sculpt.brush = BrushKind::SnakeHook; break;
       case SDLK_L: toggleActiveLayerVisible(); break;
       case SDLK_F: adjustingRadius_ = true; break;  // Move the mouse sideways while holding F.
       case SDLK_R: adjustingDetail_ = true; break;  // The same for the dynamic topology detail.
@@ -670,6 +671,30 @@ void App::beginStroke(float x, float y, std::uint64_t timestampNs) {
     }
     return;
   }
+  if (strokeBrush_ == BrushKind::SnakeHook) {
+    // The hook follows the cursor across the plane through the press point facing the camera.
+    const float p = currentPressure();
+    const bool mapRadius = sculpt.pressure == PressureMap::Radius || sculpt.pressure == PressureMap::Both;
+    const float px = sculpt.radiusPx * (mapRadius ? std::max(p, 0.1f) : 1.0f);
+    const Mat4 inv = glm::inverse(obj->transform.matrix());
+    const float scale = (obj->transform.scale.x + obj->transform.scale.y + obj->transform.scale.z) / 3.0f;
+    grabStartWorld_ = pick.worldPosition;
+    grabPlaneNormal_ = camera.forward();
+    const float radius = camera.worldPerPixel(grabStartWorld_) * px / std::max(scale, 1e-6f);
+    const Vec3 local = Vec3(inv * Vec4(grabStartWorld_, 1.0f));
+    if (!sculptor_.beginSnake(*obj, *brush, opts, local, radius, sculpt.snakePinch, label)) {
+      statusMessage = "Snake Hook: nothing to pull here";
+      return;
+    }
+    if (sculptor_.topologyOffForCopies())
+      statusMessage = "Dynamic topology is off above " + std::to_string(kMaxDyntopoCopies) + " symmetry copies";
+    snakeTarget_ = {local, p};
+    snakeTargetNs_ = 0;
+    snakeSettled_ = true;
+    lastSnakeTickNs_ = SDL_GetTicksNS();
+    stats.dabMs = 0.0;
+    return;
+  }
   sculptor_.beginStroke(*obj, *brush, opts, label);
   if (!sculptor_.active()) return;
   if (sculptor_.topologyOffForCopies())
@@ -695,6 +720,19 @@ void App::continueStroke(float x, float y, std::uint64_t timestampNs) {
     if (pendingGrabNs_ == 0) pendingGrabNs_ = timestampNs;
     return;
   }
+  if (strokeBrush_ == BrushKind::SnakeHook) {
+    // Like Grab, only the latest cursor matters; the hook chases it frame by frame.
+    SceneObject* obj = sculptor_.object();
+    const Ray ray = camera.rayThroughPixel(x - vpX_, y - vpY_);
+    const float denom = glm::dot(ray.dir, grabPlaneNormal_);
+    if (!obj || std::abs(denom) < 1e-8f) return;
+    const float t = glm::dot(grabStartWorld_ - ray.origin, grabPlaneNormal_) / denom;
+    const Mat4 inv = glm::inverse(obj->transform.matrix());
+    snakeTarget_ = {Vec3(inv * Vec4(ray.origin + ray.dir * t, 1.0f)), currentPressure()};
+    if (snakeTargetNs_ == 0) snakeTargetNs_ = timestampNs;
+    snakeSettled_ = false;
+    return;
+  }
   samples_.clear();
   sampler_.setSpacing(std::max(1.0f, sculpt.radiusPx * sculpt.spacing));
   sampler_.moveTo({x - vpX_, y - vpY_, currentPressure()}, samples_);
@@ -714,6 +752,10 @@ void App::tickStroke(bool flush) {
     pendingSamples_.clear();
     pendingGrab_.reset();
     pendingGrabNs_ = 0;
+    return;
+  }
+  if (strokeBrush_ == BrushKind::SnakeHook) {
+    tickSnake(kStrokeTickBudgetMs);
     return;
   }
   if (strokeBrush_ == BrushKind::Grab) {
@@ -742,6 +784,39 @@ void App::tickStroke(bool flush) {
     first = false;
   }
   stats.queuedSamples = static_cast<int>(pendingSamples_.size());
+}
+
+void App::tickSnake(double budgetMs) {
+  SceneObject* obj = sculptor_.object();
+  const Index hook = sculptor_.snakeHook();
+  if (!obj || hook == kInvalid) return;
+  // The follow gain depends on the time since the last tick, so the hook trails the same at any
+  // frame rate.
+  const std::uint64_t now = SDL_GetTicksNS();
+  const double dtMs = static_cast<double>(now - lastSnakeTickNs_) / 1e6;
+  lastSnakeTickNs_ = now;
+  if (snakeSettled_) return;
+  const Vec3 hookWorld = Vec3(obj->transform.matrix() * Vec4(obj->mesh.positions[hook], 1.0f));
+  const float p = snakeTarget_.pressure;
+  const bool mapRadius = sculpt.pressure == PressureMap::Radius || sculpt.pressure == PressureMap::Both;
+  const bool mapStrength = sculpt.pressure == PressureMap::Strength || sculpt.pressure == PressureMap::Both;
+  const float scale = (obj->transform.scale.x + obj->transform.scale.y + obj->transform.scale.z) / 3.0f;
+  const float px = sculpt.radiusPx * (mapRadius ? std::max(p, 0.1f) : 1.0f);
+  const float radius = camera.worldPerPixel(hookWorld) * px / std::max(scale, 1e-6f);
+  const float strength = sculpt.strength[static_cast<int>(BrushKind::SnakeHook)] * (mapStrength ? p : 1.0f);
+  DabTopology topology;
+  if (sculpt.dyntopo) topology.detail = detailSizeAt(*obj, hookWorld);
+  const SnakeStep step = sculptor_.snakeTo(snakeTarget_.local, radius, snakeGain(strength, dtMs), topology, budgetMs);
+  if (step.subDabs > 0) {
+    dabsThisFrame_ += step.subDabs;
+    stats.dabMs = sculptor_.lastDab().totalMs;
+    stats.topologyMs = sculptor_.lastDab().topologyMs;
+    stats.dabCopies = sculptor_.lastDab().clusters;
+  }
+  noteInput(snakeTargetNs_);
+  snakeTargetNs_ = 0;
+  // Settled once the hook is there, or can get no closer (a hook held on a symmetry plane).
+  if (step.subDabs == 0 || step.remaining < 1e-3f * radius) snakeSettled_ = true;
 }
 
 void App::applySample(const StrokeSample& smp, const Ray& world) {
@@ -775,7 +850,7 @@ void App::applySample(const StrokeSample& smp, const Ray& world) {
 }
 
 void App::endStroke() {
-  tickStroke(true);  // Every sample and the last Grab position land before the stroke ends.
+  tickStroke(true);  // Every sample and the last Grab or Snake Hook cursor land before the stroke ends.
   const SceneObject* obj = sculptor_.object();
   const bool levels = obj && obj->multires;
   auto entry = sculptor_.endStroke();
@@ -784,7 +859,7 @@ void App::endStroke() {
     ++editCounter_;
     const int dabs = sculptor_.dabCount();
     const std::string label = std::visit([](const auto& e) { return e.label; }, *entry);
-    statusMessage = label + " stroke, " + std::to_string(dabs) + (strokeBrush_ == BrushKind::Grab ? " moves" : " dabs");
+    statusMessage = label + " stroke, " + std::to_string(dabs) + (strokeBrush_ == BrushKind::Grab || strokeBrush_ == BrushKind::SnakeHook ? " moves" : " dabs");
     if (topo.dyntopo) {
       const long long diff = static_cast<long long>(topo.facesAfter) - topo.facesBefore;
       statusMessage += ", " + std::string(diff >= 0 ? "+" : "") + std::to_string(diff) + " faces";
@@ -897,6 +972,7 @@ const Brush* App::brushFor(BrushKind kind) const {
     case BrushKind::Mask: return &maskBrush_;
     case BrushKind::FaceSet: return &faceSetBrush_;
     case BrushKind::EraseLayer: return &eraseLayerBrush_;
+    case BrushKind::SnakeHook: return &snakeBrush_;
   }
   return nullptr;
 }
