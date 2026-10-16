@@ -23,6 +23,7 @@ struct PoseOptions {
   PoseMode mode = PoseMode::Topology;
   // Width of the bend at the joint as a fraction of the brush radius, 0..1 (0: a hard step).
   float softness = 0.25f;
+  bool operator==(const PoseOptions&) const = default;
 };
 
 struct PoseLimits {

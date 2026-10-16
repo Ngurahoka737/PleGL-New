@@ -97,6 +97,8 @@ std::string App::settingsText() const {
   w.put("brush.pressure", static_cast<int>(sculpt.pressure));
   w.put("brush.spacing", sculpt.spacing);
   w.put("snake.pinch", sculpt.snakePinch);
+  w.put("pose.mode", static_cast<int>(sculpt.poseMode));
+  w.put("pose.softness", sculpt.poseSoftness);
   w.put("symmetry.x", sculpt.symmetryX);
   w.put("symmetry.y", sculpt.symmetryY);
   w.put("symmetry.z", sculpt.symmetryZ);
@@ -159,6 +161,9 @@ void App::applySettings(const std::string& text) {
   r.get("brush.spacing", sculpt.spacing);
   r.get("snake.pinch", sculpt.snakePinch);
   sculpt.snakePinch = std::isfinite(sculpt.snakePinch) ? std::clamp(sculpt.snakePinch, 0.0f, 1.0f) : 0.0f;
+  r.getEnum("pose.mode", sculpt.poseMode, 2);
+  r.get("pose.softness", sculpt.poseSoftness);
+  sculpt.poseSoftness = std::isfinite(sculpt.poseSoftness) ? std::clamp(sculpt.poseSoftness, 0.0f, 1.0f) : 0.25f;
   r.get("symmetry.x", sculpt.symmetryX);
   r.get("symmetry.y", sculpt.symmetryY);
   r.get("symmetry.z", sculpt.symmetryZ);

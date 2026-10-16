@@ -207,7 +207,7 @@ GLuint makeLineVao(GLuint vbo) {
 }
 
 constexpr int kCursorSegments = 48;
-constexpr int kOverlayVertices = 600;
+constexpr int kOverlayVertices = Renderer::kMaxOverlayVertices;
 
 }  // namespace
 

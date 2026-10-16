@@ -79,6 +79,9 @@ class Renderer {
 
   // At most kMaxCursors cursor rings are drawn.
   static constexpr int kMaxCursors = 64;
+  // Line vertices the sculpt overlay holds: plane outlines and radial axis (at most 26) first,
+  // then SculptOverlay::points; the rest is dropped.
+  static constexpr int kMaxOverlayVertices = 600;
   void render(const Scene& scene, const Camera& camera, const ViewportRect& rect, const ViewSettings& settings,
               std::uint32_t selectedId, std::span<const CursorMarker> cursors, const SculptOverlay& overlay);
 

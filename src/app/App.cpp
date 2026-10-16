@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <glm/gtc/type_ptr.hpp>
 
 #include "core/Timer.h"
@@ -171,6 +172,7 @@ void App::run() {
     if (strengthDrag_.active() && !ImGui::IsAnyItemActive()) finishLayerStrengthDrag();
     drawGizmo();
     updateHover();
+    updatePosePreview();
     renderer_.sync(scene, view.wireframe);
     ImGui::Render();
 
@@ -187,7 +189,9 @@ void App::run() {
     rect.y = fbh - static_cast<int>((vpY_ + vpH_) * pixelScale_);
 
     CursorMarker cursor;
-    if (hover_ && (drag_ == Drag::None || drag_ == Drag::Pan)) {
+    // A Pose drag shows its joint and axis instead of the ring.
+    const bool posing = sculptor_.active() && strokeBrush_ == BrushKind::Pose;
+    if (hover_ && (drag_ == Drag::None || drag_ == Drag::Pan) && !posing) {
       cursor.visible = true;
       cursor.position = hover_->worldPosition;
       cursor.normal = hover_->worldNormal;
@@ -419,6 +423,7 @@ void App::handleShortcut(const SDL_KeyboardEvent& key) {
       case SDLK_T: sculpt.brush = BrushKind::Flatten; break;
       case SDLK_E: sculpt.brush = BrushKind::EraseLayer; break;
       case SDLK_K: sculpt.brush = BrushKind::SnakeHook; break;
+      case SDLK_O: sculpt.brush = BrushKind::Pose; break;
       case SDLK_L: toggleActiveLayerVisible(); break;
       case SDLK_F: adjustingRadius_ = true; break;  // Move the mouse sideways while holding F.
       case SDLK_R: adjustingDetail_ = true; break;  // The same for the dynamic topology detail.
@@ -449,6 +454,8 @@ void App::handleShortcut(const SDL_KeyboardEvent& key) {
 }
 
 void App::updateHover() {
+  // A Pose stroke refits bounds only when it ends, so a pick now would find the old surface.
+  if (sculptor_.active() && strokeBrush_ == BrushKind::Pose) return;
   if (!mouseInViewport_ || drag_ == Drag::Orbit || ImGui::GetIO().WantCaptureMouse) {
     if (drag_ == Drag::None) hover_.reset();
     return;
@@ -621,27 +628,7 @@ void App::beginStroke(float x, float y, std::uint64_t timestampNs) {
   const bool shift = (mods & SDL_KMOD_SHIFT) != 0, ctrl = (mods & SDL_KMOD_CTRL) != 0;
   const bool masking = sculpt.brush == BrushKind::Mask;
   strokeBrush_ = shift && !masking ? BrushKind::Smooth : sculpt.brush;
-  StrokeOptions opts;
-  opts.falloff = sculpt.falloff;
-  const SymmetrySpec symmetry = sculpt.symmetry();
-  opts.symmetryX = symmetry.x;
-  opts.symmetryY = symmetry.y;
-  opts.symmetryZ = symmetry.z;
-  opts.radialAxis = symmetry.radialAxis;
-  opts.radialCount = symmetry.radialCount;
-  opts.strength = sculpt.strength[static_cast<int>(strokeBrush_)];
-  // The Mask brush ignores Add/Subtract: it paints, and erases with Ctrl or the pen's eraser end.
-  opts.invert = masking ? ctrl || (pen.down && pen.eraser) : sculpt.invert != ctrl;
-  opts.dyntopo = sculpt.dyntopo;  // The sculptor ignores it for Grab, Mask and Face Set.
-  opts.dyntopoOptions.refine = sculpt.dyntopoRefine;
-  opts.faceSetAutoMask = sculpt.faceSetAutoMask;
-  opts.lockFaceSetBoundaries = sculpt.lockFaceSetBorders;
-  // The Face Set brush starts a new set per stroke; Ctrl grows the set under the cursor instead.
-  opts.extendFaceSet = ctrl;
-  // Sculpting brushes write the active sculpt layer (or the base); mask and face set brushes
-  // never do.
-  opts.layerTarget = obj->mesh.layers.active;
-  opts.smoothLayerOnly = sculpt.smoothLayerOnly;
+  const StrokeOptions opts = strokeOptions(*obj, strokeBrush_, ctrl);
   const Brush* brush = strokeBrush_ == BrushKind::Grab ? nullptr
                        : masking && shift              ? &maskSmoothBrush_
                                                        : brushFor(strokeBrush_);
@@ -649,7 +636,7 @@ void App::beginStroke(float x, float y, std::uint64_t timestampNs) {
     statusMessage = why;
     return;
   }
-  std::string label = brush ? brush->name() : "Grab";
+  std::string label = brush ? brush->name() : strokeBrush_ == BrushKind::Pose ? "Pose" : "Grab";
   if (const SculptLayer* layer = obj->mesh.layers.find(opts.layerTarget);
       layer && strokeBrush_ != BrushKind::Mask && strokeBrush_ != BrushKind::FaceSet)
     label += " (" + layer->name + ")";
@@ -695,6 +682,50 @@ void App::beginStroke(float x, float y, std::uint64_t timestampNs) {
     stats.dabMs = 0.0;
     return;
   }
+  if (strokeBrush_ == BrushKind::Pose) {
+    // Pose finds the joint once at the press and turns about it; pen pressure changes nothing.
+    grabStartWorld_ = pick.worldPosition;
+    grabPlaneNormal_ = camera.forward();
+    const Vec3 local = pick.localHit.position;
+    const float radius = poseRadius(*obj, grabStartWorld_);
+    // The preview the cursor rested on is this press's build when nothing changed since.
+    bool reuse = posePreviewMatches(*obj, local, radius, kPoseReusePx) &&
+                 posePreview_.build.failure != PoseFailure::Aborted;
+    for (const PoseRig& rig : posePreview_.build.rigs) {
+      for (std::size_t i = 0; reuse && i < rig.verts.size(); ++i)
+        reuse = std::memcmp(&obj->mesh.positions[rig.verts[i]], &rig.start[i], sizeof(Vec3)) == 0;
+    }
+    Timer t;
+    const bool started =
+        sculptor_.beginPose(*obj, opts, poseOptions(), local, radius, label, reuse ? &posePreview_.build : nullptr);
+    posePreview_ = PosePreview{};
+    if (!started) {
+      switch (sculptor_.lastPoseFailure()) {
+        case PoseFailure::Masked: statusMessage = "Pose: the press is on a masked area"; break;
+        case PoseFailure::NoJoint:
+          statusMessage = sculpt.poseMode == PoseMode::Mask
+                              ? "Pose: the press is on the joint. Press further out on the part to turn."
+                              : "Pose: no part to bend here. Press near the end of a part, or use a smaller radius.";
+          break;
+        case PoseFailure::Aborted: statusMessage = "Pose: the part is too large to find its joint"; break;
+        default: statusMessage = "Pose: nothing to turn here"; break;
+      }
+      return;
+    }
+    stats.dabMs = t.ms();
+    const Mat4 inv = glm::inverse(obj->transform.matrix());
+    poseViewNormal_ = glm::normalize(Vec3(inv * Vec4(camera.forward(), 0.0f)));
+    poseClick_ = poseTarget_ = local;
+    poseRadius_ = radius;
+    pendingPose_.reset();
+    pendingPoseNs_ = 0;
+    poseSkipNext_ = false;
+    statusMessage = "Pose: drag to turn";
+    if (sculptor_.poseBuild()->missingOps != 0) statusMessage += " (some symmetric copies found no surface)";
+    if (timestampNs != 0 && (oldestInputThisFrameNs_ == 0 || timestampNs < oldestInputThisFrameNs_))
+      oldestInputThisFrameNs_ = timestampNs;
+    return;
+  }
   sculptor_.beginStroke(*obj, *brush, opts, label);
   if (!sculptor_.active()) return;
   if (sculptor_.topologyOffForCopies())
@@ -722,15 +753,19 @@ void App::continueStroke(float x, float y, std::uint64_t timestampNs) {
   }
   if (strokeBrush_ == BrushKind::SnakeHook) {
     // Like Grab, only the latest cursor matters; the hook chases it frame by frame.
-    SceneObject* obj = sculptor_.object();
-    const Ray ray = camera.rayThroughPixel(x - vpX_, y - vpY_);
-    const float denom = glm::dot(ray.dir, grabPlaneNormal_);
-    if (!obj || std::abs(denom) < 1e-8f) return;
-    const float t = glm::dot(grabStartWorld_ - ray.origin, grabPlaneNormal_) / denom;
-    const Mat4 inv = glm::inverse(obj->transform.matrix());
-    snakeTarget_ = {Vec3(inv * Vec4(ray.origin + ray.dir * t, 1.0f)), currentPressure()};
+    const std::optional<Vec3> point = dragPlanePoint(x, y);
+    if (!point) return;
+    snakeTarget_ = {*point, currentPressure()};
     if (snakeTargetNs_ == 0) snakeTargetNs_ = timestampNs;
     snakeSettled_ = false;
+    return;
+  }
+  if (strokeBrush_ == BrushKind::Pose) {
+    // The parts turn toward the latest cursor once per frame.
+    const std::optional<Vec3> point = dragPlanePoint(x, y);
+    if (!point) return;
+    pendingPose_ = *point;
+    if (pendingPoseNs_ == 0) pendingPoseNs_ = timestampNs;
     return;
   }
   samples_.clear();
@@ -738,6 +773,16 @@ void App::continueStroke(float x, float y, std::uint64_t timestampNs) {
   sampler_.moveTo({x - vpX_, y - vpY_, currentPressure()}, samples_);
   for (const StrokeSample& smp : samples_)
     pendingSamples_.push_back({smp, camera.rayThroughPixel(smp.x, smp.y), timestampNs});
+}
+
+std::optional<Vec3> App::dragPlanePoint(float x, float y) const {
+  const SceneObject* obj = sculptor_.object();
+  const Ray ray = camera.rayThroughPixel(x - vpX_, y - vpY_);
+  const float denom = glm::dot(ray.dir, grabPlaneNormal_);
+  if (!obj || std::abs(denom) < 1e-8f) return std::nullopt;
+  const float t = glm::dot(grabStartWorld_ - ray.origin, grabPlaneNormal_) / denom;
+  const Mat4 inv = glm::inverse(obj->transform.matrix());
+  return Vec3(inv * Vec4(ray.origin + ray.dir * t, 1.0f));
 }
 
 void App::noteInput(std::uint64_t timestampNs) {
@@ -752,10 +797,30 @@ void App::tickStroke(bool flush) {
     pendingSamples_.clear();
     pendingGrab_.reset();
     pendingGrabNs_ = 0;
+    pendingPose_.reset();
+    pendingPoseNs_ = 0;
     return;
   }
   if (strokeBrush_ == BrushKind::SnakeHook) {
     tickSnake(kStrokeTickBudgetMs);
+    return;
+  }
+  if (strokeBrush_ == BrushKind::Pose) {
+    if (!pendingPose_) return;
+    // After a slow turn one frame shows before the next, so the view keeps up on huge parts.
+    if (poseSkipNext_ && !flush) {
+      poseSkipNext_ = false;
+      return;
+    }
+    sculptor_.pose(*pendingPose_, poseViewNormal_);
+    poseTarget_ = *pendingPose_;
+    pendingPose_.reset();
+    ++dabsThisFrame_;
+    stats.dabMs = sculptor_.lastDab().totalMs;
+    poseSkipNext_ = stats.dabMs > kPoseSkipMs;
+    noteInput(pendingPoseNs_);
+    pendingPoseNs_ = 0;
+    statusMessage = "Pose, " + std::to_string(std::lround(sculptor_.poseAngle())) + " degrees";
     return;
   }
   if (strokeBrush_ == BrushKind::Grab) {
@@ -819,6 +884,32 @@ void App::tickSnake(double budgetMs) {
   if (step.subDabs == 0 || step.remaining < 1e-3f * radius) snakeSettled_ = true;
 }
 
+StrokeOptions App::strokeOptions(const SceneObject& obj, BrushKind brush, bool ctrl) const {
+  const bool masking = brush == BrushKind::Mask;
+  StrokeOptions opts;
+  opts.falloff = sculpt.falloff;
+  const SymmetrySpec symmetry = sculpt.symmetry();
+  opts.symmetryX = symmetry.x;
+  opts.symmetryY = symmetry.y;
+  opts.symmetryZ = symmetry.z;
+  opts.radialAxis = symmetry.radialAxis;
+  opts.radialCount = symmetry.radialCount;
+  opts.strength = sculpt.strength[static_cast<int>(brush)];
+  // The Mask brush ignores Add/Subtract: it paints, and erases with Ctrl or the pen's eraser end.
+  opts.invert = masking ? ctrl || (pen.down && pen.eraser) : sculpt.invert != ctrl;
+  opts.dyntopo = sculpt.dyntopo;  // The sculptor ignores it for Grab, Pose, Mask and Face Set.
+  opts.dyntopoOptions.refine = sculpt.dyntopoRefine;
+  opts.faceSetAutoMask = sculpt.faceSetAutoMask;
+  opts.lockFaceSetBoundaries = sculpt.lockFaceSetBorders;
+  // The Face Set brush starts a new set per stroke; Ctrl grows the set under the cursor instead.
+  opts.extendFaceSet = ctrl;
+  // Sculpting brushes write the active sculpt layer (or the base); mask and face set brushes
+  // never do.
+  opts.layerTarget = obj.mesh.layers.active;
+  opts.smoothLayerOnly = sculpt.smoothLayerOnly;
+  return opts;
+}
+
 void App::applySample(const StrokeSample& smp, const Ray& world) {
   SceneObject* obj = sculptor_.object();
   if (!obj) return;
@@ -853,6 +944,8 @@ void App::endStroke() {
   tickStroke(true);  // Every sample and the last Grab or Snake Hook cursor land before the stroke ends.
   const SceneObject* obj = sculptor_.object();
   const bool levels = obj && obj->multires;
+  const std::size_t poseGroups = sculptor_.poseBuild() ? sculptor_.poseBuild()->rigs.size() : 0;
+  const float poseAngle = sculptor_.poseAngle();
   auto entry = sculptor_.endStroke();
   const StrokeTopologyStats& topo = sculptor_.lastStrokeTopology();
   if (entry) {
@@ -860,6 +953,10 @@ void App::endStroke() {
     const int dabs = sculptor_.dabCount();
     const std::string label = std::visit([](const auto& e) { return e.label; }, *entry);
     statusMessage = label + " stroke, " + std::to_string(dabs) + (strokeBrush_ == BrushKind::Grab || strokeBrush_ == BrushKind::SnakeHook ? " moves" : " dabs");
+    if (poseGroups > 0) {
+      statusMessage = label + ", " + std::to_string(std::lround(poseAngle)) + " degrees";
+      if (poseGroups > 1) statusMessage += ", " + std::to_string(poseGroups) + " groups";
+    }
     if (topo.dyntopo) {
       const long long diff = static_cast<long long>(topo.facesAfter) - topo.facesBefore;
       statusMessage += ", " + std::string(diff >= 0 ? "+" : "") + std::to_string(diff) + " faces";
@@ -871,7 +968,7 @@ void App::endStroke() {
     statusMessage = "Stroke could not be recorded for undo; earlier history was cut";
   }
   if (sculpt.dyntopo && levels && entry && strokeBrush_ != BrushKind::Grab && strokeBrush_ != BrushKind::Mask &&
-      strokeBrush_ != BrushKind::FaceSet)
+      strokeBrush_ != BrushKind::FaceSet && strokeBrush_ != BrushKind::Pose)
     statusMessage += " (dynamic topology is off on objects with subdivision levels)";
   if (topo.outOfRoom) statusMessage += " (dynamic topology stopped: stroke too large)";
   if (topo.tooManyCopies) statusMessage += " (dynamic topology is off above 24 symmetry copies)";
@@ -941,17 +1038,129 @@ void App::symmetryCursors(const CursorMarker& primary, std::vector<CursorMarker>
 
 SculptOverlay App::sculptOverlay() const {
   SculptOverlay o;
-  const SceneObject* obj = scene.find(selectedId);
-  if (mode != Mode::Sculpt || !view.symmetryPlanes || !obj) return o;
-  const SymmetrySpec spec = sculpt.symmetry();
-  if (!(cursorGroup_.spec() == spec)) cursorGroup_ = SymmetryGroup(spec);
-  o.planes = true;
-  o.model = obj->transform.matrix();
-  o.boundsMin = obj->bvh.bounds().min;
-  o.boundsMax = obj->bvh.bounds().max;
-  o.mirrorBits = cursorGroup_.mirrorPlanes();
-  o.radialAxis = spec.radialCount > 1 ? static_cast<int>(spec.radialAxis) : -1;
+  if (mode != Mode::Sculpt) return o;
+  if (const SceneObject* obj = scene.find(selectedId); obj && view.symmetryPlanes) {
+    const SymmetrySpec spec = sculpt.symmetry();
+    if (!(cursorGroup_.spec() == spec)) cursorGroup_ = SymmetryGroup(spec);
+    o.planes = true;
+    o.model = obj->transform.matrix();
+    o.boundsMin = obj->bvh.bounds().min;
+    o.boundsMax = obj->bvh.bounds().max;
+    o.mirrorBits = cursorGroup_.mirrorPlanes();
+    o.radialAxis = spec.radialCount > 1 ? static_cast<int>(spec.radialAxis) : -1;
+  }
+  poseOverlay(o);
   return o;
+}
+
+// ---- Pose ------------------------------------------------------------------------------------
+
+float App::poseRadius(const SceneObject& obj, const Vec3& world) const {
+  const float scale = (obj.transform.scale.x + obj.transform.scale.y + obj.transform.scale.z) / 3.0f;
+  return camera.worldPerPixel(world) * sculpt.radiusPx / std::max(scale, 1e-6f);
+}
+
+App::PoseKey App::poseKey(const SceneObject& obj) const {
+  PoseKey k;
+  k.objectId = obj.id;
+  k.editCounter = editCounter_;  // Every recorded edit, mask and visibility included.
+  k.topologyVersion = obj.topologyVersion;
+  k.model = obj.transform.matrix();
+  k.symmetry = sculpt.symmetry();
+  k.options = poseOptions();
+  k.faceSetAutoMask = sculpt.faceSetAutoMask;
+  k.lockFaceSetBorders = sculpt.lockFaceSetBorders;
+  return k;
+}
+
+bool App::posePreviewMatches(const SceneObject& obj, const Vec3& click, float radius, float px) const {
+  if (!posePreview_.built || !(posePreview_.key == poseKey(obj))) return false;
+  if (!(std::abs(radius - posePreview_.radius) <= 0.01f * radius)) return false;
+  // Screen pixels in object units at this radius.
+  return glm::distance(click, posePreview_.click) <= px * radius / std::max(sculpt.radiusPx, 1.0f);
+}
+
+void App::updatePosePreview() {
+  const std::uint64_t now = SDL_GetTicksNS();
+  if (std::hypot(mouseX_ - restX_, mouseY_ - restY_) > 2.0f) {
+    restX_ = mouseX_;
+    restY_ = mouseY_;
+    restSinceNs_ = now;
+  }
+  if (sculpt.brush != BrushKind::Pose || mode != Mode::Sculpt) {
+    if (posePreview_.built) posePreview_ = PosePreview{};  // Gives its memory back.
+    return;
+  }
+  if (sculptor_.active() || drag_ != Drag::None || !hover_ || adjustingRadius_ || adjustingDetail_) return;
+  if (static_cast<double>(now - restSinceNs_) / 1e6 < kPosePreviewRestMs) return;
+  const SceneObject* obj = scene.find(hover_->objectId);
+  if (!obj) return;
+  const Vec3 click = hover_->localHit.position;
+  const float radius = poseRadius(*obj, hover_->worldPosition);
+  if (posePreviewMatches(*obj, click, radius, kPoseRebuildPx)) return;
+  // Serial and capped: a worker would race with strokes and undo. A build that runs out of time
+  // shows only the ring, and the press builds in full.
+  PosePreview p;
+  p.built = true;
+  p.key = poseKey(*obj);
+  p.click = click;
+  p.radius = radius;
+  p.build = buildPoseFor(*obj, strokeOptions(*obj, BrushKind::Pose, false), poseOptions(), click, radius,
+                         {kPosePreviewCapMs, 0}, poseFans_);
+  posePreview_ = std::move(p);
+}
+
+void App::poseOverlay(SculptOverlay& o) const {
+  const bool dragging = sculptor_.active() && strokeBrush_ == BrushKind::Pose;
+  const PoseBuild* build = nullptr;
+  const SceneObject* obj = nullptr;
+  if (dragging) {
+    build = sculptor_.poseBuild();
+    obj = sculptor_.object();
+  } else if (sculpt.brush == BrushKind::Pose && !sculptor_.active() && hover_ && posePreview_.built &&
+             posePreview_.build.failure == PoseFailure::None) {
+    obj = scene.find(hover_->objectId);
+    if (obj && posePreviewMatches(*obj, hover_->localHit.position, poseRadius(*obj, hover_->worldPosition),
+                                  kPoseRebuildPx))
+      build = &posePreview_.build;
+  }
+  if (!build || !obj || build->rigs.empty()) return;
+  const Mat4 model = obj->transform.matrix();
+  auto world = [&](const Vec3& p) { return Vec3(model * Vec4(p, 1.0f)); };
+  // The renderer keeps the first 26 vertices for plane outlines and the radial axis.
+  const std::size_t budget = Renderer::kMaxOverlayVertices - 26;
+  std::vector<Vec3>& pts = o.points;
+  const Vec3 r = dragging ? poseRotation(poseClick_, build->rigs[0].pivot, poseTarget_, poseViewNormal_) : Vec3{0.0f};
+  // A cross at each joint and, while dragging, the axis each part turns about.
+  for (const PoseRig& rig : build->rigs) {
+    if (pts.size() + 8 > budget) break;
+    const Vec3 c = world(rig.pivot);
+    const float arm = camera.worldPerPixel(c) * 6.0f;
+    for (int a = 0; a < 3; ++a) {
+      Vec3 d{0.0f};
+      d[a] = arm;
+      pts.push_back(c - d);
+      pts.push_back(c + d);
+    }
+    const Vec3 axis = transform(rig.cluster.axial, r);
+    if (glm::length(axis) > 1e-6f) {
+      const Vec3 half = glm::normalize(axis) * (0.75f * poseRadius_);
+      pts.push_back(world(rig.pivot - half));
+      pts.push_back(world(rig.pivot + half));
+    }
+  }
+  // The joint loops share what is left, every stride-th segment when they do not all fit.
+  const std::size_t left = budget > pts.size() ? budget - pts.size() : 0;
+  const std::size_t share = left / build->rigs.size() / 2;  // Segments per loop.
+  if (share == 0) return;
+  for (const PoseRig& rig : build->rigs) {
+    const std::size_t segments = rig.rootLoop.size() / 2;
+    const std::size_t stride = (segments + share - 1) / share;
+    for (std::size_t s = 0; s < segments; s += stride) {
+      pts.push_back(world(rig.rootLoop[2 * s]));
+      pts.push_back(world(rig.rootLoop[2 * s + 1]));
+    }
+  }
 }
 
 float App::detailSizeAt(const SceneObject& obj, const Vec3& worldPoint) const {
@@ -973,6 +1182,7 @@ const Brush* App::brushFor(BrushKind kind) const {
     case BrushKind::FaceSet: return &faceSetBrush_;
     case BrushKind::EraseLayer: return &eraseLayerBrush_;
     case BrushKind::SnakeHook: return &snakeBrush_;
+    case BrushKind::Pose: return nullptr;
   }
   return nullptr;
 }

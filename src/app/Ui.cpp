@@ -219,6 +219,7 @@ void App::drawUi() {
       ImGui::TextUnformatted("L                   Show / hide the active sculpt layer");
       ImGui::TextUnformatted("E                   Erase Layer brush");
       ImGui::TextUnformatted("K                   Snake Hook brush (pulls the surface after the cursor)");
+      ImGui::TextUnformatted("O                   Pose brush (turns a part about its joint)");
       ImGui::TextUnformatted("F / R + move        Brush radius / detail size");
       ImGui::TextUnformatted("X / Y / Z           Mirror X / Y / Z on or off");
       ImGui::EndMenu();
@@ -271,11 +272,14 @@ void App::drawUi() {
 
       ImGui::SetNextItemWidth(-1);
       ImGui::SliderFloat("##radius", &sculpt.radiusPx, 2.0f, 1000.0f, "radius %.0f px", ImGuiSliderFlags_Logarithmic);
-      float& strength = sculpt.strength[static_cast<int>(sculpt.brush)];
-      ImGui::SetNextItemWidth(-1);
-      // Snake Hook's strength is how tightly the hook follows the cursor.
-      ImGui::SliderFloat("##strength", &strength, 0.0f, 1.0f,
-                         sculpt.brush == BrushKind::SnakeHook ? "follow %.2f" : "strength %.2f");
+      // Pose turns as far as the cursor goes, so it has no strength.
+      if (sculpt.brush != BrushKind::Pose) {
+        float& strength = sculpt.strength[static_cast<int>(sculpt.brush)];
+        ImGui::SetNextItemWidth(-1);
+        // Snake Hook's strength is how tightly the hook follows the cursor.
+        ImGui::SliderFloat("##strength", &strength, 0.0f, 1.0f,
+                           sculpt.brush == BrushKind::SnakeHook ? "follow %.2f" : "strength %.2f");
+      }
       if (sculpt.brush == BrushKind::Mask) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
         ImGui::TextWrapped("Masked areas are protected from every brush. Ctrl+drag: erase. Shift+drag: smooth mask.");
@@ -296,6 +300,22 @@ void App::drawUi() {
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
         ImGui::TextWrapped("Pulls the surface after the cursor. Works best with Dynamic topology (Ctrl+D).");
         ImGui::PopStyleColor();
+      } else if (sculpt.brush == BrushKind::Pose) {
+        int pm = static_cast<int>(sculpt.poseMode);
+        ImGui::RadioButton("Topology", &pm, 0);
+        ImGui::SameLine();
+        ImGui::RadioButton("Mask##posemode", &pm, 1);
+        sculpt.poseMode = static_cast<PoseMode>(pm);
+        ImGui::SetNextItemWidth(-1);
+        ImGui::SliderFloat("##softness", &sculpt.poseSoftness, 0.0f, 1.0f, "joint softness %.2f");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("How wide the bend at the joint is, as a share of the radius.");
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextWrapped(sculpt.poseMode == PoseMode::Topology
+                               ? "The joint sits one brush radius from where you press. Press near the end of a "
+                                 "part and drag to turn it."
+                               : "The unmasked part turns about the mask border. Mask what should stay, then drag "
+                                 "the free part.");
+        ImGui::PopStyleColor();
       } else if (sculpt.brush != BrushKind::Smooth && sculpt.brush != BrushKind::Grab) {
         int inv = sculpt.invert ? 1 : 0;
         ImGui::RadioButton("Add", &inv, 0);
@@ -311,9 +331,11 @@ void App::drawUi() {
       }
       static const char* kFalloffs[] = {"Smooth falloff", "Sharp falloff", "Linear falloff", "Constant falloff"};
       int f = static_cast<int>(sculpt.falloff);
-      ImGui::SetNextItemWidth(-1);
-      if (ImGui::Combo("##falloff", &f, kFalloffs, 4)) sculpt.falloff = static_cast<Falloff>(f);
-      if (sculpt.brush != BrushKind::Grab && sculpt.brush != BrushKind::SnakeHook) {
+      if (sculpt.brush != BrushKind::Pose) {  // Pose bends across the joint softness instead.
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::Combo("##falloff", &f, kFalloffs, 4)) sculpt.falloff = static_cast<Falloff>(f);
+      }
+      if (sculpt.brush != BrushKind::Grab && sculpt.brush != BrushKind::SnakeHook && sculpt.brush != BrushKind::Pose) {
         ImGui::SetNextItemWidth(-1);
         ImGui::SliderFloat("##spacing", &sculpt.spacing, 0.02f, 1.0f, "spacing %.2f");
       }
@@ -401,8 +423,8 @@ void App::drawUi() {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.8f, 0.4f, 1.0f));
         ImGui::TextWrapped("This object has sculpt layers, so strokes are refused. Turn this off or apply all layers.");
         ImGui::PopStyleColor();
-      } else if (sculpt.dyntopo && (sculpt.brush == BrushKind::Grab || sculpt.brush == BrushKind::Mask ||
-                                    sculpt.brush == BrushKind::FaceSet)) {
+      } else if (sculpt.dyntopo && (sculpt.brush == BrushKind::Grab || sculpt.brush == BrushKind::Pose ||
+                                    sculpt.brush == BrushKind::Mask || sculpt.brush == BrushKind::FaceSet)) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
         ImGui::TextWrapped("%s does not change topology.", kBrushLabels[static_cast<int>(sculpt.brush)]);
         ImGui::PopStyleColor();
