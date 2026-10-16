@@ -1,9 +1,11 @@
 #pragma once
 
+#include <cmath>
 #include <cstdint>
 #include <span>
 
 #include "mesh/Mesh.h"
+#include "sculpt/Symmetry.h"
 #include "spatial/Bvh.h"
 
 namespace plegl {
@@ -74,6 +76,31 @@ struct LayerTarget {
   float strength = 1.0f;
 };
 
+// How symmetric copies of one dab share the vertices they overlap on. A vertex within reach of two
+// or more copies has a slot; each copy scales its move there by f^p / sum of f^p over the copies
+// (f: the copy's raw falloff), so the shares add up to 1 and copies never stack. Moves into
+// deferred slots wait in `pending` until every copy has run, so no copy reads another's writes.
+// Vertices without a slot (slotOf -1) take a share of 1 and are written at once.
+struct ShareView {
+  const std::uint32_t* stamp = nullptr;
+  std::uint32_t current = 0;
+  const std::uint32_t* slot = nullptr;
+  const float* denom = nullptr;
+  const std::uint8_t* count = nullptr;
+  Vec3* pending = nullptr;         // Position moves, or layer offset changes for layer brushes.
+  float* pendingScalar = nullptr;  // Mask changes.
+  float exponent = kShareExponent;
+  bool deferAll = false;           // Brushes that read neighbours defer every slot.
+
+  std::int64_t slotOf(Index v) const { return stamp[v] == current ? static_cast<std::int64_t>(slot[v]) : -1; }
+  float share(std::int64_t s, float f) const {
+    if (s < 0) return 1.0f;
+    const float d = denom[s];
+    return d > 0.0f ? (exponent == 1.0f ? f : std::pow(f, exponent)) / d : 0.0f;
+  }
+  bool deferred(std::int64_t s) const { return s >= 0 && (deferAll || count[s] >= 2); }
+};
+
 // What a brush may touch: the mesh positions (or, for mask brushes, mask values, and for face set
 // brushes, face sets) owned by `leaves`.
 struct BrushContext {
@@ -84,7 +111,30 @@ struct BrushContext {
   FaceSetFilter filter;
   std::int32_t paintFaceSet = kDefaultFaceSet;  // The set a face set brush paints.
   LayerTarget* layer = nullptr;                 // Set for layer brushes only.
+  // Symmetric copies that overlap: how this copy shares vertices with the others (nullptr when
+  // no copy overlaps another, which keeps the plain arithmetic).
+  const ShareView* shares = nullptr;
+  // Face set brushes with several copies: a face claimed by an earlier copy in this dab
+  // (faceClaim[f] == claimStamp) keeps that copy's set.
+  std::uint32_t* faceClaim = nullptr;
+  std::uint32_t claimStamp = 0;
 };
+
+// Adds a position move (already clamped) for vertex v with raw falloff f, scaled by the vertex's
+// share and deferred when copies overlap there.
+inline void writeMove(BrushContext& ctx, Index v, float f, Vec3 move) {
+  if (!ctx.shares) {
+    ctx.mesh.positions[v] += move;
+    return;
+  }
+  const std::int64_t s = ctx.shares->slotOf(v);
+  move *= ctx.shares->share(s, f);
+  if (ctx.shares->deferred(s)) {
+    ctx.shares->pending[s] += move;
+  } else {
+    ctx.mesh.positions[v] += move;
+  }
+}
 
 // A brush moves vertices; it never changes topology, normals or bounds. The sculptor recomputes
 // those, records undo and marks GPU ranges afterwards, so new brushes only implement apply().
@@ -110,6 +160,8 @@ class Brush {
   // its composite. Other brushes move positions only; on a mesh with sculpt layers the sculptor
   // commits that movement into the stroke's target when the stroke ends.
   virtual bool writesLayer() const { return false; }
+  // True if apply() reads neighbouring vertices, so overlapping copies must defer every write.
+  virtual bool readsNeighbours() const { return false; }
   virtual void apply(BrushContext& ctx) const = 0;
 };
 
@@ -129,6 +181,7 @@ class DrawBrush final : public Brush {
 class SmoothBrush final : public Brush {
  public:
   const char* name() const override { return "Smooth"; }
+  bool readsNeighbours() const override { return true; }
   void apply(BrushContext& ctx) const override;
 };
 
@@ -181,6 +234,7 @@ class LayerSmoothBrush final : public Brush {
  public:
   const char* name() const override { return "Smooth"; }
   bool writesLayer() const override { return true; }
+  bool readsNeighbours() const override { return true; }
   void apply(BrushContext& ctx) const override;
 };
 
@@ -199,6 +253,7 @@ class MaskSmoothBrush final : public Brush {
  public:
   const char* name() const override { return "Smooth Mask"; }
   bool editsMask() const override { return true; }
+  bool readsNeighbours() const override { return true; }
   void apply(BrushContext& ctx) const override;
 };
 

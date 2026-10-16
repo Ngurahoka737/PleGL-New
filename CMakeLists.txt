@@ -48,6 +48,7 @@ add_library(plegl_engine STATIC
   src/engine/sculpt/Dyntopo.cpp
   src/engine/sculpt/LayerOps.cpp
   src/engine/sculpt/Normals.cpp
+  src/engine/sculpt/Symmetry.cpp
   src/engine/sculpt/MaskOps.cpp
   src/engine/sculpt/FaceSetOps.cpp
   src/engine/sculpt/Sculptor.cpp
@@ -114,6 +115,7 @@ if(PLEGL_BUILD_TESTS)
     tests/test_layers_multires.cpp
     tests/test_layers_io.cpp
     tests/test_settings.cpp
+    tests/test_symmetry.cpp
   )
   target_link_libraries(plegl_tests PRIVATE plegl_engine doctest::doctest plegl_warnings)
   add_test(NAME plegl_tests COMMAND plegl_tests)

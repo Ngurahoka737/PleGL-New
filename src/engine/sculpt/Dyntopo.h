@@ -8,17 +8,29 @@
 #include "core/Timer.h"
 #include "mesh/MeshEdit.h"
 #include "scene/Scene.h"
+#include "sculpt/Symmetry.h"
 #include "spatial/LeafLayout.h"
 
 namespace plegl {
 
 enum class DyntopoRefine : std::uint8_t { SplitCollapse, SplitOnly, CollapseOnly };
 
+// Symmetry planes and axes that topology edits keep vertices on: a vertex within eps of a mirror
+// plane (or of a rotation axis) never merges off it, and split midpoints between two such
+// vertices land exactly on it. Bits as in SymmetryGroup::mirrorPlanes / rotationAxes.
+struct DyntopoPins {
+  std::uint8_t planes = 0;
+  std::uint8_t axes = 0;
+  float eps = 0.0f;
+};
+
 struct DyntopoOptions {
   DyntopoRefine refine = DyntopoRefine::SplitCollapse;
   int maxSplits = 1024;       // Per pass.
   int maxCollapses = 1024;    // Per pass.
   double timeBudgetMs = 3.0;  // Per pass, on top of the counts. 0 turns it off (deterministic).
+  DyntopoPins pins{};         // Set by the sculptor for symmetric strokes.
+  int copies = 1;             // Symmetric passes per dab; two or more reserve twice the headroom.
 };
 
 // Topology request for one dab.
@@ -107,6 +119,9 @@ class DyntopoSession {
     Index h, a, b;
   };
 
+  std::uint8_t pinBits(const Vec3& p) const {
+    return (opt_.pins.planes | opt_.pins.axes) ? pinnedAxes(opt_.pins.planes, opt_.pins.axes, p, opt_.pins.eps) : 0;
+  }
   bool locked(Index v) const {
     return (v < static_cast<Index>(lock_.size()) && lock_[v]) || (!m_.mask.empty() && m_.mask[v] >= 0.5f);
   }

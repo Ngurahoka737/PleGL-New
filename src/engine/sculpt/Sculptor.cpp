@@ -5,6 +5,7 @@
 #include <cmath>
 #include <iterator>
 #include <span>
+#include <unordered_map>
 
 #include "core/Parallel.h"
 #include "core/Timer.h"
@@ -35,10 +36,20 @@ void Sculptor::beginStroke(SceneObject& object, const Brush& requested, const St
   beginLayers();
   // Subdivision levels keep their topology for life, so dynamic topology never runs on them; nor
   // does it on meshes with sculpt layers.
+  // Nor above kMaxDyntopoCopies symmetric copies: every copy would run its own pass.
   if (options.dyntopo && !object.multires && object.mesh.layers.empty() && !maskStroke_ && !faceSetStroke_ &&
       object.mesh.faceCount() > 0) {
-    dyntopo_ = std::make_unique<DyntopoSession>(object, options.dyntopoOptions);
-    mergedClaims_ = 0;
+    if (group_.size() > kMaxDyntopoCopies) {
+      tooManyCopies_ = true;
+    } else {
+      DyntopoOptions topo = options.dyntopoOptions;
+      if (group_.size() > 1) {
+        topo.pins = {group_.mirrorPlanes(), group_.rotationAxes(), pinEps_};
+        topo.copies = group_.size();
+      }
+      dyntopo_ = std::make_unique<DyntopoSession>(object, topo);
+      mergedClaims_ = 0;
+    }
   }
 }
 
@@ -50,10 +61,18 @@ void Sculptor::start(SceneObject& object, const StrokeOptions& options, std::str
   faceSetStroke_ = false;
   hidden_ = object.mesh.anyHidden();
   faceSetsResolved_ = false;
-  onlySet_[0] = onlySet_[1] = 0;
-  paintSet_[0] = paintSet_[1] = 0;
+  onlySet_.fill(0);
+  paintSet_.fill(0);
   grabVerts_.clear();
+  grabEntries_.clear();
+  grabPins_.clear();
   options_ = options;
+  tooManyCopies_ = false;
+  if (const SymmetrySpec spec = options.symmetry(); !(spec == group_.spec())) group_ = SymmetryGroup(spec);
+  {
+    const float diagonal = glm::length(object.bvh.bounds().extent());
+    pinEps_ = std::isfinite(diagonal) ? kPinTolerance * diagonal : 0.0f;
+  }
   layerArray_ = nullptr;
   layerTarget_ = {};
   undo_ = SculptUndo{};
@@ -136,55 +155,193 @@ bool Sculptor::dab(const Vec3& center, float radius, float strength, const DabTo
   d.falloff = options_.falloff;
   d.invert = options_.invert;
   if (!faceSetsResolved_) resolveFaceSets(center, radius);
-  bool any = applyOne(d, topology, 0);
-  if (options_.symmetryX) {
-    Dab mirrored = d;
-    mirrored.center.x = -mirrored.center.x;
-    // Skip the mirror when the dab sits on the plane, or the seam would get double strength.
-    if (std::abs(center.x) > radius * 0.05f) {
-      DabTopology mirroredTopology = topology;
-      if (dyntopo_ && topology.detail > 0.0f) {
-        Bvh::ClosestHit hit;
-        mirroredTopology.hintFace =
-            object_->bvh.closestPoint(object_->mesh, mirrored.center, radius, hit) ? hit.face : kInvalid;
-      }
-      any |= applyOne(mirrored, mirroredTopology, 1);
-    }
-  }
+  const bool any = applyCopies(prepareCopies(d, topology), {});
   lastDab_.totalMs = total.ms();
   if (any) ++dabCount_;
   return any;
+}
+
+int Sculptor::prepareCopies(const Dab& d, const DabTopology& topology) {
+  const int n = clusterCopies(group_, d.center, kCopyMergeFraction * d.radius, clusters_);
+  if (copies_.size() < static_cast<std::size_t>(n)) copies_.resize(static_cast<std::size_t>(n));
+  for (int i = 0; i < n; ++i) {
+    CopyDab& c = copies_[static_cast<std::size_t>(i)];
+    c.cluster = clusters_[static_cast<std::size_t>(i)];
+    c.dab = d;
+    c.dab.center = c.cluster.center;
+    c.topology = topology;
+    // The first copy has the face under the cursor; the others look for theirs.
+    if (i > 0 && dyntopo_ && topology.detail > 0.0f) {
+      Bvh::ClosestHit hit;
+      c.topology.hintFace =
+          object_->bvh.closestPoint(object_->mesh, c.dab.center, d.radius, hit) ? hit.face : kInvalid;
+    }
+    c.live = false;
+  }
+  lastDab_.copies = group_.size();
+  lastDab_.clusters = n;
+  return n;
+}
+
+OpMask Sculptor::pinOps(const Vec3& center, float radius) const {
+  // Ops whose fixed plane or axis comes within the reach of normal updates around this centre.
+  OpMask ops = 0;
+  const float reach = 1.25f * radius;
+  for (int k = 1; k < group_.size(); ++k)
+    if (glm::length(center - transform(group_.fixProjector(k), center)) < reach) ops |= OpMask{1} << k;
+  return ops;
+}
+
+bool Sculptor::pinCandidate(const Vec3& p, OpMask ops) const {
+  for (int k = 1; k < group_.size(); ++k)
+    if ((ops >> k & 1) && glm::length(p - transform(group_.fixProjector(k), p)) <= pinEps_) return true;
+  return false;
+}
+
+void Sculptor::collectPins(const CopyCluster& cluster, const Vec3& center, float radius,
+                           std::span<const Index> leaves) {
+  (void)cluster;
+  const OpMask ops = pinOps(center, radius);
+  if (!ops) return;
+  const Mesh& m = object_->mesh;
+  const float r2 = radius * radius;
+  for (Index li : leaves) {
+    const BvhLeaf& leaf = object_->bvh.leaves()[li];
+    for (Index v = leaf.vertBegin; v < leaf.vertEnd; ++v) {
+      const Vec3& p = m.positions[v];
+      const Vec3 d = p - center;
+      if (glm::dot(d, d) >= r2 || !pinCandidate(p, ops)) continue;
+      pins_.push_back({v, p, seamPin(group_, p, pinEps_)});
+    }
+  }
+}
+
+const ShareView* Sculptor::buildZone(int count, ShareView& view) {
+  // Copies that some other copy comes close to: a vertex within 1.2 r of two centres can be read
+  // by one copy after another moved it (moves are at most 0.2 r). Brushes that read neighbours
+  // look one edge further.
+  const bool readers = brush_->readsNeighbours();
+  const float r = copies_[0].dab.radius;
+  const float pairDist = (readers ? 2.5f : 2.4f) * r;
+  bool overlapping[kMaxSymmetryCopies] = {};
+  bool any = false;
+  for (int i = 0; i < count; ++i) {
+    const CopyDab& a = copies_[static_cast<std::size_t>(i)];
+    if (!a.live) continue;
+    for (int j = i + 1; j < count; ++j) {
+      const CopyDab& b = copies_[static_cast<std::size_t>(j)];
+      if (!b.live || glm::length(a.dab.center - b.dab.center) >= pairDist) continue;
+      overlapping[i] = overlapping[j] = true;
+      any = true;
+    }
+  }
+  if (!any) return nullptr;
+
+  Timer t;
+  const Mesh& m = object_->mesh;
+  ShareZone& z = zone_;
+  if (z.stamp.size() < m.positions.size()) {
+    z.stamp.resize(m.positions.size(), 0);
+    z.slot.resize(m.positions.size(), 0);
+  }
+  if (++z.current == 0) {
+    std::fill(z.stamp.begin(), z.stamp.end(), 0);
+    z.current = 1;
+  }
+  z.denom.clear();
+  z.count.clear();
+  z.verts.clear();
+  const float reach = r * (1.0f + kMaxDabMove);
+  const float reach2 = reach * reach;
+  const float r2 = r * r;
+  const float invR = 1.0f / r;
+  // Copies in order, leaves in query order and a serial sum: the shares do not depend on the
+  // number of threads.
+  for (int i = 0; i < count; ++i) {
+    const CopyDab& c = copies_[static_cast<std::size_t>(i)];
+    if (!c.live || !overlapping[i]) continue;
+    if (z.gathered.size() < c.leaves.size()) z.gathered.resize(c.leaves.size());
+    const Vec3 center = c.dab.center;
+    const Falloff falloff = c.dab.falloff;
+    parallelFor(0, c.leaves.size(), 1, [&](std::size_t b, std::size_t e) {
+      for (std::size_t k = b; k < e; ++k) {
+        auto& out = z.gathered[k];
+        out.clear();
+        const BvhLeaf& leaf = object_->bvh.leaves()[c.leaves[k]];
+        for (Index v = leaf.vertBegin; v < leaf.vertEnd; ++v) {
+          const Vec3 delta = m.positions[v] - center;
+          const float dist2 = glm::dot(delta, delta);
+          if (dist2 >= reach2) continue;
+          // The same falloff the brush computes for this vertex.
+          out.emplace_back(v, dist2 >= r2 ? 0.0f : falloffWeight(falloff, std::sqrt(dist2) * invR));
+        }
+      }
+    });
+    for (std::size_t k = 0; k < c.leaves.size(); ++k) {
+      for (const auto& [v, f] : z.gathered[k]) {
+        const float fp = kShareExponent == 1.0f ? f : std::pow(f, kShareExponent);
+        if (z.stamp[v] != z.current) {
+          z.stamp[v] = z.current;
+          z.slot[v] = static_cast<std::uint32_t>(z.verts.size());
+          z.verts.push_back(v);
+          z.denom.push_back(fp);
+          z.count.push_back(1);
+        } else {
+          const std::uint32_t s = z.slot[v];
+          z.denom[s] += fp;
+          if (z.count[s] < 255) ++z.count[s];
+        }
+      }
+    }
+  }
+  z.pending.assign(z.verts.size(), Vec3{0.0f});
+  if (maskStroke_) z.pendingScalar.assign(z.verts.size(), 0.0f);
+  view.stamp = z.stamp.data();
+  view.current = z.current;
+  view.slot = z.slot.data();
+  view.denom = z.denom.data();
+  view.count = z.count.data();
+  view.pending = z.pending.data();
+  view.pendingScalar = maskStroke_ ? z.pendingScalar.data() : nullptr;
+  view.deferAll = readers;
+  lastDab_.shareMs += t.ms();
+  return &view;
 }
 
 void Sculptor::resolveFaceSets(const Vec3& center, float radius) {
   faceSetsResolved_ = true;
   const Mesh& m = object_->mesh;
   const bool wantSet = options_.faceSetAutoMask || (faceSetStroke_ && options_.extendFaceSet);
-  std::int32_t under[2] = {0, 0};  // Set of the visible face under each side's first dab, 0 if none.
+  // Set of the visible face under each op's first dab, 0 if none.
+  std::array<std::int32_t, kMaxSymmetryCopies> under{};
+  const int ops = group_.size();
   if (wantSet && !m.faceSets.empty()) {
-    for (int side = 0; side < 2; ++side) {
-      const Vec3 c = side == 0 ? center : Vec3{-center.x, center.y, center.z};
+    for (int k = 0; k < ops; ++k) {
+      const Vec3 c = k == 0 ? center : transform(group_.op(k).L, center);
       Bvh::ClosestHit hit;
-      if (object_->bvh.closestPoint(m, c, radius, hit, true)) under[side] = faceSetId(m.faceSets[hit.face]);
+      if (object_->bvh.closestPoint(m, c, radius, hit, true))
+        under[static_cast<std::size_t>(k)] = faceSetId(m.faceSets[hit.face]);
     }
   } else if (wantSet) {
-    under[0] = under[1] = kDefaultFaceSet;  // Every face is in the default set.
+    under.fill(kDefaultFaceSet);  // Every face is in the default set.
   }
   // 0 (paint nothing) once ids run out.
   const std::int32_t fresh = faceSetStroke_ && !options_.extendFaceSet ? object_->newFaceSetId() : 0;
-  for (int side = 0; side < 2; ++side) {
-    if (options_.faceSetAutoMask) onlySet_[side] = under[side] != 0 ? under[side] : kNoFaceSet;
-    if (faceSetStroke_) paintSet_[side] = options_.extendFaceSet ? under[side] : fresh;  // One new set for both sides.
+  for (int k = 0; k < ops; ++k) {
+    const std::size_t i = static_cast<std::size_t>(k);
+    if (options_.faceSetAutoMask) onlySet_[i] = under[i] != 0 ? under[i] : kNoFaceSet;
+    if (faceSetStroke_) paintSet_[i] = options_.extendFaceSet ? under[i] : fresh;  // One new set for every op.
   }
 }
 
-FaceSetFilter Sculptor::filter(int side) const {
+FaceSetFilter Sculptor::filter(int op) const {
   FaceSetFilter f;
   const Mesh& m = object_->mesh;
-  if (m.faceSets.empty() || (!hidden_ && onlySet_[side] == 0 && !options_.lockFaceSetBoundaries)) return f;
+  const std::int32_t only = onlySet_[static_cast<std::size_t>(op)];
+  if (m.faceSets.empty() || (!hidden_ && only == 0 && !options_.lockFaceSetBoundaries)) return f;
   f.faceSets = m.faceSets.data();
   f.skipHidden = hidden_;
-  f.onlySet = onlySet_[side];
+  f.onlySet = only;
   f.lockBoundaries = options_.lockFaceSetBoundaries;
   return f;
 }
@@ -239,75 +396,184 @@ void Sculptor::applyTopology(const Dab& dab, const DabTopology& topology) {
   lastDab_.topologyMs += t.ms();
 }
 
-bool Sculptor::applyOne(const Dab& dabIn, const DabTopology& topology, int side) {
+bool Sculptor::applyCopies(int count, const ApplyFlags& flags) {
   Mesh& m = object_->mesh;
   Bvh& bvh = object_->bvh;
-  Dab dab = dabIn;
-  if (faceSetStroke_ && paintSet_[side] == 0) return false;  // No set to continue on this side.
-  // The topology pass honours the face set limits too; with no set under this side's first dab
-  // there is nothing it may change.
-  if (dyntopo_ && topology.detail > 0.0f && onlySet_[side] != kNoFaceSet) {
-    DabTopology limited = topology;
-    limited.onlySet = onlySet_[side];
-    limited.lockFaceSetBorders = options_.lockFaceSetBoundaries;
-    applyTopology(dab, limited);
+  const auto copy = [&](int i) -> CopyDab& { return copies_[static_cast<std::size_t>(i)]; };
+  // The topology pass honours the face set limits too; with no set under an op's first dab there
+  // is nothing it may change, and a face set stroke with nothing to continue skips the op.
+  const auto skipped = [&](const CopyDab& c) { return faceSetStroke_ && paintSet_[c.cluster.op] == 0; };
+
+  // Phase 0: topology, copy by copy, each pass seeing the edits of the passes before it. The time
+  // budget is split so symmetric strokes spend at most twice a single pass.
+  if (dyntopo_) {
+    int passes = 0;
+    for (int i = 0; i < count; ++i)
+      passes += !skipped(copy(i)) && copy(i).topology.detail > 0.0f && onlySet_[copy(i).cluster.op] != kNoFaceSet;
+    const double budget = options_.dyntopoOptions.timeBudgetMs;
+    const double perPass =
+        budget > 0.0 && passes > 0 ? std::max(0.25, std::min(2.0 * budget, budget * passes) / passes) : -1.0;
+    for (int i = 0; i < count; ++i) {
+      CopyDab& c = copy(i);
+      const std::int32_t only = onlySet_[c.cluster.op];
+      if (skipped(c) || c.topology.detail <= 0.0f || only == kNoFaceSet) continue;
+      DabTopology limited = c.topology;
+      limited.onlySet = only;
+      limited.lockFaceSetBorders = options_.lockFaceSetBoundaries;
+      limited.timeBudgetMs = perPass;
+      applyTopology(c.dab, limited);
+    }
   }
 
-  leaves_.clear();
-  bvh.querySphere(dab.center, dab.radius, leaves_);
-  if (leaves_.empty()) return false;
-  const FaceSetFilter faceSetFilter = filter(side);  // After the topology pass: it may grow the array.
-  if (brush_->needsArea() && !computeArea(dab, leaves_, faceSetFilter)) return false;  // No vertex inside the dab.
-  for (Index l : leaves_) snapshot(l);
+  // Phase A: every copy queries, measures its area and snapshots before any copy writes.
+  const bool positions = !maskStroke_ && !faceSetStroke_;
+  const bool pinning = positions && group_.size() > 1 && !brush_->writesLayer();
+  pins_.clear();
+  int live = 0;
+  for (int i = 0; i < count; ++i) {
+    CopyDab& c = copy(i);
+    c.live = false;
+    if (skipped(c)) continue;
+    c.leaves.clear();
+    bvh.querySphere(c.dab.center, c.dab.radius, c.leaves);
+    if (c.leaves.empty()) continue;
+    c.filter = filter(c.cluster.op);  // After the topology pass: it may grow the array.
+    c.paintSet = paintSet_[c.cluster.op];
+    if (brush_->needsArea()) {
+      if (!computeArea(c.dab, c.leaves, c.filter)) continue;  // No vertex inside the dab.
+      if (c.cluster.merged()) {
+        // Merged copies agree only on part of the area: keep the normal and centre on the plane or
+        // axis they share.
+        const Vec3 n = c.cluster.projectLocal(c.dab.areaNormal);
+        if (glm::length(n) >= 0.1f) c.dab.areaNormal = glm::normalize(n);
+        c.dab.areaCenter = c.cluster.projectLocal(c.dab.areaCenter);
+      }
+    }
+    for (Index l : c.leaves) snapshot(l);
+    if (pinning) collectPins(c.cluster, c.dab.center, c.dab.radius, c.leaves);
+    c.live = true;
+    ++live;
+  }
+  if (live == 0) return false;
+  if (pins_.size() > 1) {
+    std::sort(pins_.begin(), pins_.end(), [](const PinnedVertex& a, const PinnedVertex& b) { return a.v < b.v; });
+    pins_.erase(std::unique(pins_.begin(), pins_.end(),
+                            [](const PinnedVertex& a, const PinnedVertex& b) { return a.v == b.v; }),
+                pins_.end());
+  }
 
+  // Phase Z: shares where copies overlap.
+  ShareView view;
+  const ShareView* shares = live >= 2 && !faceSetStroke_ ? buildZone(count, view) : nullptr;
+  std::uint32_t* claims = nullptr;
+  if (faceSetStroke_ && live >= 2) {
+    if (faceClaim_.size() < static_cast<std::size_t>(m.faceCount())) faceClaim_.resize(static_cast<std::size_t>(m.faceCount()), 0);
+    if (++claimStamp_ == 0) {
+      std::fill(faceClaim_.begin(), faceClaim_.end(), 0);
+      claimStamp_ = 1;
+    }
+    claims = faceClaim_.data();
+  }
+
+  // Phase B: the brush, copy by copy.
   Timer t;
-  BrushContext ctx{m, bvh, leaves_, dab, faceSetFilter, paintSet_[side],
-                   brush_->writesLayer() && layerArray_ ? &layerTarget_ : nullptr};
-  brush_->apply(ctx);
+  LayerTarget* layer = brush_->writesLayer() && layerArray_ ? &layerTarget_ : nullptr;
+  for (int i = 0; i < count; ++i) {
+    CopyDab& c = copy(i);
+    if (!c.live) continue;
+    BrushContext ctx{m, bvh, c.leaves, c.dab, c.filter, c.paintSet, layer, shares, claims, claimStamp_};
+    brush_->apply(ctx);
+  }
+
+  // Phase B2: moves that waited for every copy.
+  if (shares) {
+    const ShareZone& z = zone_;
+    parallelFor(0, z.verts.size(), 4096, [&](std::size_t b, std::size_t e) {
+      for (std::size_t s = b; s < e; ++s) {
+        if (!view.deferred(static_cast<std::int64_t>(s))) continue;
+        const Index v = z.verts[s];
+        if (maskStroke_) {
+          if (z.pendingScalar[s] != 0.0f) m.mask[v] = std::clamp(m.mask[v] + z.pendingScalar[s], 0.0f, 1.0f);
+          continue;
+        }
+        const Vec3& move = z.pending[s];
+        if (isZero(move)) continue;
+        if (layer) {
+          Vec3& o = (*layer->offset)[v];
+          o.x = o.x + move.x;
+          o.y = o.y + move.y;
+          o.z = o.z + move.z;
+          m.positions[v] = composeVertex(*layer->stack, v);
+        } else {
+          m.positions[v] += move;
+        }
+      }
+    });
+  }
+
+  // Phase P: vertices that started on a symmetry plane or axis go back onto it.
+  for (const PinnedVertex& pin : pins_) m.positions[pin.v] = snapPinned(pin.pin, pin.start, m.positions[pin.v]);
+  lastDab_.pinned = static_cast<int>(pins_.size());
   lastDab_.brushMs += t.ms();
 
   if (maskStroke_ || faceSetStroke_) {  // Positions did not move: no normals, bounds or geometry upload.
-    for (Index l : leaves_) {
-      if (maskStroke_) {
-        object_->markMaskDirty(l);
-      } else {
-        object_->markFaceSetDirty(l);
+    for (int i = 0; i < count; ++i) {
+      const CopyDab& c = copy(i);
+      if (!c.live) continue;
+      for (Index l : c.leaves) {
+        if (maskStroke_) {
+          object_->markMaskDirty(l);
+        } else {
+          object_->markFaceSetDirty(l);
+        }
       }
+      lastDab_.leaves += static_cast<int>(c.leaves.size());
     }
-    lastDab_.leaves += static_cast<int>(leaves_.size());
     return true;
   }
 
-  // Brushes only move vertices inside the dab sphere. Every face touching such a vertex lies in a
-  // queried leaf (its bounds contain the vertex), so the vertices of those faces are exactly the
-  // ones whose normals can have changed. Positions are read after the brush ran, so the sphere
-  // test uses a slightly larger radius to cover vertices that moved outward across it.
+  // Phase C, once for every copy: brushes only move vertices inside their dab sphere. Every face
+  // touching such a vertex lies in a queried leaf (its bounds contain the vertex), so the vertices
+  // of those faces are exactly the ones whose normals can have changed. Positions are read after
+  // the brush ran, so the sphere test uses a slightly larger radius to cover vertices that moved
+  // outward across it.
   t.reset();
   if (++stamp_ == 0) {
     std::fill(vertexStamp_.begin(), vertexStamp_.end(), 0);
     stamp_ = 1;
   }
   normalVerts_.clear();
-  const float reach = dab.radius * 1.25f;
-  const float reach2 = reach * reach;
+  leaves_.clear();
   const bool mayHaveDead = bvh.dynamic();
-  for (Index li : leaves_) {
-    const BvhLeaf& leaf = bvh.leaves()[li];
-    for (Index f = leaf.faceBegin; f < leaf.faceEnd; ++f) {
-      if (mayHaveDead && m.faceHe[f] == kInvalid) continue;
-      bool touched = false;
-      m.forEachFaceVertex(f, [&](Index v) {
-        const Vec3 d = m.positions[v] - dab.center;
-        touched |= glm::dot(d, d) < reach2;
-      });
-      if (!touched) continue;
-      m.forEachFaceVertex(f, [&](Index v) {
-        if (vertexStamp_[v] != stamp_) {
-          vertexStamp_[v] = stamp_;
-          normalVerts_.push_back(v);
-        }
-      });
+  for (int i = 0; i < count; ++i) {
+    const CopyDab& c = copy(i);
+    if (!c.live) continue;
+    const float reach = c.dab.radius * 1.25f;
+    const float reach2 = reach * reach;
+    const Vec3 center = c.dab.center;
+    leaves_.insert(leaves_.end(), c.leaves.begin(), c.leaves.end());
+    for (Index li : c.leaves) {
+      const BvhLeaf& leaf = bvh.leaves()[li];
+      for (Index f = leaf.faceBegin; f < leaf.faceEnd; ++f) {
+        if (mayHaveDead && m.faceHe[f] == kInvalid) continue;
+        bool touched = false;
+        m.forEachFaceVertex(f, [&](Index v) {
+          const Vec3 d = m.positions[v] - center;
+          touched |= glm::dot(d, d) < reach2;
+        });
+        if (!touched) continue;
+        m.forEachFaceVertex(f, [&](Index v) {
+          if (vertexStamp_[v] != stamp_) {
+            vertexStamp_[v] = stamp_;
+            normalVerts_.push_back(v);
+          }
+        });
+      }
     }
+  }
+  if (live > 1) {
+    std::sort(leaves_.begin(), leaves_.end());
+    leaves_.erase(std::unique(leaves_.begin(), leaves_.end()), leaves_.end());
   }
   // Vertices owned by leaves outside the query change normals too; snapshot and upload those.
   dirtyLeaves_.assign(leaves_.begin(), leaves_.end());
@@ -326,7 +592,11 @@ bool Sculptor::applyOne(const Dab& dabIn, const DabTopology& topology, int side)
       dirtyLeaves_.push_back(lastOwner);
     }
   }
-  recomputeNormals(normalVerts_);
+  if (flags.deferNormals) {
+    pendingNormals_.insert(pendingNormals_.end(), normalVerts_.begin(), normalVerts_.end());
+  } else {
+    recomputeNormals(normalVerts_);
+  }
   lastDab_.normalsMs += t.ms();
   lastDab_.vertices += static_cast<int>(normalVerts_.size());
   lastDab_.leaves += static_cast<int>(leaves_.size());
@@ -359,30 +629,67 @@ bool Sculptor::beginGrab(SceneObject& object, const StrokeOptions& options, cons
   const float strength = std::clamp(options.strength, 0.0f, 1.0f);
   resolveFaceSets(center, radius);
 
-  // Collect weights per vertex; a vertex can sit in both spheres when they overlap at the seam.
-  std::unordered_map<Index, std::size_t> slot;
-  auto capture = [&](const Vec3& c, bool mirror) {
+  // Every cluster of symmetric copies captures the vertices inside its sphere. A vertex inside
+  // several spheres splits between them by falloff, like a dab, so overlapping copies do not
+  // stack; on a plane the copies merge into one cluster whose pull stays in the plane.
+  const int clusters = clusterCopies(group_, center, kCopyMergeFraction * radius, grabClusters_);
+  grabClusterCount_ = clusters;
+  struct Hit {
+    Index v;
+    std::uint32_t cluster;
+    float weight;  // Strength, falloff and mask.
+    float share;   // Raw falloff, then the share.
+  };
+  std::vector<Hit> hits;
+  std::unordered_map<Index, float> shareSum;  // Vertex -> sum of f^p over clusters containing it.
+  const float r2 = radius * radius;
+  OpMask pinOpsAll = 0;
+  for (int k = 0; k < clusters; ++k) {
+    const CopyCluster& cl = grabClusters_[static_cast<std::size_t>(k)];
+    const Vec3 c = cl.center;
+    if (group_.size() > 1) pinOpsAll |= pinOps(c, radius);
     leaves_.clear();
     bvh.querySphere(c, radius, leaves_);
-    const float r2 = radius * radius;
-    const FaceSetFilter faceSetFilter = filter(mirror ? 1 : 0);
+    const FaceSetFilter faceSetFilter = filter(cl.op);
     for (Index li : leaves_) {
       const BvhLeaf& leaf = bvh.leaves()[li];
       for (Index v = leaf.vertBegin; v < leaf.vertEnd; ++v) {
         const Vec3 d = m.positions[v] - c;
         const float dist2 = glm::dot(d, d);
         if (dist2 >= r2) continue;
-        float w = strength * falloffWeight(options.falloff, std::sqrt(dist2) / radius);
+        const float f = falloffWeight(options.falloff, std::sqrt(dist2) / radius);
+        if (clusters > 1) shareSum[v] += kShareExponent == 1.0f ? f : std::pow(f, kShareExponent);
+        float w = strength * f;
         if (!m.mask.empty()) w *= 1.0f - m.mask[v];  // Fully masked vertices stay put.
         if (w <= 0.0f || !faceSetFilter.allows(m, v)) continue;
-        auto [it, inserted] = slot.try_emplace(v, grabVerts_.size());
-        if (inserted) grabVerts_.push_back({v, m.positions[v], 0.0f, 0.0f});
-        (mirror ? grabVerts_[it->second].mirrorWeight : grabVerts_[it->second].weight) += w;
+        hits.push_back({v, static_cast<std::uint32_t>(k), w, f});
       }
     }
-  };
-  capture(center, false);
-  if (options.symmetryX && std::abs(center.x) > radius * 0.05f) capture({-center.x, center.y, center.z}, true);
+  }
+  // Entries grouped by vertex, vertices in the order they were first captured.
+  std::unordered_map<Index, std::size_t> slot;
+  std::vector<std::vector<GrabEntry>> entries;
+  for (const Hit& hit : hits) {
+    float weight = hit.weight;
+    if (clusters > 1) {
+      const float f = hit.share;
+      const float denom = shareSum[hit.v];
+      weight *= denom > 0.0f ? (kShareExponent == 1.0f ? f : std::pow(f, kShareExponent)) / denom : 0.0f;
+    }
+    auto [it, inserted] = slot.try_emplace(hit.v, grabVerts_.size());
+    if (inserted) {
+      grabVerts_.push_back({hit.v, m.positions[hit.v], 0, 0});
+      entries.emplace_back();
+    }
+    entries[it->second].push_back({hit.cluster, weight});
+  }
+  for (std::size_t i = 0; i < grabVerts_.size(); ++i) {
+    grabVerts_[i].firstEntry = static_cast<std::uint32_t>(grabEntries_.size());
+    grabVerts_[i].entryCount = static_cast<std::uint32_t>(entries[i].size());
+    grabEntries_.insert(grabEntries_.end(), entries[i].begin(), entries[i].end());
+    if (pinOpsAll && pinCandidate(grabVerts_[i].start, pinOpsAll))
+      grabPins_.emplace_back(static_cast<std::uint32_t>(i), seamPin(group_, grabVerts_[i].start, pinEps_));
+  }
   if (grabVerts_.empty()) {
     object_ = nullptr;
     return false;
@@ -430,15 +737,30 @@ void Sculptor::grab(const Vec3& offset) {
   Timer total;
   lastDab_ = {};
   Mesh& m = object_->mesh;
-  const Vec3 mirrored{-offset.x, offset.y, offset.z};
+  // The offset as each cluster sees it: mirrored, turned, and on a plane projected into it.
+  std::array<Vec3, kMaxSymmetryCopies> moves;
+  for (int k = 0; k < grabClusterCount_; ++k)
+    moves[static_cast<std::size_t>(k)] = transform(grabClusters_[static_cast<std::size_t>(k)].polar, offset);
   Timer t;
   parallelFor(0, grabVerts_.size(), 4096, [&](std::size_t b, std::size_t e) {
     for (std::size_t i = b; i < e; ++i) {
       const GrabVertex& g = grabVerts_[i];
-      m.positions[g.v] = g.start + offset * g.weight + mirrored * g.mirrorWeight;
+      Vec3 p = g.start;
+      for (std::uint32_t k = 0; k < g.entryCount; ++k) {
+        const GrabEntry& entry = grabEntries_[g.firstEntry + k];
+        p += moves[entry.cluster] * entry.weight;
+      }
+      m.positions[g.v] = p;
     }
   });
+  for (const auto& [i, pin] : grabPins_) {
+    const GrabVertex& g = grabVerts_[i];
+    m.positions[g.v] = snapPinned(pin, g.start, m.positions[g.v]);
+  }
   lastDab_.brushMs = t.ms();
+  lastDab_.copies = group_.size();
+  lastDab_.clusters = grabClusterCount_;
+  lastDab_.pinned = static_cast<int>(grabPins_.size());
   t.reset();
   recomputeNormals(grabNormalVerts_);
   lastDab_.normalsMs = t.ms();
@@ -610,6 +932,7 @@ std::optional<StrokeUndo> Sculptor::endStroke() {
   SceneObject* obj = object_;
   object_ = nullptr;
   lastStroke_ = {};
+  lastStroke_.tooManyCopies = tooManyCopies_;
   if (std::unique_ptr<DyntopoSession> session = std::move(dyntopo_)) {
     lastStroke_.lockedVertices = session->lockedVertices();
     if (session->changedTopology()) return endDyntopoStroke(*obj, *session);

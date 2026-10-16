@@ -16,4 +16,8 @@ void parallelFor(std::size_t begin, std::size_t end, std::size_t grain,
 // Number of threads the pool uses, including the calling thread.
 std::size_t workerCount();
 
+// For tests: while set, every parallelFor runs inline on the calling thread. Results must not
+// depend on it.
+void setSerialForTesting(bool serial);
+
 }  // namespace plegl

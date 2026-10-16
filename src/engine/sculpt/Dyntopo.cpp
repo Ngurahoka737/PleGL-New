@@ -4,6 +4,7 @@
 #include <cmath>
 
 #include "core/Parallel.h"
+#include "sculpt/Symmetry.h"
 
 namespace plegl {
 namespace {
@@ -103,7 +104,8 @@ DyntopoSession::DyntopoSession(SceneObject& object, const DyntopoOptions& option
   // Room for the stroke's new elements, so no edit reallocates inside a dab. Reserving only when
   // the spare capacity runs low keeps a growing mesh from reallocating on every stroke.
   const Index nv = m_.vertexCount(), nf = m_.faceCount(), nh = m_.halfEdgeCount();
-  const Index spare = std::max<Index>(65536, nv / 4);
+  // Symmetric strokes edit at every copy, so they get twice the room.
+  const Index spare = std::max<Index>(65536, nv / 4) * (opt_.copies >= 2 ? 2 : 1);
   if (!m_.hasHeadroom(spare / 2, 2 * spare, 5 * spare)) m_.reserveHeadroom(nv + spare, nf + 4 * spare, nh + 10 * spare);
 
   // Non-manifold vertices (fans that do not cover every outgoing edge) are locked. A mesh found
@@ -433,7 +435,11 @@ void DyntopoSession::splitAll(const Vec3& c, float r, float lmax2) {
       continue;
     }
 
+    // A midpoint between two vertices on the same symmetry plane or axis lands exactly on it.
+    const std::uint8_t pinned = pinBits(m_.positions[e.a]) & pinBits(m_.positions[e.b]);
     const Index v = ed_.splitEdge(h, 0.5f);
+    for (int axis = 0; axis < 3; ++axis)
+      if (pinned >> axis & 1) m_.positions[v][axis] = 0.0f;
     ++pass_.edits;
     // h: a -> v and t: b -> v. Fan both faces from v to their opposite corner.
     for (Index s : {h, t}) {
@@ -537,12 +543,30 @@ bool DyntopoSession::collapseOne(const Edge& e, float lmax2, float lmin2) {
   } else if (borderA && (lockBorders_ || faceSetId(sets[m_.heFace[h]]) == faceSetId(sets[m_.heFace[t]]))) {
     return false;
   }
+  // Symmetry pins: an end on more symmetry planes or axes than the other keeps its place, and ends
+  // on different ones do not merge, so no vertex leaves the plane or axis it is on.
+  const std::uint8_t za = pinBits(pa), zb = pinBits(pb);
+  if (za != zb) {
+    const bool aCovers = (za & zb) == zb, bCovers = (za & zb) == za;
+    if (!aCovers && !bCovers) return false;
+    const Index pinned = aCovers ? a : b;
+    if (endChosen && keep != pinned) return false;
+    keep = pinned;
+    gone = keep == a ? b : a;
+    p = m_.positions[keep];
+    endChosen = true;
+  }
   // The vertex the pass must keep stays where it is, unless the rules above want the other end.
   if (keepVertex_ == a || keepVertex_ == b) {
     if (endChosen && keep != keepVertex_) return false;
     keep = keepVertex_;
     gone = keep == a ? b : a;
     p = m_.positions[keep];
+  }
+  // The merged vertex sits exactly on the planes and axes its kept end is on.
+  if (const std::uint8_t z = keep == a ? za : zb) {
+    for (int axis = 0; axis < 3; ++axis)
+      if (z >> axis & 1) p[axis] = 0.0f;
   }
 
   // No edge at the merged vertex may come out long enough to be split again.

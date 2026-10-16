@@ -1,7 +1,9 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <optional>
 #include <unordered_map>
 #include <vector>
@@ -18,7 +20,13 @@ struct StrokeOptions {
   float strength = 0.5f;
   Falloff falloff = Falloff::Smooth;
   bool invert = false;
-  bool symmetryX = false;  // Mirror every dab across the object's local X = 0 plane.
+  // Symmetry: mirror every dab across the object's local X = 0 / Y = 0 / Z = 0 planes, and repeat
+  // it radialCount times around the radial axis (1 = off). See Symmetry.h.
+  bool symmetryX = false;
+  bool symmetryY = false;
+  bool symmetryZ = false;
+  Axis radialAxis = Axis::Y;
+  int radialCount = 1;
   // Dynamic topology: dabs that pass a detail size split and collapse edges under the brush.
   // Ignored by grab and mask strokes.
   bool dyntopo = false;
@@ -36,6 +44,8 @@ struct StrokeOptions {
   std::uint32_t layerTarget = 0;
   // Smooth on a layer smooths only that layer's offsets (see LayerSmoothBrush).
   bool smoothLayerOnly = false;
+
+  SymmetrySpec symmetry() const { return sanitized({symmetryX, symmetryY, symmetryZ, radialAxis, radialCount}); }
 };
 
 struct DabTiming {
@@ -47,6 +57,10 @@ struct DabTiming {
   double topologyMs = 0.0; // Dynamic topology pass, normals and refit after it.
   int splits = 0;
   int collapses = 0;
+  int copies = 1;          // Symmetric copies of the dab (the group's size).
+  int clusters = 1;        // Copies left after merging those that nearly coincide.
+  double shareMs = 0.0;    // Building the shares of overlapping copies.
+  int pinned = 0;          // Vertices held on a symmetry plane or axis.
 };
 
 // What the last ended stroke did to topology.
@@ -61,9 +75,18 @@ struct StrokeTopologyStats {
   bool faulted = false;    // Topology stopped part way through the stroke.
   bool outOfRoom = false;  // Splits stopped because the stroke's headroom ran out.
   Index lockedVertices = 0;
+  bool tooManyCopies = false;  // Dynamic topology was off: more than kMaxDyntopoCopies copies.
 };
 
-// Runs strokes on one scene object. For every dab it queries the BVH, snapshots the touched
+// Runs strokes on one scene object.
+//
+// Symmetry (StrokeOptions::symmetry()): every dab, and a Grab's capture, runs once per cluster of
+// symmetric copies (see clusterCopies). Copies that nearly coincide merge into one dab on the
+// plane or axis between them. Copies that overlap share each vertex by their falloff (ShareView),
+// and every copy reads the mesh as it was before the dab. Vertices that start on a symmetry plane
+// or axis (within kPinTolerance of the bounds diagonal) are snapped back onto it after each dab.
+// Normals, bounds and GPU marks are updated once per dab for the union of all copies.
+// For every dab it queries the BVH, snapshots the touched
 // leaves for undo, runs the brush, recomputes normals around the moved vertices, refits the BVH
 // and marks GPU ranges dirty. Brushes only move positions. Mask and face set brushes take a
 // shorter path: the sculptor allocates the mask (or face sets), snapshots only those values and
@@ -117,6 +140,10 @@ class Sculptor {
   const DyntopoSession* dyntopo() const { return dyntopo_.get(); }
   // The face set the running (or last) face set stroke paints on the primary side.
   std::int32_t paintFaceSet() const { return paintSet_[0]; }
+  // The running stroke's symmetry group.
+  const SymmetryGroup& symmetry() const { return group_; }
+  // True while the running stroke asked for dynamic topology but has too many symmetric copies.
+  bool topologyOffForCopies() const { return tooManyCopies_; }
 
   const DabTiming& lastDab() const { return lastDab_; }
   int dabCount() const { return dabCount_; }
@@ -126,9 +153,17 @@ class Sculptor {
   void start(SceneObject& object, const StrokeOptions& options, std::string label);
   void beginLayers();
   void commitLayerStroke();
-  bool applyOne(const Dab& dab, const DabTopology& topology, int side);
+  struct ApplyFlags {
+    bool deferNormals = false;  // Leave normals for a later recomputeNormals of pendingNormals_.
+  };
+  int prepareCopies(const Dab& dab, const DabTopology& topology);
+  bool applyCopies(int count, const ApplyFlags& flags);
+  const ShareView* buildZone(int count, ShareView& view);
+  void collectPins(const CopyCluster& cluster, const Vec3& center, float radius, std::span<const Index> leaves);
+  OpMask pinOps(const Vec3& center, float radius) const;
+  bool pinCandidate(const Vec3& p, OpMask ops) const;
   void resolveFaceSets(const Vec3& center, float radius);
-  FaceSetFilter filter(int side) const;
+  FaceSetFilter filter(int op) const;
   void applyTopology(const Dab& dab, const DabTopology& topology);
   void mergeClaims();
   std::optional<StrokeUndo> endDyntopoStroke(SceneObject& obj, DyntopoSession& session);
@@ -142,9 +177,46 @@ class Sculptor {
   bool faceSetStroke_ = false;
   bool hidden_ = false;           // The mesh had hidden faces when the stroke began.
   bool faceSetsResolved_ = false;
-  // Per side (0 primary, 1 mirrored): the auto-mask set (0 none) and the set painted (0 nothing).
-  std::int32_t onlySet_[2] = {0, 0};
-  std::int32_t paintSet_[2] = {0, 0};
+  // Per symmetry op: the auto-mask set (0 none) and the set painted (0 nothing).
+  std::array<std::int32_t, kMaxSymmetryCopies> onlySet_{};
+  std::array<std::int32_t, kMaxSymmetryCopies> paintSet_{};
+  SymmetryGroup group_;
+  float pinEps_ = 0.0f;
+  bool tooManyCopies_ = false;
+  // One symmetric copy of the current dab.
+  struct CopyDab {
+    Dab dab;
+    CopyCluster cluster;
+    DabTopology topology;
+    FaceSetFilter filter;
+    std::int32_t paintSet = 0;
+    std::vector<Index> leaves;
+    bool live = false;
+  };
+  CopyClusters clusters_;
+  std::vector<CopyDab> copies_;
+  // Vertices within reach of two or more copies: per-vertex slots (kept for the stroke) and
+  // per-dab sums, see ShareView.
+  struct ShareZone {
+    std::vector<std::uint32_t> stamp, slot;
+    std::uint32_t current = 0;
+    std::vector<float> denom;
+    std::vector<std::uint8_t> count;
+    std::vector<Vec3> pending;
+    std::vector<float> pendingScalar;
+    std::vector<Index> verts;
+    std::vector<std::vector<std::pair<Index, float>>> gathered;  // Per leaf: vertex, raw falloff.
+  };
+  ShareZone zone_;
+  struct PinnedVertex {
+    Index v;
+    Vec3 start;
+    SeamPin pin;
+  };
+  std::vector<PinnedVertex> pins_;
+  std::vector<std::uint32_t> faceClaim_;
+  std::uint32_t claimStamp_ = 0;
+  std::vector<Index> pendingNormals_;
   StrokeOptions options_;
   // Sculpt layers: the target array of a position stroke on a layered mesh (else nullptr), and
   // the same as layer brushes see it.
@@ -158,15 +230,23 @@ class Sculptor {
   std::vector<std::uint32_t> vertexStamp_;
   std::uint32_t stamp_ = 0;
   std::vector<Index> leaves_, normalVerts_, dirtyLeaves_;
-  // Grab state: captured vertices, their start positions and weights for the primary and the
-  // mirrored sphere, plus the fixed set of vertices whose normals and leaves a grab touches.
+  // Grab state: captured vertices, their start positions and their weight per symmetric cluster,
+  // plus the fixed set of vertices whose normals and leaves a grab touches.
   struct GrabVertex {
     Index v;
     Vec3 start;
+    std::uint32_t firstEntry;
+    std::uint32_t entryCount;
+  };
+  struct GrabEntry {
+    std::uint32_t cluster;
     float weight;
-    float mirrorWeight;
   };
   std::vector<GrabVertex> grabVerts_;
+  std::vector<GrabEntry> grabEntries_;
+  std::vector<std::pair<std::uint32_t, SeamPin>> grabPins_;  // Index in grabVerts_, pin.
+  CopyClusters grabClusters_;
+  int grabClusterCount_ = 0;
   std::vector<Index> grabNormalVerts_, grabRefitLeaves_, grabDirtyLeaves_;
   std::vector<Index> strokeRefit_;  // Every leaf refit during the stroke, for undo.
   std::vector<Index> kept_;
