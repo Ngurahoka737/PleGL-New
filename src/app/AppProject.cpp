@@ -188,6 +188,11 @@ std::string App::settingsText() const {
   w.put("brush.spacing", sculpt.spacing);
   w.put("symmetry.x", sculpt.symmetryX);
   w.put("mask.filter_steps", sculpt.maskFilterSteps);
+  w.put("dyntopo.enabled", sculpt.dyntopo);
+  w.put("dyntopo.refine", static_cast<int>(sculpt.dyntopoRefine));
+  w.put("dyntopo.detail_mode", static_cast<int>(sculpt.detailMode));
+  w.put("dyntopo.detail_px", sculpt.detailPx);
+  w.put("dyntopo.detail_size", sculpt.detailSize);
 
   w.put("view.matcap", view.matcap);
   w.put("view.wireframe", view.wireframe);
@@ -236,6 +241,13 @@ void App::applySettings(const std::string& text) {
   sculpt.maskFilterSteps = std::clamp(sculpt.maskFilterSteps, 1, 10);
   sculpt.radiusPx = std::clamp(sculpt.radiusPx, 2.0f, 2000.0f);
   sculpt.spacing = std::clamp(sculpt.spacing, 0.01f, 1.0f);
+  r.get("dyntopo.enabled", sculpt.dyntopo);
+  r.getEnum("dyntopo.refine", sculpt.dyntopoRefine, 3);
+  r.getEnum("dyntopo.detail_mode", sculpt.detailMode, 2);
+  r.get("dyntopo.detail_px", sculpt.detailPx);
+  r.get("dyntopo.detail_size", sculpt.detailSize);
+  sculpt.detailPx = std::isfinite(sculpt.detailPx) ? std::clamp(sculpt.detailPx, 2.0f, 64.0f) : 8.0f;
+  sculpt.detailSize = std::isfinite(sculpt.detailSize) ? std::clamp(sculpt.detailSize, 1e-5f, 10.0f) : 0.02f;
 
   r.get("view.matcap", view.matcap);
   r.get("view.wireframe", view.wireframe);

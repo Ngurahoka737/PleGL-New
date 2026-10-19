@@ -192,6 +192,27 @@ std::vector<Index> Mesh::reorder(std::span<const Index> faceOrder) {
 
 void Mesh::clear() { *this = Mesh{}; }
 
+void Mesh::reserveHeadroom(Index vertices, Index faces, Index halfEdges) {
+  const auto nv = static_cast<std::size_t>(vertices), nf = static_cast<std::size_t>(faces),
+             nh = static_cast<std::size_t>(halfEdges);
+  positions.reserve(nv);
+  if (!normals.empty()) normals.reserve(nv);
+  if (!mask.empty()) mask.reserve(nv);
+  vertHe.reserve(nv);
+  faceHe.reserve(nf);
+  heNext.reserve(nh);
+  heTwin.reserve(nh);
+  heVert.reserve(nh);
+  heFace.reserve(nh);
+}
+
+bool Mesh::hasHeadroom(Index vertices, Index faces, Index halfEdges) const {
+  auto fits = [](const auto& v, Index n) { return v.size() + static_cast<std::size_t>(n) <= v.capacity(); };
+  return fits(positions, vertices) && (normals.empty() || fits(normals, vertices)) &&
+         (mask.empty() || fits(mask, vertices)) && fits(vertHe, vertices) && fits(faceHe, faces) &&
+         fits(heNext, halfEdges) && fits(heTwin, halfEdges) && fits(heVert, halfEdges) && fits(heFace, halfEdges);
+}
+
 bool Mesh::anyMasked() const {
   for (float v : mask) {
     if (v > 0.0f) return true;
@@ -389,7 +410,8 @@ void weldVertices(std::vector<Vec3>& positions, std::vector<Index>& faceIndices,
   positions = std::move(out);
 }
 
-ValidationResult validate(const Mesh& m) {
+namespace {
+ValidationResult validateImpl(const Mesh& m, bool live) {
   auto fail = [](std::string msg) { return ValidationResult{false, std::move(msg)}; };
   const Index nv = m.vertexCount();
   const Index nf = m.faceCount();
@@ -411,10 +433,14 @@ ValidationResult validate(const Mesh& m) {
       return fail("non-finite position at vertex " + std::to_string(v));
   }
 
+  Index liveHalfEdges = 0;
   for (Index h = 0; h < nh; ++h) {
+    if (live && m.heFace[h] == kInvalid) continue;
+    ++liveHalfEdges;
     if (m.heNext[h] < 0 || m.heNext[h] >= nh) return fail("heNext out of range at " + std::to_string(h));
     if (m.heVert[h] < 0 || m.heVert[h] >= nv) return fail("heVert out of range at " + std::to_string(h));
     if (m.heFace[h] < 0 || m.heFace[h] >= nf) return fail("heFace out of range at " + std::to_string(h));
+    if (live && m.faceHe[m.heFace[h]] == kInvalid) return fail("half-edge of a removed face at " + std::to_string(h));
     if (m.heFace[m.heNext[h]] != m.heFace[h]) return fail("heNext leaves its face at " + std::to_string(h));
     const Index t = m.heTwin[h];
     if (t != kInvalid) {
@@ -428,6 +454,7 @@ ValidationResult validate(const Mesh& m) {
 
   Index walked = 0;
   for (Index f = 0; f < nf; ++f) {
+    if (live && m.faceHe[f] == kInvalid) continue;
     const Index start = m.faceHe[f];
     if (start < 0 || start >= nh || m.heFace[start] != f) return fail("faceHe invalid at " + std::to_string(f));
     Index h = start;
@@ -439,22 +466,28 @@ ValidationResult validate(const Mesh& m) {
     if (n < 3) return fail("face with fewer than 3 sides at " + std::to_string(f));
     walked += n;
   }
-  if (walked != nh) return fail("some half-edges belong to no face loop");
+  if (walked != liveHalfEdges) return fail("some half-edges belong to no face loop");
 
   std::vector<Index> outCount(nv, 0);
-  for (Index h = 0; h < nh; ++h) ++outCount[m.heVert[h]];
+  for (Index h = 0; h < nh; ++h)
+    if (!live || m.heFace[h] != kInvalid) ++outCount[m.heVert[h]];
   for (Index v = 0; v < nv; ++v) {
     const Index start = m.vertHe[v];
     if (start == kInvalid) {
       if (outCount[v] != 0) return fail("vertex with faces has no vertHe at " + std::to_string(v));
       continue;
     }
-    if (start < 0 || start >= nh || m.heVert[start] != v) return fail("vertHe invalid at " + std::to_string(v));
+    if (start < 0 || start >= nh || m.heVert[start] != v || m.heFace[start] == kInvalid)
+      return fail("vertHe invalid at " + std::to_string(v));
     Index visited = 0;
     m.forEachOutgoing(v, [&](Index) { ++visited; });
     if (visited != outCount[v]) return fail("non-manifold vertex fan at " + std::to_string(v));
   }
   return {};
 }
+}  // namespace
+
+ValidationResult validate(const Mesh& m) { return validateImpl(m, false); }
+ValidationResult validateLive(const Mesh& m) { return validateImpl(m, true); }
 
 }  // namespace plegl

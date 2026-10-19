@@ -51,7 +51,9 @@ std::optional<SculptUndo> maskStroke(SceneObject& obj, const Brush& brush, Vec3 
   sculptor.beginStroke(obj, brush, opts, brush.name());
   const Vec3 c = surfacePoint(obj, dir);
   for (int i = 0; i < dabs; ++i) REQUIRE(sculptor.dab(c, radius, 1.0f));
-  return sculptor.endStroke();
+  auto undo = sculptor.endStroke();
+  if (!undo) return std::nullopt;
+  return std::get<SculptUndo>(std::move(*undo));
 }
 
 void requireMaskInRange(const Mesh& m) {

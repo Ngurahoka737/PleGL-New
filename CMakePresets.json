@@ -37,8 +37,8 @@
     { "name": "engine-only", "configurePreset": "engine-only" }
   ],
   "testPresets": [
-    { "name": "release", "configurePreset": "release", "output": { "outputOnFailure": true } },
-    { "name": "msvc", "configurePreset": "msvc", "configuration": "Release", "output": { "outputOnFailure": true } },
-    { "name": "engine-only", "configurePreset": "engine-only", "output": { "outputOnFailure": true } }
+    { "name": "release", "configurePreset": "release", "output": { "outputOnFailure": true }, "execution": { "timeout": 600 } },
+    { "name": "msvc", "configurePreset": "msvc", "configuration": "Release", "output": { "outputOnFailure": true }, "execution": { "timeout": 600 } },
+    { "name": "engine-only", "configurePreset": "engine-only", "output": { "outputOnFailure": true }, "execution": { "timeout": 600 } }
   ]
 }

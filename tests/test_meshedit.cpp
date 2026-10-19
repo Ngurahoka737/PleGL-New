@@ -170,3 +170,119 @@ TEST_CASE("Bvh::closestPoint matches brute force") {
     if (std::sqrt(best) > 0.2f) CHECK_FALSE(bvh.closestPoint(m, p, 0.2f, limited));
   }
 }
+
+namespace {
+
+// Records every element an edit reports, so tests can check that nothing changes unreported.
+struct RecordingObserver : EditObserver {
+  std::vector<Index> verts, faces, halfEdges;
+  void beforeWrite(ElementKind kind, Index i) override {
+    (kind == ElementKind::Vertex ? verts : kind == ElementKind::Face ? faces : halfEdges).push_back(i);
+  }
+  bool has(const std::vector<Index>& list, Index i) const { return std::find(list.begin(), list.end(), i) != list.end(); }
+};
+
+// Every element that existed before the edit and differs after it must have been reported.
+void requireReported(const Mesh& before, const Mesh& after, const RecordingObserver& obs) {
+  for (Index v = 0; v < before.vertexCount(); ++v) {
+    const bool changed = before.positions[v] != after.positions[v] || before.vertHe[v] != after.vertHe[v] ||
+                         (!before.mask.empty() && before.mask[v] != after.mask[v]);
+    if (changed && !obs.has(obs.verts, v)) {
+      INFO("vertex " << v << " changed unreported");
+      REQUIRE(false);
+    }
+  }
+  for (Index f = 0; f < before.faceCount(); ++f) {
+    if (before.faceHe[f] != after.faceHe[f] && !obs.has(obs.faces, f)) {
+      INFO("face " << f << " changed unreported");
+      REQUIRE(false);
+    }
+  }
+  for (Index h = 0; h < before.halfEdgeCount(); ++h) {
+    const bool changed = before.heNext[h] != after.heNext[h] || before.heTwin[h] != after.heTwin[h] ||
+                         before.heVert[h] != after.heVert[h] || before.heFace[h] != after.heFace[h];
+    if (changed && !obs.has(obs.halfEdges, h)) {
+      INFO("half-edge " << h << " changed unreported");
+      REQUIRE(false);
+    }
+  }
+}
+
+}  // namespace
+
+TEST_CASE("an edit observer hears about every element an edit changes") {
+  for (int shape = 0; shape < 3; ++shape) {
+    Mesh m = shape == 0 ? makeIcosphere(2) : shape == 1 ? makeQuadSphere(6) : makeUvSphere(12, 8);
+    m.mask.assign(m.positions.size(), 0.25f);
+    MeshEditor ed(m);
+    RecordingObserver obs;
+    ed.setObserver(&obs);
+    std::mt19937 rng(1234 + shape);
+    int applied[5] = {};
+    for (int step = 0; step < 400; ++step) {
+      const Index nh = m.halfEdgeCount();
+      const Index h = std::uniform_int_distribution<Index>(0, nh - 1)(rng);
+      if (!ed.halfEdgeAlive(h)) continue;
+      const int op = static_cast<int>(rng() % 5);
+      const Mesh before = m;
+      obs = {};
+      bool ok = false;
+      switch (op) {
+        case 0: ok = ed.rotateEdge(h); break;
+        case 1: ok = ed.splitEdge(h, 0.3f) != kInvalid; break;
+        case 2: {
+          const Index hb = m.heNext[m.heNext[h]];
+          ok = m.heNext[hb] != h && ed.splitFace(h, hb) != kInvalid;
+          break;
+        }
+        case 3: ok = ed.collapseEdge(h, m.positions[m.heVert[h]]); break;
+        case 4: ok = ed.collapseDiagonal(h); break;
+      }
+      if (!ok) {
+        // A refused edit changes nothing at all.
+        CHECK(m.positions == before.positions);
+        CHECK(m.heNext == before.heNext);
+        continue;
+      }
+      ++applied[op];
+      requireReported(before, m, obs);
+      const ValidationResult r = validateLive(m);
+      INFO(r.message);
+      REQUIRE(r.ok);
+    }
+    for (int op = 0; op < 5; ++op) {
+      INFO("shape " << shape << " op " << op);
+      if (shape != 0 || op != 4) CHECK(applied[op] > 0);  // collapseDiagonal needs quads.
+    }
+  }
+}
+
+TEST_CASE("an edit observer changes nothing about the edit") {
+  Mesh a = makeQuadSphere(8), b = a;
+  MeshEditor ea(a), eb(b);
+  RecordingObserver obs;
+  eb.setObserver(&obs);
+  std::mt19937 rng(7);
+  for (int step = 0; step < 200; ++step) {
+    const Index h = std::uniform_int_distribution<Index>(0, a.halfEdgeCount() - 1)(rng);
+    if (!ea.halfEdgeAlive(h)) continue;
+    const bool ra = (step % 2) ? ea.collapseDiagonal(h) : ea.rotateEdge(h);
+    const bool rb = (step % 2) ? eb.collapseDiagonal(h) : eb.rotateEdge(h);
+    REQUIRE(ra == rb);
+  }
+  CHECK(a.positions == b.positions);
+  CHECK(a.heNext == b.heNext);
+  CHECK(a.heTwin == b.heTwin);
+  CHECK(a.vertHe == b.vertHe);
+}
+
+TEST_CASE("mesh headroom avoids reallocation") {
+  Mesh m = makeIcosphere(1);
+  m.reserveHeadroom(m.vertexCount() + 10, m.faceCount() + 40, m.halfEdgeCount() + 100);
+  CHECK(m.hasHeadroom(10, 40, 100));
+  CHECK_FALSE(m.hasHeadroom(11, 40, 100));
+  const Vec3* data = m.positions.data();
+  MeshEditor ed(m);
+  for (int i = 0; i < 10; ++i) ed.splitEdge(static_cast<Index>(i * 3));
+  CHECK(m.positions.data() == data);
+}

@@ -18,26 +18,62 @@ namespace {
 
 struct MeshInfo {
   std::uint64_t version = 0;
+  std::uint64_t seen = 0;  // Newest version noticed; counted one frame later.
   Index triangles = 0, quads = 0, ngons = 0, edges = 0;
   Index valence4 = 0, interior = 0;
 };
 
-const MeshInfo& meshInfo(const SceneObject& obj) {
+// Face and valence statistics, recounted in parallel when the topology changes. Never during a
+// stroke (a dynamic topology mesh holds removed elements then) and never in the frame that
+// noticed the change, which already pays for the stroke's compaction and GPU upload.
+const MeshInfo& meshInfo(const SceneObject& obj, bool strokeActive) {
   static std::unordered_map<std::uint32_t, MeshInfo> cache;
   MeshInfo& info = cache[obj.id];
-  if (info.version == obj.topologyVersion) return info;
-  info = {};
-  info.version = obj.topologyVersion;
-  const Mesh& m = obj.mesh;
-  for (Index f = 0; f < m.faceCount(); ++f) {
-    const Index n = m.faceSize(f);
-    (n == 3 ? info.triangles : n == 4 ? info.quads : info.ngons)++;
+  if (info.version == obj.topologyVersion || strokeActive) return info;
+  if (info.seen != obj.topologyVersion) {
+    info.seen = obj.topologyVersion;
+    if (info.version != 0) return info;  // Show the old numbers for one more frame.
   }
-  info.edges = m.edgeCount();
-  for (Index v = 0; v < m.vertexCount(); ++v) {
-    if (m.vertHe[v] == kInvalid || m.isBoundaryVertex(v)) continue;
-    ++info.interior;
-    info.valence4 += m.valence(v) == 4;
+  const Mesh& m = obj.mesh;
+  struct Counts {
+    Index triangles = 0, quads = 0, ngons = 0, edges = 0, valence4 = 0, interior = 0;
+  };
+  constexpr std::size_t kChunk = 16384;
+  const std::size_t nf = static_cast<std::size_t>(m.faceCount()), nv = static_cast<std::size_t>(m.vertexCount());
+  const std::size_t chunks = (std::max(nf, nv) + kChunk - 1) / kChunk;
+  std::vector<Counts> part(chunks);
+  parallelFor(0, chunks, 1, [&](std::size_t b, std::size_t e) {
+    for (std::size_t c = b; c < e; ++c) {
+      Counts& k = part[c];
+      for (std::size_t f = c * kChunk; f < std::min(nf, (c + 1) * kChunk); ++f) {
+        const Index n = m.faceSize(static_cast<Index>(f));
+        (n == 3 ? k.triangles : n == 4 ? k.quads : k.ngons)++;
+        // Each edge once: from its lower half-edge, or its only one on a border.
+        const Index h0 = m.faceHe[f];
+        Index h = h0;
+        do {
+          const Index t = m.heTwin[h];
+          k.edges += t == kInvalid || h < t;
+          h = m.heNext[h];
+        } while (h != h0);
+      }
+      for (std::size_t v = c * kChunk; v < std::min(nv, (c + 1) * kChunk); ++v) {
+        const auto vi = static_cast<Index>(v);
+        if (m.vertHe[vi] == kInvalid || m.isBoundaryVertex(vi)) continue;
+        ++k.interior;
+        k.valence4 += m.valence(vi) == 4;
+      }
+    }
+  });
+  info = {};
+  info.version = info.seen = obj.topologyVersion;
+  for (const Counts& k : part) {
+    info.triangles += k.triangles;
+    info.quads += k.quads;
+    info.ngons += k.ngons;
+    info.edges += k.edges;
+    info.valence4 += k.valence4;
+    info.interior += k.interior;
   }
   return info;
 }
@@ -130,6 +166,8 @@ void App::drawUi() {
       ImGui::TextUnformatted("Sculpt mode:");
       ImGui::TextUnformatted("M                   Mask brush (Ctrl+drag erases, Shift+drag smooths)");
       ImGui::TextUnformatted("Ctrl + I            Invert mask");
+      ImGui::TextUnformatted("Ctrl + D            Dynamic topology on / off");
+      ImGui::TextUnformatted("F / R + move        Brush radius / detail size");
       ImGui::EndMenu();
     }
     ImGui::EndMainMenuBar();
@@ -198,6 +236,34 @@ void App::drawUi() {
 
       sectionHeader("Symmetry");
       ImGui::Checkbox("Mirror X (X)", &sculpt.symmetryX);
+
+      sectionHeader("Dynamic topology");
+      ImGui::Checkbox("Enabled (Ctrl+D)", &sculpt.dyntopo);
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Brushes add triangles where detail is needed and merge them where it is not.");
+      ImGui::BeginDisabled(!sculpt.dyntopo);
+      static const char* kDetailModes[] = {"Relative (pixels)", "Constant (units)"};
+      int dm = static_cast<int>(sculpt.detailMode);
+      ImGui::SetNextItemWidth(-1);
+      if (ImGui::Combo("##detailMode", &dm, kDetailModes, 2)) sculpt.detailMode = static_cast<DetailMode>(dm);
+      ImGui::SetNextItemWidth(-1);
+      if (sculpt.detailMode == DetailMode::Relative) {
+        ImGui::SliderFloat("##detailPx", &sculpt.detailPx, 2.0f, 64.0f, "detail %.0f px", ImGuiSliderFlags_AlwaysClamp);
+      } else {
+        ImGui::DragFloat("##detailSize", &sculpt.detailSize, sculpt.detailSize * 0.01f, 1e-5f, 10.0f,
+                         "detail %.4g units", ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_AlwaysClamp);
+      }
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Target edge length. Hold R and move the mouse to change it.");
+      static const char* kRefine[] = {"Subdivide and collapse", "Subdivide only", "Collapse only"};
+      int rm = static_cast<int>(sculpt.dyntopoRefine);
+      ImGui::SetNextItemWidth(-1);
+      if (ImGui::Combo("##refine", &rm, kRefine, 3)) sculpt.dyntopoRefine = static_cast<DyntopoRefine>(rm);
+      ImGui::EndDisabled();
+      if (sculpt.dyntopo && (sculpt.brush == BrushKind::Grab || sculpt.brush == BrushKind::Mask)) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextWrapped("%s does not change topology.", kBrushNames[static_cast<int>(sculpt.brush)]);
+        ImGui::PopStyleColor();
+      }
 
       sectionHeader("Mask");
       {
@@ -369,7 +435,7 @@ void App::drawUi() {
       if (ImGui::Button("Frame")) frameScene();
 
       if (SceneObject* still = scene.find(selectedId)) {
-        const MeshInfo& info = meshInfo(*still);
+        const MeshInfo& info = meshInfo(*still, strokeActive());
         const Mesh& mesh = still->mesh;
         ImGui::Text("Vertices   %d", mesh.vertexCount());
         ImGui::Text("Faces      %d", mesh.faceCount());
@@ -404,6 +470,15 @@ void App::drawUi() {
     ImGui::Text("Input to frame  %.1f ms", stats.inputToFrameMs);
     const RenderStats& rs = renderStats();
     ImGui::Text("Uploads  %d full, %d partial", rs.fullUploads, rs.partialUploads);
+    if (sculpt.dyntopo || rs.indexBlockUploads > 0) {
+      ImGui::Text("Topology  %.2f ms last dab", stats.topologyMs);
+      ImGui::Text("Index blocks  %d  (draw runs %d)", rs.indexBlockUploads, rs.drawRuns);
+      const StrokeTopologyStats& ts = lastStrokeTopology();
+      if (ts.dyntopo) {
+        ImGui::Text("Last stroke  +%d / -%d edges", ts.splits, ts.collapses);
+        ImGui::Text("  faces %d -> %d, end %.1f ms", ts.facesBefore, ts.facesAfter, ts.consolidateMs);
+      }
+    }
     if (stats.maskOpMs > 0.0) ImGui::Text("Last mask op  %.1f ms", stats.maskOpMs);
     ImGui::Text("Worker threads  %zu", workerCount());
     if (ImGui::Button("Bump under cursor (B)")) bumpUnderCursor();
@@ -423,7 +498,7 @@ void App::drawUi() {
   if (ImGui::Begin("Status", nullptr, panelFlags | ImGuiWindowFlags_NoScrollbar)) {
     ImGui::TextUnformatted(statusMessage.c_str());
     const char* hint = mode == Mode::Object ? "Object mode  |  Alt+drag navigate  |  G R S transform  |  Tab sculpt"
-                                            : "Sculpt mode  |  Alt+drag navigate  |  M mask  |  Tab object";
+                                            : "Sculpt mode  |  Alt+drag navigate  |  M mask  |  Ctrl+D dyntopo  |  Tab object";
     const float w = ImGui::CalcTextSize(hint).x;
     ImGui::SameLine(std::max(ImGui::GetCursorPosX() + 20.0f, ImGui::GetWindowWidth() - w - 12.0f * scale));
     ImGui::TextDisabled("%s", hint);

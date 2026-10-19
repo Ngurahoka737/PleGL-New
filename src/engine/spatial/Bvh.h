@@ -1,22 +1,33 @@
 #pragma once
 
+#include <cstdint>
 #include <limits>
 #include <span>
+#include <string>
 #include <vector>
 
 #include "mesh/Mesh.h"
 
 namespace plegl {
 
-// A BVH leaf is the engine's unit of work. Each leaf owns a contiguous range of faces and a
-// contiguous range of vertices, so raycasts, brush queries, partial GPU uploads, undo snapshots
-// and parallel jobs can all be expressed per leaf.
+// Leaf flags.
+inline constexpr std::uint8_t kLeafOwnsOrphans = 1;  // Owns vertices none of its faces use.
+inline constexpr std::uint8_t kLeafMayHaveDead = 2;  // Holds removed elements (dynamic topology only).
+
+// A BVH leaf is the engine's unit of work. Each leaf owns a contiguous range of faces, of their
+// half-edges and of vertices, so raycasts, brush queries, partial GPU uploads, undo snapshots and
+// parallel jobs can all be expressed per leaf. Leaves are sorted by these ranges; a leaf can be
+// empty (all ranges empty), in which case it has no node in the tree.
 struct BvhLeaf {
   Index faceBegin = 0;
   Index faceEnd = 0;
   Index vertBegin = 0;  // Vertices first used by this leaf's faces.
   Index vertEnd = 0;
+  Index heBegin = 0;    // Half-edges of the leaf's faces, laid out face by face.
+  Index heEnd = 0;
+  std::uint8_t flags = 0;
   Aabb bounds;          // Bounds of every face in the leaf (may include vertices owned elsewhere).
+  bool empty() const { return faceBegin == faceEnd && vertBegin == vertEnd; }
 };
 
 struct BvhNode {
@@ -75,8 +86,35 @@ class Bvh {
   Index leafOfVertex(Index v) const;
   // Leaf owning face f, or kInvalid.
   Index leafOfFace(Index f) const;
+  // Leaf owning half-edge h, or kInvalid.
+  Index leafOfHalfEdge(Index h) const;
+
+  // --- Dynamic topology -------------------------------------------------------------------
+  // During a dynamic topology stroke the mesh keeps removed elements in place and appends new
+  // ones. The existing leaves keep their ranges; appended elements are owned by "tail" leaves
+  // added after them, which have no tree node and are scanned linearly by every query.
+  void beginDynamic(const Mesh& mesh);
+  // Extends the open tail leaf over everything appended since, closing it at kTailLeafFaces.
+  void growTail(const Mesh& mesh);
+  void endDynamic() { dynamic_ = false; }
+  bool dynamic() const { return dynamic_; }
+  bool isTail(Index leaf) const { return dynamic_ && leaf >= firstTailLeaf_; }
+  Index firstTailLeaf() const { return dynamic_ ? firstTailLeaf_ : static_cast<Index>(leaves_.size()); }
+  Index tailStartFace() const { return tailStartFace_; }
+  Index tailStartVertex() const { return tailStartVert_; }
+  Index tailStartHalfEdge() const { return tailStartHe_; }
+  void addLeafFlags(Index leaf, std::uint8_t flags) { leaves_[leaf].flags |= flags; }
+  static constexpr Index kTailLeafFaces = 1020;
+
+  // Replaces the leaves (sorted by range, empty ones allowed) and builds a new tree over them.
+  // Leaf indices are kept: this is how dynamic topology folds edits back into the hierarchy.
+  void setLeaves(std::vector<BvhLeaf> leaves);
+  // Rebuilds the tree over the current leaves (median split on leaf centres), keeping leaf indices.
+  void rebuildTree();
 
   std::span<const BvhLeaf> leaves() const { return leaves_; }
+  // Leaf size the hierarchy was built with; dynamic topology keeps new leaves within it.
+  Index maxLeafFaces() const { return maxLeafFaces_; }
   std::size_t memoryBytes() const;
   std::span<const BvhNode> nodes() const { return nodes_; }
   bool empty() const { return nodes_.empty(); }
@@ -84,11 +122,31 @@ class Bvh {
 
  private:
   Aabb leafBounds(const Mesh& mesh, const BvhLeaf& leaf) const;
+  template <typename Fn>
+  void forEachTailLeaf(Fn&& fn) const {
+    if (!dynamic_) return;
+    for (Index l = firstTailLeaf_; l < static_cast<Index>(leaves_.size()); ++l) fn(l);
+  }
 
   std::vector<BvhNode> nodes_;    // Depth-first preorder: children always follow their parent.
   std::vector<BvhLeaf> leaves_;
-  std::vector<Index> leafNode_;   // leaf index -> node index
+  std::vector<Index> leafNode_;   // leaf index -> node index (kInvalid for empty and tail leaves)
   std::vector<Index> parent_;     // node index -> parent node index
+  Index maxLeafFaces_ = 1024;
+  bool dynamic_ = false;
+  Index firstTailLeaf_ = 0;
+  Index tailStartFace_ = 0, tailStartVert_ = 0, tailStartHe_ = 0;
 };
+
+// Splits `order` (face indices) into groups of at most maxLeafFaces faces by recursive median
+// splits on the longest axis of the face centroids, as Bvh::build does. Reorders `order` and
+// returns the group boundaries (first entry 0, last entry order.size()).
+std::vector<Index> partitionFaces(std::span<const Vec3> centroids, std::vector<Index>& order, Index maxLeafFaces);
+
+// Checks the at-rest layout: a valid mesh without removed elements whose leaves partition faces,
+// half-edges (laid out face by face) and face-using vertices into contiguous ranges in leaf order,
+// with isolated vertices last; every owned vertex used by a face of its leaf (unless the leaf owns
+// orphans); bounds that contain their leaves; and a tree that reaches every non-empty leaf once.
+ValidationResult validateLayout(const Mesh& mesh, const Bvh& bvh);
 
 }  // namespace plegl

@@ -53,6 +53,9 @@ inline constexpr const char* kBrushNames[kBrushCount] = {"Draw",    "Clay",    "
                                                          "Inflate", "Flatten", "Crease", "Mask"};
 inline constexpr const char* kBrushKeys[kBrushCount] = {"D", "C", "S", "G", "I", "T", "Shift+C", "M"};
 enum class PressureMap { Strength, Radius, Both, None };
+// How the dynamic topology detail size is given: in screen pixels at the cursor (so zooming in
+// adds detail), or as a fixed edge length in object units.
+enum class DetailMode { Relative, Constant };
 
 struct SculptSettings {
   BrushKind brush = BrushKind::Draw;
@@ -64,6 +67,13 @@ struct SculptSettings {
   bool symmetryX = true;       // PRD default for character sculpting.
   float spacing = 0.1f;        // Dab spacing as a fraction of the radius.
   int maskFilterSteps = 2;     // Iterations per Blur Mask / Sharpen Mask.
+  // Dynamic topology (Ctrl+D): brushes add and remove triangles under the cursor so detail can go
+  // anywhere. Not used by Grab and Mask.
+  bool dyntopo = false;
+  DyntopoRefine dyntopoRefine = DyntopoRefine::SplitCollapse;
+  DetailMode detailMode = DetailMode::Relative;
+  float detailPx = 8.0f;      // Relative: target edge length in screen pixels (hold R to change).
+  float detailSize = 0.02f;   // Constant: target edge length in object units.
 };
 
 struct RemeshSettings {
@@ -88,6 +98,7 @@ struct FrameStats {
   double inputToFrameMs = 0.0;  // OS input timestamp to the frame showing it being swapped.
   int dabsLastFrame = 0;
   double maskOpMs = 0.0;        // Last whole-mesh mask operation (invert, clear, blur...).
+  double topologyMs = 0.0;      // Dynamic topology part of the last dab.
 };
 
 class App {
@@ -150,6 +161,9 @@ class App {
   void importFile(const std::filesystem::path& path);
   void quit() { running_ = false; }
   const RenderStats& renderStats() const { return renderer_.stats(); }
+  const StrokeTopologyStats& lastStrokeTopology() const { return sculptor_.lastStrokeTopology(); }
+  // Detail size the next dab would use at a surface point, in object units (dynamic topology).
+  float detailSizeAt(const SceneObject& obj, const Vec3& worldPoint) const;
   const std::optional<ScenePick>& hover() const { return hover_; }
 
  private:
@@ -240,6 +254,7 @@ class App {
   Vec3 grabStartWorld_{0.0f};
   Vec3 grabPlaneNormal_{0.0f, 0.0f, 1.0f};
   bool adjustingRadius_ = false;     // F held.
+  bool adjustingDetail_ = false;     // R held in Sculpt mode.
   std::uint64_t oldestInputThisFrameNs_ = 0;
   int dabsThisFrame_ = 0;
 };

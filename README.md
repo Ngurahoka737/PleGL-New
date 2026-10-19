@@ -2,7 +2,7 @@
 
 Software digital sculpting 3D untuk desktop yang fokus pada satu hal: sculpting yang cepat, stabil, dan mudah dipelajari.
 
-Status: **Phase 6 (Masking)**. Tujuh brush (Draw, Clay, Smooth, Grab, Inflate, Flatten, Crease), empat jenis falloff, tekanan pen, undo/redo, simetri X, dan quad remesh (voxel remesh lalu optimasi valence 4 sampai sekitar 99%, relaksasi, dan proyeksi ke permukaan asli) sudah jalan di atas engine Phase 0 (mesh, BVH, renderer, import/export OBJ). Project bisa disimpan dan dibuka sebagai `.psculpt`, dengan autosave tiap 5 menit dan pemulihan setelah crash. Mask melindungi area dari semua brush, bisa dicat, dibalik, dihapus, diperhalus, dan dipertajam, lalu ikut tersimpan di project dan ikut pindah saat remesh.
+Status: **Phase 6b (Dynamic Topology)**. Tujuh brush (Draw, Clay, Smooth, Grab, Inflate, Flatten, Crease), empat jenis falloff, tekanan pen, undo/redo, simetri X, dan quad remesh (voxel remesh lalu optimasi valence 4 sampai sekitar 99%, relaksasi, dan proyeksi ke permukaan asli) sudah jalan di atas engine Phase 0 (mesh, BVH, renderer, import/export OBJ). Project bisa disimpan dan dibuka sebagai `.psculpt`, dengan autosave tiap 5 menit dan pemulihan setelah crash. Mask melindungi area dari semua brush, bisa dicat, dibalik, dihapus, diperhalus, dan dipertajam, lalu ikut tersimpan di project dan ikut pindah saat remesh. Dynamic topology (Ctrl+D) menambah segitiga di tempat yang sedang di-sculpt dan menggabungkannya di tempat yang tidak butuh detail, dengan ukuran detail dalam pixel layar atau satuan objek, dan tetap bisa di-undo per stroke.
 
 ## Stack
 
@@ -73,6 +73,8 @@ cmake --build --preset engine-only
 | Hapus semua mask / mask semua | Alt + M / Alt + Shift + M (di kedua mode) |
 | Blur / Sharpen mask | Alt + B / Alt + Shift + B (di kedua mode) |
 | Radius brush | [ dan ], atau tahan F lalu geser mouse ke samping |
+| Dynamic topology on/off | Ctrl + D (di Sculpt mode) |
+| Ukuran detail dynamic topology | Tahan R lalu geser mouse ke samping (di Sculpt mode) |
 | Simetri X on/off | X (di Sculpt mode) |
 | Remesh objek terpilih | Ctrl + R |
 | Undo / Redo | Ctrl + Z / Ctrl + Shift + Z atau Ctrl + Y |
@@ -91,7 +93,8 @@ src/engine/   Library engine tanpa UI (diuji headless)
   spatial/    BVH (node daun = unit kerja engine), raycast, query bola, titik terdekat
   io/         Import dan export OBJ, project file .psculpt
   scene/      Objek, transform, picking
-  sculpt/     Brush, stroke sampler, sculptor (dab, simetri), operasi mask, undo per daun BVH
+  sculpt/     Brush, stroke sampler, sculptor (dab, simetri), dynamic topology, operasi mask, undo per daun BVH
+  render/     Indeks gambar per daun BVH (tanpa OpenGL, diuji headless)
   remesh/     Grid voxel (SDF), Surface Nets quad, voxel remesh, quad remesh
 src/app/      Aplikasi: SDL3, renderer OpenGL, kamera, UI
 tests/        Unit test (doctest)
