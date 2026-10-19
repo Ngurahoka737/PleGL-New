@@ -2,7 +2,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
+#include <variant>
 #include <vector>
 
 #include "scene/Scene.h"
@@ -27,6 +29,25 @@ struct SculptUndo {
   std::size_t bytes() const;
 };
 
+// A whole mesh with its BVH, as one topology state of an object.
+struct MeshState {
+  Mesh mesh;
+  Bvh bvh;
+  std::uint64_t topologyVersion = 0;
+  std::size_t bytes() const;
+};
+
+// A topology change such as a remesh: the object's complete mesh before and after. Restoring a
+// state also restores its topologyVersion, so sculpt entries recorded on that topology apply
+// again after undoing the remesh.
+struct TopologyUndo {
+  std::string label;
+  std::uint32_t objectId = 0;
+  std::shared_ptr<const MeshState> before;
+  std::shared_ptr<const MeshState> after;
+  std::size_t bytes() const;
+};
+
 class UndoStack {
  public:
   explicit UndoStack(std::size_t maxBytes = std::size_t{1} << 30) : maxBytes_(maxBytes) {}
@@ -34,6 +55,7 @@ class UndoStack {
   // Adds an entry and drops anything that could be redone. Old entries are dropped once the
   // stack exceeds its memory budget.
   void push(SculptUndo entry);
+  void push(TopologyUndo entry);
 
   // Return the label of what was undone or redone, or empty when nothing applied.
   std::string undo(Scene& scene);
@@ -46,9 +68,13 @@ class UndoStack {
   void clear();
 
  private:
+  using Entry = std::variant<SculptUndo, TopologyUndo>;
+  void pushEntry(Entry entry);
+  static std::size_t bytesOf(const Entry& e);
   static bool apply(Scene& scene, const SculptUndo& entry, const std::vector<LeafState>& states);
+  static bool apply(Scene& scene, const TopologyUndo& entry, const MeshState& from, const MeshState& to);
 
-  std::vector<SculptUndo> entries_;
+  std::vector<Entry> entries_;
   std::size_t cursor_ = 0;  // Entries before the cursor are undoable.
   std::size_t bytes_ = 0;
   std::size_t maxBytes_;

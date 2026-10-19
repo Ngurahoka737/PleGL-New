@@ -3,6 +3,7 @@
 #include <misc/cpp/imgui_stdlib.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <unordered_map>
 
@@ -166,6 +167,35 @@ void App::drawUi() {
 
       sectionHeader("Symmetry");
       ImGui::Checkbox("Mirror X (X)", &sculpt.symmetryX);
+
+      sectionHeader("Remesh");
+      ImGui::SetNextItemWidth(-1);
+      ImGui::DragFloat("##voxel", &remesh.voxelSize, remesh.voxelSize * 0.01f, 0.0005f, 1.0f, "voxel size %.4f",
+                       ImGuiSliderFlags_Logarithmic);
+      remesh.voxelSize = std::clamp(remesh.voxelSize, 0.0005f, 1.0f);
+      if (const SceneObject* sel = scene.find(selectedId)) {
+        const Aabb b = sel->bvh.bounds();
+        if (b.valid()) {
+          const float longest = std::max({b.extent().x, b.extent().y, b.extent().z});
+          const int across = static_cast<int>(std::ceil(longest / remesh.voxelSize));
+          ImGui::TextDisabled("%d voxels across", across);
+          if (across + 7 > 512) {
+            ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.4f, 1.0f), "Voxel size too small (limit 505).");
+          } else if (across < 48) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.8f, 0.4f, 1.0f));
+            ImGui::TextWrapped("Large voxel size may remove surface details.");
+            ImGui::PopStyleColor();
+          }
+        }
+      }
+      ImGui::BeginDisabled(remeshing() || strokeActive() || !scene.find(selectedId));
+      if (ImGui::Button(remeshing() ? "Remeshing..." : "Voxel Remesh (Ctrl+R)", ImVec2(-1, 0))) requestRemesh();
+      ImGui::EndDisabled();
+      if (!lastRemeshInfo.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextWrapped("Last: %s", lastRemeshInfo.c_str());
+        ImGui::PopStyleColor();
+      }
 
       sectionHeader("History");
       ImGui::BeginDisabled(!undoStack.canUndo() || strokeActive());

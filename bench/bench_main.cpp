@@ -12,6 +12,7 @@
 #include "io/Obj.h"
 #include "mesh/Primitives.h"
 #include "scene/Scene.h"
+#include "remesh/VoxelRemesh.h"
 #include "sculpt/Sculptor.h"
 #include "spatial/Bvh.h"
 
@@ -136,6 +137,31 @@ int main(int argc, char** argv) {
       }
       sculptor.endStroke();
       report(obj, radius, "Grab", times, verts);
+    }
+  }
+  // Voxel remesh: whole pipeline (sign, narrow-band distance, Surface Nets, half-edge build) at
+  // two voxel sizes. The PRD targets 100K < 1 s, 500K < 3 s, 1M < 5 s.
+  std::printf("\nVoxel remesh benchmark\n\n");
+  std::printf("%10s %8s %12s %10s %10s %10s %10s %10s %8s\n", "in verts", "voxel", "grid", "out verts", "grid ms",
+              "extract ms", "build ms", "total ms", "MB");
+  std::vector<int> remeshRes = quick ? std::vector<int>{129} : std::vector<int>{129, 289, 408};
+  for (int res : remeshRes) {
+    const Mesh in = makeQuadSphere(res);
+    for (float voxel : {0.01f, 0.005f}) {
+      VoxelRemeshStats st;
+      std::string error;
+      Timer t;
+      auto out = voxelRemesh(in, {.voxelSize = voxel}, &st, &error);
+      const double total = t.ms();
+      if (!out) {
+        std::printf("  remesh failed: %s\n", error.c_str());
+        continue;
+      }
+      char grid[32];
+      std::snprintf(grid, sizeof(grid), "%dx%dx%d", st.resolution[0], st.resolution[1], st.resolution[2]);
+      std::printf("%10d %8.3f %12s %10d %10.0f %10.0f %10.0f %10.0f %8.0f\n", in.vertexCount(), voxel, grid,
+                  out->vertexCount(), st.gridMs, st.extractMs, st.buildMs, total,
+                  static_cast<double>(st.gridBytes) / (1024.0 * 1024.0));
     }
   }
   return 0;

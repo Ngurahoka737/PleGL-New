@@ -2,7 +2,7 @@
 
 Software digital sculpting 3D untuk desktop yang fokus pada satu hal: sculpting yang cepat, stabil, dan mudah dipelajari.
 
-Status: **Phase 2 (Sculpt Core)**. Tujuh brush (Draw, Clay, Smooth, Grab, Inflate, Flatten, Crease), empat jenis falloff, tekanan pen, undo/redo, dan simetri X sudah jalan di atas engine Phase 0 (mesh, BVH, renderer, import/export OBJ).
+Status: **Phase 3 (Voxel Engine)**. Tujuh brush (Draw, Clay, Smooth, Grab, Inflate, Flatten, Crease), empat jenis falloff, tekanan pen, undo/redo, simetri X, dan voxel remesh dengan output quad sudah jalan di atas engine Phase 0 (mesh, BVH, renderer, import/export OBJ).
 
 ## Stack
 
@@ -70,6 +70,7 @@ cmake --build --preset engine-only
 | Pilih brush Inflate / Flatten / Crease | I / T / Shift + C |
 | Radius brush | [ dan ], atau tahan F lalu geser mouse ke samping |
 | Simetri X on/off | X (di Sculpt mode) |
+| Voxel remesh objek terpilih | Ctrl + R |
 | Undo / Redo | Ctrl + Z / Ctrl + Shift + Z atau Ctrl + Y |
 | Import / Export OBJ | Ctrl + O / Ctrl + E |
 | Uji update GPU parsial | B (menonjolkan permukaan di bawah cursor) |
@@ -86,6 +87,7 @@ src/engine/   Library engine tanpa UI (diuji headless)
   io/         Import dan export OBJ
   scene/      Objek, transform, picking
   sculpt/     Brush, stroke sampler, sculptor (dab, simetri), undo per daun BVH
+  remesh/     Grid voxel (SDF), Surface Nets quad, voxel remesh
 src/app/      Aplikasi: SDL3, renderer OpenGL, kamera, UI
 tests/        Unit test (doctest)
 bench/        Benchmark engine pada mesh 50K sampai 1M vertex

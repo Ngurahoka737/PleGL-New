@@ -59,6 +59,17 @@ Semua brush kecuali Grab lewat `Brush::apply` dan dibatasi `kMaxDabMove` (0,2 ×
 
 Undo menyimpan keadaan sebelum dan sesudah untuk daun yang berubah saja (posisi dan normal), dengan batas memori 1 GB. Entry yang topologinya sudah berubah (misalnya setelah remesh nanti) dilewati, bukan diterapkan ke mesh yang salah.
 
+## Voxel remesh (`remesh/`)
+
+Pipeline: mesh → `VoxelGrid` (signed distance di node grid) → `extractSurfaceNets` (quad) → `buildMesh` → BVH baru. Topologi awal tidak menentukan hasil.
+
+- **Tanda dalam/luar** dihitung tepat di setiap node: sinar sepanjang tiap sumbu grid menghitung persilangan permukaan beserta arahnya (winding number). Node dianggap di dalam kalau minimal dua dari tiga sumbu setuju. Bagian yang saling tumpuk dan self-intersection jadi gabungan (union), arah face yang terbalik tidak berpengaruh, dan lubang kecil kalah suara.
+- **Jarak** hanya disimpan di pita tipis (2 voxel) sekitar permukaan, dalam blok 8×8×8, jadi memori mengikuti luas permukaan. Tanda disimpan padat (1 byte per node).
+- **Surface Nets** membuat satu vertex per patch permukaan di tiap sel dan satu quad per edge grid yang disilang permukaan, jadi hasilnya 100% quad dan tertutup. Sel yang dilewati dua lembar permukaan mendapat satu vertex per lembar. Face sel yang ambigu diputuskan dari nilai tengahnya dengan urutan penjumlahan tetap, jadi dua sel tetangga selalu sepakat dan setiap edge dipakai tepat dua quad (manifold).
+- Remesh di aplikasi berjalan di worker thread. Undo menyimpan mesh lengkap sebelum dan sesudah (`TopologyUndo`), termasuk `topologyVersion`, sehingga undo stroke sebelum remesh tetap berlaku setelah remesh di-undo.
+
+Keterbatasan saat ini: valence 4 baru sekitar 50% (khas Surface Nets pada permukaan melengkung). Optimasi valence, relaksasi, dan proyeksi ke permukaan asli ada di fase berikutnya.
+
 ## Threading (`core/Parallel.h`)
 
 Engine hanya memakai satu primitif paralel, `parallelFor`. Implementasinya sekarang thread pool kecil sendiri; bisa diganti oneTBB tanpa mengubah pemanggil. Import OBJ dan build BVH berjalan di thread latar, lalu hasilnya ditambahkan ke scene di thread utama.
@@ -100,3 +111,18 @@ Phase 2, 1M vertex, p95 per dab:
 | Grab | 0,4 ms | 1,8 ms |
 
 Target PRD (latensi brush di bawah 16 ms) masih terpenuhi pada 1M vertex dengan brush besar. Upload GPU belum termasuk angka ini; panel Performance di aplikasi menampilkan waktu dab dan latensi input-ke-frame secara langsung.
+
+## Hasil benchmark voxel remesh (Phase 3)
+
+`plegl_bench`, mesin cloud 4 thread, Release, quad sphere radius 1. Total termasuk tanda, jarak, Surface Nets, dan build half-edge:
+
+| Vertex input | Voxel | Grid | Vertex output | Total | Memori grid |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 100K | 0,010 | 207³ | 188K | 0,17 s | 17 MB |
+| 100K | 0,005 | 407³ | 754K | 0,75 s | 99 MB |
+| 500K | 0,010 | 207³ | 188K | 0,42 s | 17 MB |
+| 500K | 0,005 | 407³ | 754K | 1,1 s | 98 MB |
+| 1M | 0,010 | 208³ | 188K | 0,69 s | 17 MB |
+| 1M | 0,005 | 408³ | 754K | 1,6 s | 98 MB |
+
+Target PRD: 100K < 1 s, 500K < 3 s, 1M < 5 s. Volume bola berubah kurang dari 2% pada voxel 0,04, dan dua bola yang tumpang tindih menjadi satu permukaan dengan volume gabungan yang benar (selisih di bawah 3%).

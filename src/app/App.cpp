@@ -1,5 +1,7 @@
 #include "App.h"
 
+#include "remesh/VoxelRemesh.h"
+
 #include <glad/gl.h>
 #include <imgui.h>
 #include <imgui_impl_opengl3.h>
@@ -303,6 +305,7 @@ void App::handleShortcut(const SDL_KeyboardEvent& key) {
     if (key.key == SDLK_O) requestImport();
     if (key.key == SDLK_E) requestExport();
     if (key.key == SDLK_N) newScene();
+    if (key.key == SDLK_R) requestRemesh();
     return;
   }
   switch (key.key) {
@@ -480,6 +483,10 @@ void App::beginStroke(float x, float y, std::uint64_t timestampNs) {
   SceneObject* obj = scene.find(hover_->objectId);
   if (!obj) return;
   selectedId = obj->id;
+  if (obj->id == remeshObjectId_) {
+    statusMessage = "Wait for the remesh to finish before sculpting this object.";
+    return;
+  }
   const SDL_Keymod mods = SDL_GetModState();
   strokeBrush_ = (mods & SDL_KMOD_SHIFT) != 0 ? BrushKind::Smooth : sculpt.brush;
   StrokeOptions opts;
@@ -599,6 +606,60 @@ void App::redo() {
   if (sculptor_.active()) return;
   const std::string label = undoStack.redo(scene);
   statusMessage = label.empty() ? "Nothing to redo" : "Redo " + label;
+}
+
+void App::requestRemesh() {
+  SceneObject* obj = scene.find(selectedId);
+  if (!obj) {
+    statusMessage = "Select an object to remesh.";
+    return;
+  }
+  if (remeshing() || sculptor_.active()) return;
+  remeshObjectId_ = obj->id;
+  statusMessage = "Remeshing " + obj->name + "...";
+  // The worker gets its own copy; the scene is only touched on the main thread.
+  auto input = std::make_shared<Mesh>(obj->mesh);
+  const std::uint32_t id = obj->id;
+  const std::uint64_t version = obj->topologyVersion;
+  const VoxelRemeshParams params{.voxelSize = remesh.voxelSize};
+  workers_.emplace_back([this, input, id, version, params] {
+    Timer t;
+    auto remeshStats = std::make_shared<VoxelRemeshStats>();
+    auto error = std::make_shared<std::string>();
+    auto result = std::make_shared<std::optional<Mesh>>(voxelRemesh(*input, params, remeshStats.get(), error.get()));
+    auto bvh = std::make_shared<Bvh>();
+    if (*result) bvh->build(**result);
+    const double ms = t.ms();
+    std::lock_guard lock(asyncMutex_);
+    asyncResults_.push_back([this, id, version, remeshStats, error, result, bvh, ms] {
+      remeshObjectId_ = 0;
+      SceneObject* target = scene.find(id);
+      if (!*result) {
+        statusMessage = "Remesh failed: " + *error;
+        return;
+      }
+      if (!target || target->topologyVersion != version) {
+        statusMessage = "Remesh discarded: the object changed while it ran.";
+        return;
+      }
+      TopologyUndo entry;
+      entry.label = "Remesh";
+      entry.objectId = id;
+      entry.before = std::make_shared<MeshState>(
+          MeshState{std::move(target->mesh), std::move(target->bvh), target->topologyVersion});
+      target->mesh = std::move(**result);
+      target->bvh = std::move(*bvh);
+      target->topologyVersion = nextTopologyVersion();
+      target->dirtyLeaves.clear();
+      entry.after = std::make_shared<MeshState>(MeshState{target->mesh, target->bvh, target->topologyVersion});
+      undoStack.push(std::move(entry));
+      char buf[256];
+      std::snprintf(buf, sizeof(buf), "%d vertices, %d quads, grid %dx%dx%d, %.0f ms", target->mesh.vertexCount(),
+                    target->mesh.faceCount(), remeshStats->resolution[0], remeshStats->resolution[1], remeshStats->resolution[2], ms);
+      lastRemeshInfo = buf;
+      statusMessage = "Remeshed " + target->name + ": " + lastRemeshInfo;
+    });
+  });
 }
 
 // ---- Files ---------------------------------------------------------------------------------
