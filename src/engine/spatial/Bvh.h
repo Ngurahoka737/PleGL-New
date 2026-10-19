@@ -57,6 +57,9 @@ class Bvh {
     Index face = kInvalid;
     float distSq = 0.0f;
     Vec3 faceNormal{0.0f};  // Normalized geometric normal of the closest face.
+    // Corners of the closest triangle (faces are fanned from their first half-edge), for
+    // interpolating vertex attributes at `position`.
+    Index corners[3] = {kInvalid, kInvalid, kInvalid};
   };
   bool closestPoint(const Mesh& mesh, const Vec3& p, float maxDist, ClosestHit& out) const;
 

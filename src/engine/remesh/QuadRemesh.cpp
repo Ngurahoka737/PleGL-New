@@ -4,7 +4,9 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 
+#include "core/Geometry.h"
 #include "core/Parallel.h"
 #include "core/Timer.h"
 #include "mesh/MeshEdit.h"
@@ -308,8 +310,15 @@ std::optional<Mesh> quadRemesh(const Mesh& input, const QuadRemeshParams& params
   float h = params.targetEdge * float(1 << subdivisions);  // Edge length of the current mesh.
   std::optional<Mesh> out = voxelRemesh(input, {h, params.maxResolution}, &st.voxel, error);
   if (!out) return out;
+  const bool masked = input.anyMasked();
   if (!optimize) {  // Plain voxel remesh.
     st.raw = st.optimized = measureQuality(*out);
+    if (masked) {
+      Mesh ref = input;
+      Bvh refBvh;
+      refBvh.build(ref, {.maxLeafFaces = 8});
+      transferMask(ref, refBvh, *out);
+    }
     return out;
   }
 
@@ -346,9 +355,28 @@ std::optional<Mesh> quadRemesh(const Mesh& input, const QuadRemeshParams& params
     h *= 0.5f;
     relax(*out, ref, refBvh, h, params.relaxIterations);
   }
+  if (masked) transferMask(ref, refBvh, *out);
   st.optimizeMs = t.ms() - statsMs;
   st.optimized = measureQuality(*out, errRef, errBvh);
   return out;
+}
+
+void transferMask(const Mesh& source, const Bvh& sourceBvh, Mesh& target) {
+  if (!source.anyMasked()) {
+    target.mask.clear();
+    return;
+  }
+  target.mask.assign(target.positions.size(), 0.0f);
+  parallelFor(0, target.positions.size(), 2048, [&](std::size_t b, std::size_t e) {
+    for (std::size_t v = b; v < e; ++v) {
+      Bvh::ClosestHit hit;
+      if (!sourceBvh.closestPoint(source, target.positions[v], std::numeric_limits<float>::infinity(), hit)) continue;
+      const Index* c = hit.corners;
+      const Vec3 w = barycentric(hit.position, source.positions[c[0]], source.positions[c[1]], source.positions[c[2]]);
+      const float value = w.x * source.mask[c[0]] + w.y * source.mask[c[1]] + w.z * source.mask[c[2]];
+      target.mask[v] = std::clamp(value, 0.0f, 1.0f);
+    }
+  });
 }
 
 MeshQuality measureQuality(const Mesh& m, const Mesh* reference, const Bvh* referenceBvh) {

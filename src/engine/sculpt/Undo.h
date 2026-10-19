@@ -11,15 +11,18 @@
 
 namespace plegl {
 
-// Vertex data owned by one BVH leaf at one moment.
+// Vertex data owned by one BVH leaf at one moment. Each channel is either empty (not recorded,
+// so applying the state leaves it alone) or holds one value per vertex of the leaf. Sculpt strokes
+// record positions and normals; mask strokes and mask operations record the mask only.
 struct LeafState {
   Index leaf = kInvalid;
   std::vector<Vec3> positions;
   std::vector<Vec3> normals;
+  std::vector<float> mask;
 };
 
-// One sculpt stroke: only the leaves it touched, before and after. A stroke over a 1M vertex
-// mesh that touches 20 leaves stores about 20 * 1024 vertices, not the whole mesh.
+// One sculpt stroke or mask edit: only the leaves it touched, before and after. A stroke over a
+// 1M vertex mesh that touches 20 leaves stores about 20 * 1024 vertices, not the whole mesh.
 struct SculptUndo {
   std::string label;
   std::uint32_t objectId = 0;

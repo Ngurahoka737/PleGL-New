@@ -168,16 +168,19 @@ std::vector<Index> Mesh::reorder(std::span<const Index> faceOrder) {
   }
 
   std::vector<Vec3> newPos(nv), newNrm(normals.size() == positions.size() ? nv : 0);
+  std::vector<float> newMask(mask.size() == positions.size() ? nv : 0);
   std::vector<Index> newVertHe(nv);
   for (Index v = 0; v < nv; ++v) {
     const Index o = vertOld[v];
     newPos[v] = positions[o];
     if (!newNrm.empty()) newNrm[v] = normals[o];
+    if (!newMask.empty()) newMask[v] = mask[o];
     newVertHe[v] = vertHe[o] == kInvalid ? kInvalid : heMap[vertHe[o]];
   }
 
   positions = std::move(newPos);
   normals = std::move(newNrm);
+  mask = std::move(newMask);
   vertHe = std::move(newVertHe);
   faceHe = std::move(newFaceHe);
   heNext = std::move(newNext);
@@ -188,6 +191,13 @@ std::vector<Index> Mesh::reorder(std::span<const Index> faceOrder) {
 }
 
 void Mesh::clear() { *this = Mesh{}; }
+
+bool Mesh::anyMasked() const {
+  for (float v : mask) {
+    if (v > 0.0f) return true;
+  }
+  return false;
+}
 
 // ---------------------------------------------------------------------------------------------
 
@@ -387,6 +397,10 @@ ValidationResult validate(const Mesh& m) {
 
   if (static_cast<Index>(m.vertHe.size()) != nv) return fail("vertHe size mismatch");
   if (!m.normals.empty() && static_cast<Index>(m.normals.size()) != nv) return fail("normals size mismatch");
+  if (!m.mask.empty() && static_cast<Index>(m.mask.size()) != nv) return fail("mask size mismatch");
+  for (Index v = 0; v < static_cast<Index>(m.mask.size()); ++v) {
+    if (!(m.mask[v] >= 0.0f && m.mask[v] <= 1.0f)) return fail("mask out of range at vertex " + std::to_string(v));
+  }
   if (static_cast<Index>(m.heTwin.size()) != nh || static_cast<Index>(m.heVert.size()) != nh ||
       static_cast<Index>(m.heFace.size()) != nh)
     return fail("half-edge array size mismatch");

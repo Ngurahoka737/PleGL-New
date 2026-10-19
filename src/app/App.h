@@ -15,6 +15,7 @@
 #include "Camera.h"
 #include "Renderer.h"
 #include "scene/Scene.h"
+#include "sculpt/MaskOps.h"
 #include "sculpt/Sculptor.h"
 #include "sculpt/StrokeSampler.h"
 #include "io/Project.h"
@@ -45,21 +46,24 @@ struct PrimitiveSettings {
   int planeResolution = 64;
 };
 
-enum class BrushKind { Draw, Clay, Smooth, Grab, Inflate, Flatten, Crease };
-inline constexpr int kBrushCount = 7;
-inline constexpr const char* kBrushNames[kBrushCount] = {"Draw", "Clay", "Smooth", "Grab", "Inflate", "Flatten", "Crease"};
-inline constexpr const char* kBrushKeys[kBrushCount] = {"D", "C", "S", "G", "I", "T", "Shift+C"};
+// Projects store the brush as its index here, so new brushes go at the end.
+enum class BrushKind { Draw, Clay, Smooth, Grab, Inflate, Flatten, Crease, Mask };
+inline constexpr int kBrushCount = 8;
+inline constexpr const char* kBrushNames[kBrushCount] = {"Draw",    "Clay",    "Smooth", "Grab",
+                                                         "Inflate", "Flatten", "Crease", "Mask"};
+inline constexpr const char* kBrushKeys[kBrushCount] = {"D", "C", "S", "G", "I", "T", "Shift+C", "M"};
 enum class PressureMap { Strength, Radius, Both, None };
 
 struct SculptSettings {
   BrushKind brush = BrushKind::Draw;
   float radiusPx = 60.0f;      // Screen-space radius, like most sculpting tools.
-  float strength[kBrushCount] = {0.5f, 0.5f, 0.5f, 1.0f, 0.5f, 0.5f, 0.5f};  // Per brush.
+  float strength[kBrushCount] = {0.5f, 0.5f, 0.5f, 1.0f, 0.5f, 0.5f, 0.5f, 1.0f};  // Per brush.
   Falloff falloff = Falloff::Smooth;
   bool invert = false;         // Brushes subtract instead of add (Ctrl flips it per stroke).
   PressureMap pressure = PressureMap::Strength;
   bool symmetryX = true;       // PRD default for character sculpting.
   float spacing = 0.1f;        // Dab spacing as a fraction of the radius.
+  int maskFilterSteps = 2;     // Iterations per Blur Mask / Sharpen Mask.
 };
 
 struct RemeshSettings {
@@ -83,6 +87,7 @@ struct FrameStats {
   double inputToDabMs = 0.0;    // OS input timestamp to dab applied.
   double inputToFrameMs = 0.0;  // OS input timestamp to the frame showing it being swapped.
   int dabsLastFrame = 0;
+  double maskOpMs = 0.0;        // Last whole-mesh mask operation (invert, clear, blur...).
 };
 
 class App {
@@ -138,6 +143,9 @@ class App {
   void bumpUnderCursor();  // Debug path for per-leaf GPU updates.
   void undo();
   void redo();
+  // Whole-mesh mask operations on the selected object, undoable.
+  void applyMask(MaskOp op);
+  bool canEditMask() const;
   bool strokeActive() const { return sculptor_.active(); }
   void importFile(const std::filesystem::path& path);
   void quit() { running_ = false; }
@@ -221,9 +229,13 @@ class App {
   InflateBrush inflateBrush_;
   FlattenBrush flattenBrush_;
   CreaseBrush creaseBrush_;
+  MaskBrush maskBrush_;
+  MaskSmoothBrush maskSmoothBrush_;  // Shift with the Mask brush smooths the mask.
   StrokeSampler sampler_;
   std::vector<StrokeSample> samples_;
-  BrushKind strokeBrush_ = BrushKind::Draw;  // Brush of the running stroke (Shift turns it into Smooth).
+  // Brush of the running stroke. Shift turns it into Smooth, except for Mask, which stays Mask and
+  // smooths the mask instead.
+  BrushKind strokeBrush_ = BrushKind::Draw;
   // Grab drags the captured region in the plane through the grab point facing the camera.
   Vec3 grabStartWorld_{0.0f};
   Vec3 grabPlaneNormal_{0.0f, 0.0f, 1.0f};

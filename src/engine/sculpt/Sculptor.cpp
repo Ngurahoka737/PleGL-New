@@ -11,11 +11,15 @@ namespace plegl {
 void Sculptor::beginStroke(SceneObject& object, const Brush& brush, const StrokeOptions& options, std::string label) {
   start(object, options, std::move(label));
   brush_ = &brush;
+  maskStroke_ = brush.editsMask();
+  // Allocate before the first snapshot, so the before-state holds real (zero) values.
+  if (maskStroke_) object.mesh.ensureMask();
 }
 
 void Sculptor::start(SceneObject& object, const StrokeOptions& options, std::string label) {
   object_ = &object;
   brush_ = nullptr;
+  maskStroke_ = false;
   grabVerts_.clear();
   options_ = options;
   undo_ = SculptUndo{};
@@ -36,8 +40,12 @@ void Sculptor::snapshot(Index leaf) {
   const Mesh& m = object_->mesh;
   LeafState s;
   s.leaf = leaf;
-  s.positions.assign(m.positions.begin() + l.vertBegin, m.positions.begin() + l.vertEnd);
-  s.normals.assign(m.normals.begin() + l.vertBegin, m.normals.begin() + l.vertEnd);
+  if (maskStroke_) {
+    s.mask.assign(m.mask.begin() + l.vertBegin, m.mask.begin() + l.vertEnd);
+  } else {
+    s.positions.assign(m.positions.begin() + l.vertBegin, m.positions.begin() + l.vertEnd);
+    s.normals.assign(m.normals.begin() + l.vertBegin, m.normals.begin() + l.vertEnd);
+  }
   snapshotIndex_.emplace(leaf, undo_.before.size());
   undo_.before.push_back(std::move(s));
 }
@@ -104,6 +112,12 @@ bool Sculptor::applyOne(const Dab& dabIn) {
   BrushContext ctx{m, bvh, leaves_, dab};
   brush_->apply(ctx);
   lastDab_.brushMs += t.ms();
+
+  if (maskStroke_) {  // Positions did not move: no normals, bounds or geometry upload.
+    for (Index l : leaves_) object_->markMaskDirty(l);
+    lastDab_.leaves += static_cast<int>(leaves_.size());
+    return true;
+  }
 
   // Brushes only move vertices inside the dab sphere. Every face touching such a vertex lies in a
   // queried leaf (its bounds contain the vertex), so the vertices of those faces are exactly the
@@ -196,7 +210,8 @@ bool Sculptor::beginGrab(SceneObject& object, const StrokeOptions& options, cons
         const Vec3 d = m.positions[v] - c;
         const float dist2 = glm::dot(d, d);
         if (dist2 >= r2) continue;
-        const float w = strength * falloffWeight(options.falloff, std::sqrt(dist2) / radius);
+        float w = strength * falloffWeight(options.falloff, std::sqrt(dist2) / radius);
+        if (!m.mask.empty()) w *= 1.0f - m.mask[v];  // Fully masked vertices stay put.
         if (w <= 0.0f) continue;
         auto [it, inserted] = slot.try_emplace(v, grabVerts_.size());
         if (inserted) grabVerts_.push_back({v, m.positions[v], 0.0f, 0.0f});
@@ -281,15 +296,41 @@ std::optional<SculptUndo> Sculptor::endStroke() {
   object_ = nullptr;
   if (undo_.before.empty()) return std::nullopt;
   const Mesh& m = obj->mesh;
+  if (maskStroke_) {
+    // Drop leaves the mask brush passed over without changing (for example already fully masked).
+    std::vector<LeafState> before;
+    for (LeafState& b : undo_.before) {
+      const BvhLeaf& l = obj->bvh.leaves()[b.leaf];
+      if (std::equal(b.mask.begin(), b.mask.end(), m.mask.begin() + l.vertBegin)) continue;
+      LeafState a;
+      a.leaf = b.leaf;
+      a.mask.assign(m.mask.begin() + l.vertBegin, m.mask.begin() + l.vertEnd);
+      undo_.after.push_back(std::move(a));
+      before.push_back(std::move(b));
+    }
+    if (before.empty()) return std::nullopt;
+    undo_.before = std::move(before);
+    return std::move(undo_);
+  }
+  // Drop leaves the stroke did not change, for example because they are fully masked. A leaf
+  // whose positions stayed but whose normals changed (a neighbour moved) is kept.
+  std::vector<LeafState> before;
+  before.reserve(undo_.before.size());
   undo_.after.reserve(undo_.before.size());
-  for (const LeafState& b : undo_.before) {
+  for (LeafState& b : undo_.before) {
     const BvhLeaf& l = obj->bvh.leaves()[b.leaf];
+    if (std::equal(b.positions.begin(), b.positions.end(), m.positions.begin() + l.vertBegin) &&
+        std::equal(b.normals.begin(), b.normals.end(), m.normals.begin() + l.vertBegin))
+      continue;
     LeafState a;
     a.leaf = b.leaf;
     a.positions.assign(m.positions.begin() + l.vertBegin, m.positions.begin() + l.vertEnd);
     a.normals.assign(m.normals.begin() + l.vertBegin, m.normals.begin() + l.vertEnd);
     undo_.after.push_back(std::move(a));
+    before.push_back(std::move(b));
   }
+  if (before.empty()) return std::nullopt;
+  undo_.before = std::move(before);
   return std::move(undo_);
 }
 

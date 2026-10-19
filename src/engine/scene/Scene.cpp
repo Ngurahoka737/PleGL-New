@@ -30,7 +30,7 @@ std::uint64_t nextTopologyVersion() {
 
 void SceneObject::rebuildSpatial() {
   bvh.build(mesh);
-  dirtyLeaves.clear();
+  clearDirty();
   topologyVersion = nextTopologyVersion();
 }
 

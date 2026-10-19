@@ -11,7 +11,7 @@ namespace plegl {
 // Polygon mesh stored as an index-based half-edge structure with struct-of-arrays attributes.
 //
 // Topology arrays hold 32-bit indices only, so a mesh can be copied, serialized or handed to
-// another thread cheaply. Hot sculpting paths only touch `positions` and `normals`.
+// another thread cheaply. Hot sculpting paths only touch `positions`, `normals` and `mask`.
 //
 // Conventions:
 //  - Half-edge h starts at heVert[h] and ends at heVert[heNext[h]].
@@ -24,6 +24,9 @@ class Mesh {
   // Vertex attributes.
   std::vector<Vec3> positions;
   std::vector<Vec3> normals;
+  // Sculpt mask in [0, 1]; 1 means fully protected from brushes. Empty means nothing is masked,
+  // otherwise it has one value per vertex. Topology builders leave it empty.
+  std::vector<float> mask;
 
   // Topology.
   std::vector<Index> vertHe;  // One outgoing half-edge per vertex (kInvalid if isolated).
@@ -42,6 +45,13 @@ class Mesh {
   Index faceSize(Index f) const;
   bool isBoundaryVertex(Index v) const;
   int valence(Index v) const;
+
+  // Allocates the mask (all zero) if it is empty.
+  void ensureMask() {
+    if (mask.empty()) mask.assign(positions.size(), 0.0f);
+  }
+  // True if any vertex has a non-zero mask value.
+  bool anyMasked() const;
 
   // Calls fn(h) for every outgoing half-edge of v. Each incident face is visited exactly once.
   template <class Fn>

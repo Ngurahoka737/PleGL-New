@@ -9,7 +9,7 @@ Dokumen ini merangkum keputusan yang sudah diterapkan di kode. Rencana lengkap P
 ## Mesh: half-edge berbasis index (`mesh/Mesh.h`)
 
 - Topologi adalah array `int32`: `heNext`, `heTwin`, `heVert`, `heFace`, ditambah `vertHe` dan `faceHe`. Tidak ada pointer, jadi mesh murah disalin, diserialisasi, dan dikirim ke thread lain.
-- Atribut disimpan sebagai struct-of-arrays (`positions`, `normals`). Jalur panas brush hanya menyentuh array ini.
+- Atribut disimpan sebagai struct-of-arrays (`positions`, `normals`, `mask`). Jalur panas brush hanya menyentuh array ini.
 - Edge terbuka ditandai `heTwin == -1`, tanpa loop boundary eksplisit.
 - Face boleh segitiga, quad, atau n-gon. Output remesh 100% quad.
 - `buildMesh` membangun twin lewat adjacency per vertex (linear terhadap jumlah half-edge) dan melaporkan edge non-manifold, vertex non-manifold, dan face degenerate.
@@ -25,7 +25,7 @@ Dokumen ini merangkum keputusan yang sudah diterapkan di kode. Rencana lengkap P
 
 ## Renderer (`src/app/Renderer.*`)
 
-- Satu buffer posisi dan satu buffer normal per objek, urutannya sama dengan mesh. Daun yang ditandai dirty diunggah per rentang, bukan seluruh buffer.
+- Satu buffer posisi, satu buffer normal, dan satu buffer mask per objek, urutannya sama dengan mesh. Daun yang ditandai dirty diunggah per rentang, bukan seluruh buffer. Mask punya daftar dirty sendiri, jadi stroke mask tidak mengunggah ulang posisi.
 - Wireframe memakai edge poligon asli (bukan diagonal segitiga), jadi quad tampil sebagai quad.
 - Matcap dibuat secara prosedural saat start, tanpa file aset.
 
@@ -57,7 +57,17 @@ Brush yang ada:
 
 Semua brush kecuali Grab lewat `Brush::apply` dan dibatasi `kMaxDabMove` (0,2 × radius per dab) supaya pencarian normal basi tetap benar. Grab punya jalur sendiri di `Sculptor::beginGrab/grab`: daftar vertex, face, dan daun yang terpengaruh dihitung sekali saat klik, lalu tiap gerakan cursor hanya menulis posisi, normal, dan refit daun itu.
 
-Undo menyimpan keadaan sebelum dan sesudah untuk daun yang berubah saja (posisi dan normal), dengan batas memori 1 GB. Entry yang topologinya sudah berubah (misalnya setelah remesh nanti) dilewati, bukan diterapkan ke mesh yang salah.
+Undo menyimpan keadaan sebelum dan sesudah untuk daun yang berubah saja (posisi dan normal, atau nilai mask untuk stroke dan operasi mask), dengan batas memori 1 GB. Stroke yang tidak mengubah apa pun (misalnya seluruhnya di area ter-mask) tidak membuat entry, jadi riwayat redo tetap utuh. Entry yang topologinya sudah berubah (misalnya setelah remesh nanti) dilewati, bukan diterapkan ke mesh yang salah.
+
+## Mask (`sculpt/MaskOps.h`, `Mesh::mask`)
+
+- `Mesh::mask` berisi satu float per vertex di [0, 1], 1 berarti terlindungi penuh. Kosong berarti tidak ada yang di-mask, jadi mesh tanpa mask tidak membayar memori apa pun. Mask ikut diurutkan ulang oleh `reorder`, ikut `splitEdge` (interpolasi), `collapseEdge`/`collapseDiagonal` (nilai terbesar dipertahankan, supaya area terlindungi tidak bocor), dan `compact`.
+- Setiap brush yang memindahkan vertex mengalikan gerakannya dengan (1 − mask). Grab mengalikan bobot tangkapnya saat klik. Vertex dengan mask 1 tidak bergerak sama sekali (bit-exact, dicek di test untuk semua brush).
+- **Mask brush** (`MaskBrush`) menggeser nilai mask ke 1 (cat) atau 0 (hapus) sesuai falloff dan strength. Dengan Shift, `MaskSmoothBrush` meratakan mask ke rata-rata tetangga. Berbeda dengan Smooth biasa, vertex border dirata-rata dengan semua tetangganya, jadi tepi terbuka tidak terputus dari mask di sebelahnya. Stroke mask lewat jalur `Sculptor` yang sama tetapi hanya menyimpan nilai mask untuk undo, tidak menghitung normal, dan tidak me-refit BVH. Daun yang mask-nya ternyata tidak berubah dibuang dari entry undo, jadi mengecat area yang sudah penuh tidak menambah riwayat.
+- **Operasi seluruh mesh** (`applyMaskOp`): Invert, Clear, Fill, Blur, dan Sharpen. Semuanya paralel per daun BVH, dan undo hanya menyimpan daun yang berubah. Blur menggeser tiap nilai setengah jalan ke rata-rata tetangganya; Sharpen mendorong nilai menjauhi hasil blur (unsharp mask) lalu dijepit ke [0, 1].
+- **Tampilan**: area ter-mask digelapkan di shader (`showMask`, `maskOpacity`). Kalau lebih dari 64 daun berubah sekaligus (misalnya Invert), buffer mask diunggah utuh sekali, bukan per daun.
+- **Penyimpanan**: chunk opsional `MASK` di `.psculpt` (lihat Project file). File tanpa chunk itu dibuka tanpa mask, dan build lama melewatinya, jadi versi format tidak berubah.
+- **Remesh**: kalau sumbernya punya mask, setiap vertex hasil mengambil titik terdekat di mesh asli (BVH daun 8 face yang sudah dipakai untuk proyeksi) lalu menginterpolasi mask dari tiga sudut segitiganya. Biayanya sekitar 0,1 s untuk 157K vertex output.
 
 ## Voxel remesh (`remesh/`)
 
@@ -66,7 +76,7 @@ Pipeline: mesh → `VoxelGrid` (signed distance di node grid) → `extractSurfac
 - **Tanda dalam/luar** dihitung tepat di setiap node: sinar sepanjang tiap sumbu grid menghitung persilangan permukaan beserta arahnya (winding number). Node dianggap di dalam kalau minimal dua dari tiga sumbu setuju. Bagian yang saling tumpuk dan self-intersection jadi gabungan (union), arah face yang terbalik tidak berpengaruh, dan lubang kecil kalah suara.
 - **Jarak** hanya disimpan di pita tipis (2 voxel) sekitar permukaan, dalam blok 8×8×8, jadi memori mengikuti luas permukaan. Tanda disimpan padat (1 byte per node).
 - **Surface Nets** membuat satu vertex per patch permukaan di tiap sel dan satu quad per edge grid yang disilang permukaan, jadi hasilnya 100% quad dan tertutup. Sel yang dilewati dua lembar permukaan mendapat satu vertex per lembar. Face sel yang ambigu diputuskan dari nilai tengahnya dengan urutan penjumlahan tetap, jadi dua sel tetangga selalu sepakat dan setiap edge dipakai tepat dua quad (manifold).
-- Remesh di aplikasi berjalan di worker thread. Undo menyimpan mesh lengkap sebelum dan sesudah (`TopologyUndo`), termasuk `topologyVersion`, sehingga undo stroke sebelum remesh tetap berlaku setelah remesh di-undo.
+- Remesh di aplikasi berjalan di worker thread. Selama itu undo dan redo ditahan, begitu juga stroke dan operasi mask pada objek yang di-remesh, karena hasilnya dibangun dari mesh saat remesh dimulai dan akan menimpa perubahan itu. Undo menyimpan mesh lengkap sebelum dan sesudah (`TopologyUndo`), termasuk `topologyVersion`, sehingga undo stroke sebelum remesh tetap berlaku setelah remesh di-undo.
 
 Output Surface Nets mentah punya valence 4 sekitar 50% (khas pada permukaan melengkung). Itu diperbaiki oleh quad remesh di bawah.
 
@@ -96,6 +106,7 @@ Di aplikasi, toggle **Optimize quads** (default aktif) memilih antara quad remes
 Format `.psculpt` adalah container biner kecil: magic `PSCULPT\x1A`, versi, lalu chunk bertag (`u32 tag`, `u64 ukuran`, isi) dan chunk `END ` berisi CRC-32 dari semua byte sebelumnya.
 
 - `OBJS` menyimpan tiap objek: nama, transform, visibilitas, posisi vertex (float, bit-exact), ukuran face, dan index face. Topologi half-edge dibangun ulang saat dibuka, dan BVH dibangun di worker thread.
+- `MASK` (opsional, hanya kalau ada objek yang punya mask) menyimpan per objek: index objek di `OBJS`, jumlah vertex, encoding (0 = float32), lalu nilai mask. File dengan chunk `MASK` yang index objeknya salah, jumlah vertex-nya tidak cocok, encoding-nya tidak dikenal, atau terpotong ditolak ("The mask data is damaged."), sama seperti chunk lain yang rusak. Encoding baru nanti butuh versi format baru atau tag chunk baru. Nilai di luar [0, 1] atau NaN dijepit.
 - `SETT` menyimpan setelan aplikasi sebagai baris `key value`: brush, radius, strength per brush, falloff, tekanan pen, simetri, kamera, viewport, remesh, mode, dan objek terpilih. Engine menyimpannya apa adanya, jadi setelan baru tidak perlu mengubah format. Kunci yang tidak ada memakai nilai default.
 - Pembaca melewati chunk yang tidak dikenal (kompatibel ke depan) dan menolak file yang terpotong, rusak (checksum salah), atau dari versi format yang lebih baru, dengan pesan yang jelas. Setiap jumlah dan index diperiksa sebelum dipakai.
 - Penyimpanan bersifat atomik: data ditulis ke `<nama>.tmp` lalu di-rename, jadi crash saat menyimpan tidak merusak project yang ada. Serialisasi berjalan di thread utama (cepat, cuma salin memori), penulisan file di worker.
@@ -143,6 +154,13 @@ Phase 2, 1M vertex, p95 per dab:
 | Flatten | 1,4 ms | 7,2 ms |
 | Crease | 1,7 ms | 10,0 ms |
 | Grab | 0,4 ms | 1,8 ms |
+
+Phase 6, mask brush pada 1M vertex: p95 di bawah 1,6 ms untuk semua radius (tanpa normal dan refit). Operasi mask seluruh mesh, dijalankan di thread utama:
+
+| Vertex | Invert | Blur ×2 | Sharpen ×2 | Clear | Undo |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 500K | 1,2 ms | 17 ms | 16 ms | 0,8 ms | 3,8 MB |
+| 1M | 2,7 ms | 37 ms | 37 ms | 1,5 ms | 7,6 MB |
 
 Target PRD (latensi brush di bawah 16 ms) masih terpenuhi pada 1M vertex dengan brush besar. Upload GPU belum termasuk angka ini; panel Performance di aplikasi menampilkan waktu dab dan latensi input-ke-frame secara langsung.
 

@@ -14,26 +14,32 @@ namespace {
 const char* kMeshVs = R"(#version 450 core
 layout(location = 0) in vec3 aPosition;
 layout(location = 1) in vec3 aNormal;
+layout(location = 3) in float aMask;  // Location 2 is the line shader's vertex colour.
 uniform mat4 uModel;
 uniform mat4 uView;
 uniform mat4 uProj;
 uniform mat3 uNormalMat;  // view * model, inverse-transposed
 out vec3 vNormalView;
+out float vMask;
 void main() {
   vNormalView = uNormalMat * aNormal;
+  vMask = aMask;
   gl_Position = uProj * uView * uModel * vec4(aPosition, 1.0);
 }
 )";
 
 const char* kMeshFs = R"(#version 450 core
 in vec3 vNormalView;
+in float vMask;
 uniform sampler2D uMatcap;
 uniform float uSelected;
+uniform float uMaskOpacity;
 out vec4 fragColor;
 void main() {
   vec3 n = normalize(vNormalView);
   if (!gl_FrontFacing) n = -n;  // Open meshes: shade the inside too.
   vec3 color = texture(uMatcap, n.xy * 0.49 + 0.5).rgb;
+  color *= 1.0 - uMaskOpacity * clamp(vMask, 0.0, 1.0);  // Masked areas read as darker.
   // Selected objects get a soft rim so they read without an outline pass.
   float rim = pow(1.0 - clamp(n.z, 0.0, 1.0), 3.0);
   color += uSelected * rim * vec3(1.0, 0.55, 0.15) * 0.6;
@@ -245,8 +251,8 @@ void Renderer::shutdown() {
 }
 
 void Renderer::destroy(GpuMesh& gpu) {
-  const GLuint buffers[] = {gpu.positions, gpu.normals, gpu.triangles, gpu.edges};
-  glDeleteBuffers(4, buffers);
+  const GLuint buffers[] = {gpu.positions, gpu.normals, gpu.mask, gpu.triangles, gpu.edges};
+  glDeleteBuffers(5, buffers);
   glDeleteVertexArrays(1, &gpu.vao);
   gpu = {};
 }
@@ -282,6 +288,13 @@ void Renderer::upload(GpuMesh& gpu, const SceneObject& object) {
   glNamedBufferStorage(gpu.positions, vbytes, m.positions.data(), GL_DYNAMIC_STORAGE_BIT);
   glCreateBuffers(1, &gpu.normals);
   glNamedBufferStorage(gpu.normals, vbytes, m.normals.data(), GL_DYNAMIC_STORAGE_BIT);
+  // One float per vertex; an unmasked mesh gets a zero-filled buffer so the shader can always read it.
+  const bool hasMask = !m.mask.empty();
+  glCreateBuffers(1, &gpu.mask);
+  glNamedBufferStorage(gpu.mask, static_cast<GLsizeiptr>(std::max<std::size_t>(m.positions.size(), 1) * sizeof(float)),
+                       hasMask ? m.mask.data() : nullptr, GL_DYNAMIC_STORAGE_BIT);
+  if (!hasMask) glClearNamedBufferData(gpu.mask, GL_R32F, GL_RED, GL_FLOAT, nullptr);
+  gpu.maskOnGpu = hasMask;
   glCreateBuffers(1, &gpu.triangles);
   glNamedBufferStorage(gpu.triangles, static_cast<GLsizeiptr>(tris.size() * 4), tris.data(), 0);
   glCreateBuffers(1, &gpu.edges);
@@ -296,13 +309,49 @@ void Renderer::upload(GpuMesh& gpu, const SceneObject& object) {
   glEnableVertexArrayAttrib(gpu.vao, 1);
   glVertexArrayAttribFormat(gpu.vao, 1, 3, GL_FLOAT, GL_FALSE, 0);
   glVertexArrayAttribBinding(gpu.vao, 1, 1);
+  glVertexArrayVertexBuffer(gpu.vao, 2, gpu.mask, 0, sizeof(float));
+  glEnableVertexArrayAttrib(gpu.vao, 3);
+  glVertexArrayAttribFormat(gpu.vao, 3, 1, GL_FLOAT, GL_FALSE, 0);
+  glVertexArrayAttribBinding(gpu.vao, 3, 2);
   glVertexArrayElementBuffer(gpu.vao, gpu.triangles);
 
   gpu.triangleIndexCount = static_cast<GLsizei>(tris.size());
   gpu.edgeIndexCount = static_cast<GLsizei>(edges.size());
   gpu.topologyVersion = object.topologyVersion;
-  stats_.uploadedBytes += static_cast<std::size_t>(vbytes) * 2 + tris.size() * 4 + edges.size() * 4;
+  stats_.uploadedBytes += static_cast<std::size_t>(vbytes) * 2 + m.mask.size() * sizeof(float) + tris.size() * 4 +
+                         edges.size() * 4;
   ++stats_.fullUploads;
+}
+
+void Renderer::syncMask(GpuMesh& gpu, SceneObject& obj) {
+  const Mesh& m = obj.mesh;
+  if (m.mask.empty()) {
+    if (gpu.maskOnGpu) glClearNamedBufferData(gpu.mask, GL_R32F, GL_RED, GL_FLOAT, nullptr);
+    gpu.maskOnGpu = false;
+  } else if (obj.maskDirtyAll) {
+    const std::size_t bytes = m.mask.size() * sizeof(float);
+    glNamedBufferSubData(gpu.mask, 0, static_cast<GLsizeiptr>(bytes), m.mask.data());
+    stats_.uploadedBytes += bytes;
+    ++stats_.partialUploads;
+    gpu.maskOnGpu = true;
+  } else if (!obj.maskDirtyLeaves.empty()) {
+    std::sort(obj.maskDirtyLeaves.begin(), obj.maskDirtyLeaves.end());
+    obj.maskDirtyLeaves.erase(std::unique(obj.maskDirtyLeaves.begin(), obj.maskDirtyLeaves.end()),
+                              obj.maskDirtyLeaves.end());
+    const auto leaves = obj.bvh.leaves();
+    for (Index l : obj.maskDirtyLeaves) {
+      const BvhLeaf& leaf = leaves[l];
+      const auto bytes = static_cast<GLsizeiptr>((leaf.vertEnd - leaf.vertBegin) * sizeof(float));
+      if (bytes == 0) continue;
+      glNamedBufferSubData(gpu.mask, static_cast<GLintptr>(leaf.vertBegin * sizeof(float)), bytes,
+                           &m.mask[leaf.vertBegin]);
+      stats_.uploadedBytes += static_cast<std::size_t>(bytes);
+      ++stats_.partialUploads;
+    }
+    gpu.maskOnGpu = true;
+  }
+  obj.maskDirtyLeaves.clear();
+  obj.maskDirtyAll = false;
 }
 
 void Renderer::sync(Scene& scene) {
@@ -314,9 +363,10 @@ void Renderer::sync(Scene& scene) {
     GpuMesh& gpu = meshes_[obj.id];
     if (gpu.topologyVersion != obj.topologyVersion) {
       upload(gpu, obj);
-      obj.dirtyLeaves.clear();
+      obj.clearDirty();
       continue;
     }
+    syncMask(gpu, obj);
     if (obj.dirtyLeaves.empty()) continue;
     std::sort(obj.dirtyLeaves.begin(), obj.dirtyLeaves.end());
     obj.dirtyLeaves.erase(std::unique(obj.dirtyLeaves.begin(), obj.dirtyLeaves.end()), obj.dirtyLeaves.end());
@@ -373,6 +423,7 @@ void Renderer::render(const Scene& scene, const Camera& camera, const ViewportRe
   glUniformMatrix4fv(loc(meshProgram_, "uView"), 1, GL_FALSE, glm::value_ptr(view));
   glUniformMatrix4fv(loc(meshProgram_, "uProj"), 1, GL_FALSE, glm::value_ptr(proj));
   glUniform1i(loc(meshProgram_, "uMatcap"), 0);
+  glUniform1f(loc(meshProgram_, "uMaskOpacity"), settings.showMask ? std::clamp(settings.maskOpacity, 0.0f, 1.0f) : 0.0f);
   glBindTextureUnit(0, matcaps_[std::clamp(settings.matcap, 0, kMatcapCount - 1)]);
   for (const auto& obj : scene.objects()) {
     if (!obj->visible) continue;

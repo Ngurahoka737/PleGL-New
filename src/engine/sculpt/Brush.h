@@ -34,7 +34,8 @@ struct Dab {
   Vec3 areaCenter{0.0f};              // Falloff-weighted mean position under the dab.
 };
 
-// What a brush may touch: the mesh positions owned by `leaves`.
+// What a brush may touch: the mesh positions (or, for mask brushes, mask values) owned by
+// `leaves`.
 struct BrushContext {
   Mesh& mesh;
   const Bvh& bvh;
@@ -44,6 +45,8 @@ struct BrushContext {
 
 // A brush moves vertices; it never changes topology, normals or bounds. The sculptor recomputes
 // those, records undo and marks GPU ranges afterwards, so new brushes only implement apply().
+// Moving brushes scale their effect by (1 - mask), so fully masked vertices never move. Mask
+// brushes (editsMask() true) change only Mesh::mask, which the sculptor allocates beforehand.
 //
 // Contract: only vertices inside the dab sphere move, and none moves farther than kMaxDabMove
 // radius in one dab, so none ends up beyond 1.25 radius from the centre (the sculptor finds
@@ -54,6 +57,8 @@ class Brush {
   virtual const char* name() const = 0;
   // True if apply() reads Dab::areaNormal / Dab::areaCenter.
   virtual bool needsArea() const { return false; }
+  // True if apply() writes Mesh::mask instead of positions.
+  virtual bool editsMask() const { return false; }
   virtual void apply(BrushContext& ctx) const = 0;
 };
 
@@ -106,6 +111,24 @@ class CreaseBrush final : public Brush {
  public:
   const char* name() const override { return "Crease"; }
   bool needsArea() const override { return true; }
+  void apply(BrushContext& ctx) const override;
+};
+
+// Paints the mask toward 1 (toward 0, erasing, when inverted). Each dab moves a value part of the
+// way to its target, so overlapping dabs (for example at the symmetry plane) converge instead of
+// overshooting.
+class MaskBrush final : public Brush {
+ public:
+  const char* name() const override { return "Mask"; }
+  bool editsMask() const override { return true; }
+  void apply(BrushContext& ctx) const override;
+};
+
+// Smooths mask values toward the average of their neighbours, softening mask edges.
+class MaskSmoothBrush final : public Brush {
+ public:
+  const char* name() const override { return "Smooth Mask"; }
+  bool editsMask() const override { return true; }
   void apply(BrushContext& ctx) const override;
 };
 

@@ -14,6 +14,7 @@
 #include "scene/Scene.h"
 #include "remesh/QuadRemesh.h"
 #include "remesh/VoxelRemesh.h"
+#include "sculpt/MaskOps.h"
 #include "sculpt/Sculptor.h"
 #include "spatial/Bvh.h"
 
@@ -101,7 +102,8 @@ int main(int argc, char** argv) {
     InflateBrush inflate;
     FlattenBrush flatten;
     CreaseBrush crease;
-    const Brush* brushes[] = {&draw, &clay, &smooth, &inflate, &flatten, &crease};
+    MaskBrush mask;
+    const Brush* brushes[] = {&draw, &clay, &smooth, &inflate, &flatten, &crease, &mask};
     for (const Brush* brush : brushes) {
       for (float radius : {0.05f, 0.15f, 0.4f}) {
         Scene scene;  // Fresh sphere per run so earlier strokes do not change the next.
@@ -140,6 +142,29 @@ int main(int argc, char** argv) {
       report(obj, radius, "Grab", times, verts);
     }
   }
+  // Whole-mesh mask operations, run on the main thread in the app. Blur and Sharpen use two
+  // iterations (the app default). The undo entry is built inside the timed call.
+  std::printf("\nMask operation benchmark (ms)\n\n");
+  std::printf("%10s %10s %10s %10s %10s %10s\n", "vertices", "invert", "blur x2", "sharpen x2", "clear", "undo MB");
+  for (int res : strokeRes) {
+    Scene scene;
+    SceneObject& obj = scene.add("Sphere", makeQuadSphere(res));
+    double ms[4];
+    std::size_t undoBytes = 0;
+    const MaskOp ops[4] = {MaskOp::Invert, MaskOp::Blur, MaskOp::Sharpen, MaskOp::Clear};
+    // Start from a half mask so blur and sharpen have an edge to work on.
+    obj.mesh.mask.resize(obj.mesh.positions.size());
+    for (Index v = 0; v < obj.mesh.vertexCount(); ++v) obj.mesh.mask[v] = obj.mesh.positions[v].y > 0.0f ? 1.0f : 0.0f;
+    for (int i = 0; i < 4; ++i) {
+      Timer t;
+      auto entry = applyMaskOp(obj, ops[i], 2);
+      ms[i] = t.ms();
+      if (entry) undoBytes = std::max(undoBytes, entry->bytes());
+    }
+    std::printf("%10d %10.1f %10.1f %10.1f %10.1f %10.1f\n", obj.mesh.vertexCount(), ms[0], ms[1], ms[2], ms[3],
+                static_cast<double>(undoBytes) / (1024.0 * 1024.0));
+  }
+
   // Voxel remesh: whole pipeline (sign, narrow-band distance, Surface Nets, half-edge build) at
   // two voxel sizes. The PRD targets 100K < 1 s, 500K < 3 s, 1M < 5 s.
   std::printf("\nVoxel remesh benchmark\n\n");
@@ -167,12 +192,18 @@ int main(int argc, char** argv) {
   }
   // Quad remesh: voxel remesh plus valence optimisation and relaxation onto the input. Same
   // PRD targets as the voxel remesh.
-  std::printf("\nQuad remesh benchmark\n\n");
-  std::printf("%10s %8s %10s %10s %10s %10s %8s %8s\n", "in verts", "edge", "out verts", "voxel ms", "optim ms",
-              "total ms", "val4 %", "edge cv");
+  std::printf("\nQuad remesh benchmark (masked: half the input masked, so the mask is transferred)\n\n");
+  std::printf("%10s %8s %7s %10s %10s %10s %10s %8s %8s\n", "in verts", "edge", "masked", "out verts", "voxel ms",
+              "optim ms", "total ms", "val4 %", "edge cv");
   for (int res : remeshRes) {
-    const Mesh in = makeQuadSphere(res);
-    for (float edge : {0.01f, 0.005f}) {
+    Mesh in = makeQuadSphere(res);
+    for (float edge : {0.01f, 0.005f, -0.01f}) {
+      const bool masked = edge < 0.0f;  // Last row: the first edge again, with a mask.
+      edge = std::abs(edge);
+      if (masked) {
+        in.mask.resize(in.positions.size());
+        for (Index v = 0; v < in.vertexCount(); ++v) in.mask[v] = in.positions[v].y > 0.0f ? 1.0f : 0.0f;
+      }
       QuadRemeshStats st;
       std::string error;
       Timer t;
@@ -182,9 +213,9 @@ int main(int argc, char** argv) {
         std::printf("  remesh failed: %s\n", error.c_str());
         continue;
       }
-      std::printf("%10d %8.3f %10d %10.0f %10.0f %10.0f %8.1f %8.3f\n", in.vertexCount(), edge,
-                  out->vertexCount(), st.voxel.gridMs + st.voxel.extractMs + st.voxel.buildMs, st.optimizeMs, total,
-                  100.0 * st.optimized.valence4Ratio, st.optimized.edgeLengthCv);
+      std::printf("%10d %8.3f %7s %10d %10.0f %10.0f %10.0f %8.1f %8.3f\n", in.vertexCount(), edge,
+                  masked ? "yes" : "no", out->vertexCount(), st.voxel.gridMs + st.voxel.extractMs + st.voxel.buildMs,
+                  st.optimizeMs, total, 100.0 * st.optimized.valence4Ratio, st.optimized.edgeLengthCv);
     }
   }
   return 0;

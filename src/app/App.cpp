@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <glm/gtc/type_ptr.hpp>
 
 #include "core/Timer.h"
@@ -270,7 +271,12 @@ void App::handleEvent(const SDL_Event& e) {
       break;
 
     case SDL_EVENT_KEY_DOWN:
-      if (!io.WantCaptureKeyboard && !e.key.repeat) handleShortcut(e.key);
+      // Typing into a text field, dragging a widget or an open dialog blocks shortcuts. Not
+      // WantCaptureKeyboard: it is also true whenever a panel has keyboard focus, which happens
+      // after any click on a button or slider, and would leave every shortcut dead until the
+      // viewport was clicked. The dialog flags are set before ImGui opens the popup.
+      if (!io.WantTextInput && !ImGui::IsAnyItemActive() && !askSaveChanges_ && !offerRecovery_ && !e.key.repeat)
+        handleShortcut(e.key);
       break;
     case SDL_EVENT_KEY_UP:
       if (e.key.key == SDLK_F) adjustingRadius_ = false;
@@ -314,7 +320,11 @@ void App::handleShortcut(const SDL_KeyboardEvent& key) {
     if ((key.key == SDLK_Z && shift) || key.key == SDLK_Y) redo();
     if (key.key == SDLK_S) requestSaveProject(shift);
     if (key.key == SDLK_O) requestOpenProject();
-    if (key.key == SDLK_I) requestImport();
+    if (key.key == SDLK_I) {
+      // Ctrl+I inverts the mask while sculpting (as in other sculpting tools); Ctrl+Shift+I imports.
+      if (mode == Mode::Sculpt && !shift) applyMask(MaskOp::Invert);
+      else requestImport();
+    }
     if (key.key == SDLK_E) requestExport();
     if (key.key == SDLK_N) requestNewScene();
     if (key.key == SDLK_R) requestRemesh();
@@ -323,6 +333,8 @@ void App::handleShortcut(const SDL_KeyboardEvent& key) {
   switch (key.key) {
     case SDLK_TAB:
       if (!sculptor_.active()) mode = mode == Mode::Object ? Mode::Sculpt : Mode::Object;
+      // Drop panel focus so ImGui does not also use this Tab to turn the last slider into a text field.
+      ImGui::SetWindowFocus(nullptr);
       break;
     case SDLK_HOME:
     case SDLK_KP_PERIOD:
@@ -331,9 +343,20 @@ void App::handleShortcut(const SDL_KeyboardEvent& key) {
     default:
       break;
   }
+  if ((key.mod & SDL_KMOD_ALT) != 0) {
+    // Mask operations work in both modes, like the Mask menu. Alt is the navigation modifier, so
+    // no other Alt+key does anything.
+    switch (key.key) {
+      case SDLK_M: applyMask(shift ? MaskOp::Fill : MaskOp::Clear); break;
+      case SDLK_B: applyMask(shift ? MaskOp::Sharpen : MaskOp::Blur); break;
+      default: break;
+    }
+    return;
+  }
   if (mode == Mode::Sculpt) {
     switch (key.key) {
       case SDLK_D: sculpt.brush = BrushKind::Draw; break;
+      case SDLK_M: sculpt.brush = BrushKind::Mask; break;
       case SDLK_C: sculpt.brush = shift ? BrushKind::Crease : BrushKind::Clay; break;
       case SDLK_S: sculpt.brush = BrushKind::Smooth; break;
       case SDLK_G: sculpt.brush = BrushKind::Grab; break;
@@ -356,7 +379,9 @@ void App::handleShortcut(const SDL_KeyboardEvent& key) {
     case SDLK_D:
       if (shift) duplicateSelected();
       break;
-    case SDLK_B: bumpUnderCursor(); break;
+    case SDLK_B:
+      if (!shift) bumpUnderCursor();
+      break;
     case SDLK_ESCAPE: selectedId = 0; break;
     default: break;
   }
@@ -502,12 +527,15 @@ void App::beginStroke(float x, float y, std::uint64_t timestampNs) {
     return;
   }
   const SDL_Keymod mods = SDL_GetModState();
-  strokeBrush_ = (mods & SDL_KMOD_SHIFT) != 0 ? BrushKind::Smooth : sculpt.brush;
+  const bool shift = (mods & SDL_KMOD_SHIFT) != 0, ctrl = (mods & SDL_KMOD_CTRL) != 0;
+  const bool masking = sculpt.brush == BrushKind::Mask;
+  strokeBrush_ = shift && !masking ? BrushKind::Smooth : sculpt.brush;
   StrokeOptions opts;
   opts.falloff = sculpt.falloff;
   opts.symmetryX = sculpt.symmetryX;
   opts.strength = sculpt.strength[static_cast<int>(strokeBrush_)];
-  opts.invert = sculpt.invert != ((mods & SDL_KMOD_CTRL) != 0);
+  // The Mask brush ignores Add/Subtract: it paints, and erases with Ctrl or the pen's eraser end.
+  opts.invert = masking ? ctrl || (pen.down && pen.eraser) : sculpt.invert != ctrl;
   if (strokeBrush_ == BrushKind::Grab) {
     // Grab captures once at the press; pressure only scales the radius here.
     const float p = currentPressure();
@@ -525,7 +553,7 @@ void App::beginStroke(float x, float y, std::uint64_t timestampNs) {
     }
     return;
   }
-  const Brush& brush = *brushFor(strokeBrush_);
+  const Brush& brush = masking && shift ? maskSmoothBrush_ : *brushFor(strokeBrush_);
   sculptor_.beginStroke(*obj, brush, opts, brush.name());
   samples_.clear();
   sampler_.begin({x - vpX_, y - vpY_, currentPressure()}, std::max(1.0f, sculpt.radiusPx * sculpt.spacing), samples_);
@@ -592,9 +620,9 @@ void App::endStroke() {
   if (auto entry = sculptor_.endStroke()) {
     ++editCounter_;
     const int dabs = sculptor_.dabCount();
-    undoStack.push(std::move(*entry));
-    statusMessage = std::string(kBrushNames[static_cast<int>(strokeBrush_)]) + " stroke, " + std::to_string(dabs) +
+    statusMessage = entry->label + " stroke, " + std::to_string(dabs) +
                     (strokeBrush_ == BrushKind::Grab ? " moves" : " dabs");
+    undoStack.push(std::move(*entry));
   }
 }
 
@@ -607,12 +635,18 @@ const Brush* App::brushFor(BrushKind kind) const {
     case BrushKind::Inflate: return &inflateBrush_;
     case BrushKind::Flatten: return &flattenBrush_;
     case BrushKind::Crease: return &creaseBrush_;
+    case BrushKind::Mask: return &maskBrush_;
   }
   return nullptr;
 }
 
 void App::undo() {
   if (sculptor_.active()) return;
+  if (remeshing()) {
+    // The remesh result is built from the mesh as it was, so it would bring this change back.
+    statusMessage = "Wait for the remesh to finish before undoing.";
+    return;
+  }
   const std::string label = undoStack.undo(scene);
   if (!label.empty()) ++editCounter_;
   statusMessage = label.empty() ? "Nothing to undo" : "Undo " + label;
@@ -620,9 +654,45 @@ void App::undo() {
 
 void App::redo() {
   if (sculptor_.active()) return;
+  if (remeshing()) {
+    statusMessage = "Wait for the remesh to finish before redoing.";
+    return;
+  }
   const std::string label = undoStack.redo(scene);
   if (!label.empty()) ++editCounter_;
   statusMessage = label.empty() ? "Nothing to redo" : "Redo " + label;
+}
+
+bool App::canEditMask() const {
+  const SceneObject* obj = scene.find(selectedId);
+  return obj && !sculptor_.active() && obj->id != remeshObjectId_;
+}
+
+void App::applyMask(MaskOp op) {
+  SceneObject* obj = scene.find(selectedId);
+  if (!obj) {
+    statusMessage = "Select an object first.";
+    return;
+  }
+  if (sculptor_.active()) return;
+  if (obj->id == remeshObjectId_) {
+    // The remesh result is built from the mesh as it was, so this edit would be lost.
+    statusMessage = "Wait for the remesh to finish before editing this object's mask.";
+    return;
+  }
+  const bool filter = op == MaskOp::Blur || op == MaskOp::Sharpen;
+  Timer t;
+  auto entry = applyMaskOp(*obj, op, filter ? std::clamp(sculpt.maskFilterSteps, 1, 10) : 1);
+  stats.maskOpMs = t.ms();
+  if (!entry) {
+    statusMessage = std::string(maskOpName(op)) + ": nothing to change";
+    return;
+  }
+  ++editCounter_;
+  undoStack.push(std::move(*entry));
+  char buf[96];
+  std::snprintf(buf, sizeof(buf), "%s (%.1f ms)", maskOpName(op), stats.maskOpMs);
+  statusMessage = buf;
 }
 
 void App::requestRemesh() {
@@ -667,7 +737,7 @@ void App::requestRemesh() {
       target->mesh = std::move(**result);
       target->bvh = std::move(*bvh);
       target->topologyVersion = nextTopologyVersion();
-      target->dirtyLeaves.clear();
+      target->clearDirty();
       entry.after = std::make_shared<MeshState>(MeshState{target->mesh, target->bvh, target->topologyVersion});
       undoStack.push(std::move(entry));
       const int* res = remeshStats->voxel.resolution;

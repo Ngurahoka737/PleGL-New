@@ -78,6 +78,7 @@ Index MeshEditor::splitEdge(Index h, float t) {
     const float len = glm::length(n);
     m_.normals.push_back(len > 0.0f ? n / len : m_.normals[a]);
   }
+  if (!m_.mask.empty()) m_.mask.push_back(glm::mix(m_.mask[a], m_.mask[b], t));
   deadVertex_.push_back(0);
 
   auto newHalfEdge = [&](Index vert, Index face, Index next) {
@@ -177,6 +178,8 @@ bool MeshEditor::collapseEdge(Index h, const Vec3& position) {
   for (Index e : scratchB_)
     if (halfEdgeAlive(e)) m_.heVert[e] = a;
   m_.positions[a] = position;
+  // Keep the stronger mask so a collapse never shrinks a protected region.
+  if (!m_.mask.empty()) m_.mask[a] = std::max(m_.mask[a], m_.mask[b]);
   deadVertex_[b] = 1;
   m_.vertHe[b] = kInvalid;
   m_.vertHe[a] = kInvalid;
@@ -215,6 +218,7 @@ bool MeshEditor::collapseDiagonal(Index h) {
   for (Index e : scratchB_)
     if (halfEdgeAlive(e)) m_.heVert[e] = v0;
   m_.positions[v0] = (m_.positions[v0] + m_.positions[v2]) * 0.5f;
+  if (!m_.mask.empty()) m_.mask[v0] = std::max(m_.mask[v0], m_.mask[v2]);
   deadVertex_[v2] = 1;
   m_.vertHe[v2] = kInvalid;
   m_.vertHe[v0] = t3;
@@ -238,9 +242,11 @@ void MeshEditor::compact() {
   Mesh out;
   out.positions.resize(cv);
   out.vertHe.resize(cv);
+  if (!m_.mask.empty()) out.mask.resize(cv);
   for (Index v = 0; v < nv; ++v) {
     if (vmap[v] == kInvalid) continue;
     out.positions[vmap[v]] = m_.positions[v];
+    if (!out.mask.empty()) out.mask[vmap[v]] = m_.mask[v];
     out.vertHe[vmap[v]] = remap(m_.vertHe[v], hmap);
   }
   out.faceHe.resize(cf);

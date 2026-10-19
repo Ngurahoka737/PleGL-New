@@ -24,6 +24,10 @@ struct Transform {
 // are matched by object id and version).
 std::uint64_t nextTopologyVersion();
 
+// Above this many changed leaves, a mask edit asks for one whole-mask upload instead of per-leaf
+// uploads.
+inline constexpr std::size_t kMaskDirtyAllLeaves = 64;
+
 struct SceneObject {
   std::uint32_t id = 0;
   std::string name;
@@ -36,10 +40,24 @@ struct SceneObject {
   std::uint64_t topologyVersion = 1;
   // Leaves whose vertex positions or normals changed since the renderer last uploaded them.
   std::vector<Index> dirtyLeaves;
+  // Leaves whose mask values changed, or the whole mask when maskDirtyAll is set.
+  std::vector<Index> maskDirtyLeaves;
+  bool maskDirtyAll = false;
 
   // Rebuilds the BVH (which reorders the mesh) and bumps topologyVersion.
   void rebuildSpatial();
   void markLeafDirty(Index leaf) { dirtyLeaves.push_back(leaf); }
+  void markMaskDirty(Index leaf) { maskDirtyLeaves.push_back(leaf); }
+  void markMaskDirtyAll() {
+    maskDirtyAll = true;
+    maskDirtyLeaves.clear();
+  }
+  // Drops pending partial uploads; for use after a topology change, which re-uploads everything.
+  void clearDirty() {
+    dirtyLeaves.clear();
+    maskDirtyLeaves.clear();
+    maskDirtyAll = false;
+  }
 };
 
 struct ScenePick {
