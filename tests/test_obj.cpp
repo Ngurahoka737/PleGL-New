@@ -32,6 +32,14 @@ TEST_CASE("parseObj rejects bad input with a line number") {
   CHECK_FALSE(r.ok);
   CHECK(r.error.find("line 4") != std::string::npos);
   CHECK_FALSE(parseObj("v 0 0 0\n").ok);
+  // Non-finite coordinates parse as numbers but could never be sculpted or saved with levels.
+  for (const char* bad : {"nan", "inf", "-inf", "infinity"}) {
+    INFO(bad);
+    const std::string text = std::string("v 0 0 0\nv 1 0 0\nv ") + bad + " 1 0\nf 1 2 3\n";
+    ObjImportResult n = parseObj(text);
+    CHECK_FALSE(n.ok);
+    CHECK(n.error.find("line 3") != std::string::npos);
+  }
 }
 
 TEST_CASE("OBJ round trip preserves positions, faces and topology") {

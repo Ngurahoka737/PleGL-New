@@ -23,7 +23,8 @@ void Sculptor::beginStroke(SceneObject& object, const Brush& brush, const Stroke
   // Allocate before the first snapshot, so the before-state holds real (default) values.
   if (maskStroke_) object.mesh.ensureMask();
   if (faceSetStroke_) object.mesh.ensureFaceSets();
-  if (options.dyntopo && !maskStroke_ && !faceSetStroke_ && object.mesh.faceCount() > 0) {
+  // Subdivision levels keep their topology for life, so dynamic topology never runs on them.
+  if (options.dyntopo && !object.multires && !maskStroke_ && !faceSetStroke_ && object.mesh.faceCount() > 0) {
     dyntopo_ = std::make_unique<DyntopoSession>(object, options.dyntopoOptions);
     mergedClaims_ = 0;
   }
@@ -145,7 +146,7 @@ void Sculptor::resolveFaceSets(const Vec3& center, float radius) {
     under[0] = under[1] = kDefaultFaceSet;  // Every face is in the default set.
   }
   // 0 (paint nothing) once ids run out.
-  const std::int32_t fresh = faceSetStroke_ && !options_.extendFaceSet ? m.newFaceSetId() : 0;
+  const std::int32_t fresh = faceSetStroke_ && !options_.extendFaceSet ? object_->newFaceSetId() : 0;
   for (int side = 0; side < 2; ++side) {
     if (options_.faceSetAutoMask) onlySet_[side] = under[side] != 0 ? under[side] : kNoFaceSet;
     if (faceSetStroke_) paintSet_[side] = options_.extendFaceSet ? under[side] : fresh;  // One new set for both sides.
@@ -321,10 +322,7 @@ void Sculptor::recomputeNormals(std::span<const Index> verts) {
   parallelFor(0, verts.size(), 2048, [&](std::size_t b, std::size_t e) {
     for (std::size_t i = b; i < e; ++i) {
       const Index v = verts[i];
-      Vec3 n{0.0f};
-      m.forEachOutgoing(v, [&](Index h) { n += m.faceAreaNormal(m.heFace[h]); });
-      const float len = glm::length(n);
-      if (len > 1e-20f) m.normals[v] = n / len;
+      m.normals[v] = m.vertexNormal(v);
     }
   });
 }

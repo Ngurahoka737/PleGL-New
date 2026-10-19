@@ -11,7 +11,9 @@
 #include "core/Parallel.h"
 #include "core/Timer.h"
 #include "io/Obj.h"
+#include "io/Project.h"
 #include "mesh/Primitives.h"
+#include "multires/MultiresOps.h"
 #include "scene/Scene.h"
 #include "remesh/QuadRemesh.h"
 #include "remesh/VoxelRemesh.h"
@@ -215,6 +217,75 @@ int main(int argc, char** argv) {
     }
     std::printf("%10d %10.1f %10.1f %10.1f %10.1f %10.1f\n", obj.mesh.vertexCount(), ms[0], ms[1], ms[2], ms[3],
                 static_cast<double>(undoBytes) / (1024.0 * 1024.0));
+  }
+
+  // Multiresolution: subdividing to each level (worker part and main-thread part), a level switch
+  // with nothing pending, a switch down after a 200-dab stroke on the top level (the sync that
+  // spreads it) and back up, and saving and opening the project.
+  std::printf("\nMultires benchmark (quad sphere base, Draw radius 0.15)\n\n");
+  std::printf("%10s %6s %10s %10s %10s %10s %10s %10s %10s %10s %8s\n", "faces", "level", "run ms", "finish ms",
+              "switch", "dab avg", "down sync", "up again", "save ms", "open ms", "MB");
+  {
+    const int baseRes = quick ? 32 : 48;
+    const int levels = quick ? 3 : 4;
+    Scene scene;
+    SyncWorkspace ws;
+    SceneObject& obj = scene.add("Head", makeQuadSphere(baseRes));
+    DrawBrush draw;
+    for (int k = 1; k <= levels; ++k) {
+      std::string error;
+      auto job = prepareSubdivide(obj, &error);
+      if (!job) {
+        std::printf("  subdivide failed: %s\n", error.c_str());
+        break;
+      }
+      Timer t;
+      runSubdivideJob(*job);
+      const double runMs = t.ms();
+      t.reset();
+      if (!finishSubdivide(obj, *job, ws)) {
+        std::printf("  subdivide failed: %s\n", job->error.c_str());
+        break;
+      }
+      const double finishMs = t.ms();
+      // A switch down and up with nothing pending.
+      t.reset();
+      setActiveLevel(obj, k - 1, ws);
+      setActiveLevel(obj, k, ws);
+      const double switchMs = t.ms() * 0.5;
+      // A stroke on the top level, then the switch that spreads it to the levels below and back.
+      Sculptor sculptor;
+      sculptor.beginStroke(obj, draw, {.strength = 0.5f}, "Draw");
+      double dabMs = 0.0;
+      int dabs = 0;
+      for (int i = 0; i < 200; ++i) {
+        const float a = -0.8f + 1.6f * static_cast<float>(i) / 199.0f;
+        const Vec3 dir = glm::normalize(Vec3{std::sin(a), 0.3f, std::cos(a)});
+        RayHit hit;
+        if (!obj.bvh.raycast(obj.mesh, Ray{dir * 3.0f, -dir}, hit)) continue;
+        sculptor.dab(hit.position, 0.15f, 0.5f);
+        dabMs += sculptor.lastDab().totalMs;
+        ++dabs;
+      }
+      sculptor.endStroke();
+      t.reset();
+      setActiveLevel(obj, k - 1, ws);
+      const double downMs = t.ms();
+      t.reset();
+      setActiveLevel(obj, k, ws);
+      const double upMs = t.ms();
+      t.reset();
+      const std::vector<std::uint8_t> bytes = serializeProject(scene, "");
+      const double saveMs = t.ms();
+      t.reset();
+      std::optional<Project> project = parseProject(bytes.data(), bytes.size());
+      const bool opened = project && buildProject(*project);
+      const double openMs = t.ms();
+      if (!opened) std::printf("  reopening failed\n");
+      std::printf("%10d %6d %10.0f %10.0f %10.1f %10.3f %10.1f %10.1f %10.0f %10.0f %8.0f\n", obj.mesh.faceCount(), k,
+                  runMs, finishMs, switchMs, dabMs / std::max(dabs, 1), downMs, upMs, saveMs, openMs,
+                  static_cast<double>(obj.multires->bytes()) / (1024.0 * 1024.0));
+    }
   }
 
   // Voxel remesh: whole pipeline (sign, narrow-band distance, Surface Nets, half-edge build) at

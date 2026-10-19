@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "multires/MultiresIo.h"
 #include "scene/Scene.h"
 
 namespace plegl {
@@ -16,6 +17,12 @@ struct ProjectObject {
   Transform transform;
   bool visible = true;
   Mesh mesh;
+  // Subdivision levels as read from the file, rebuilt by buildProject().
+  std::shared_ptr<MultiresFileData> levelData;
+  // Filled by buildProject(): the mesh's BVH and, for an object with levels, its stack (the mesh
+  // is then the active level and the BVH the level's own).
+  Bvh bvh;
+  std::shared_ptr<Multires> multires;
 };
 
 struct Project {
@@ -39,6 +46,16 @@ struct Project {
 // face set other than the default or a hidden face. Readers skip unknown chunks, so later versions
 // can add data that older builds ignore (a build without masking opens a masked file and drops the
 // mask).
+//
+// The optional "MRES" holds subdivision levels (see multires/MultiresIo.h): u32 count, then per
+// object with levels: u32 object index (ascending), u8 encoding (0), u8 level count (2..8), u8
+// active level, u8 reserved (0); the base level as u32 vertex, face and half-edge counts, u32 face
+// sizes, u32 corners, i32 twins and i32 vertex fan starts (canonical half-edges, -1 for none);
+// per level u32 vertex and face counts, u8 channels (1 positions, 2 mask, 4 face sets; 0 on the
+// active level) and the channels' values; then the active level's pending edits as three lists
+// (u32 count, u32 canonical indices, values) for positions, mask and face sets. For such objects
+// OBJS, MASK and FSET hold the active level in canonical order, so a build without levels opens
+// the level that was being sculpted.
 // Little-endian.
 inline constexpr std::uint32_t kProjectVersion = 1;
 
@@ -56,6 +73,13 @@ bool writeFileAtomic(const std::filesystem::path& path, const std::vector<std::u
                      std::string* error = nullptr);
 
 std::optional<Project> loadProject(const std::filesystem::path& path, std::string* error = nullptr);
+
+// Builds every object's BVH and rebuilds subdivision levels (the slow part of opening a project;
+// worker-safe). Fails, refusing the whole project, when level data does not fit its object.
+bool buildProject(Project& project, std::string* error = nullptr);
+
+// Moves a built object (see buildProject) into the scene, keeping its name exactly.
+SceneObject& addProjectObject(Scene& scene, ProjectObject& object);
 
 std::uint32_t crc32(const std::uint8_t* data, std::size_t size, std::uint32_t crc = 0);
 

@@ -1,6 +1,7 @@
 #include "io/Obj.h"
 
 #include <charconv>
+#include <cmath>
 #include <cstring>
 #include <cstdio>
 #include <fstream>
@@ -21,7 +22,8 @@ const char* parseFloat(const char* p, const char* end, float& out) {
   p = skipSpace(p, end);
   if (p < end && *p == '+') ++p;  // from_chars rejects a leading '+'.
   auto [next, ec] = std::from_chars(p, end, out);
-  return ec == std::errc() ? next : nullptr;
+  // "nan" and "inf" parse, but a mesh with them cannot be sculpted, subdivided or saved with levels.
+  return ec == std::errc() && std::isfinite(out) ? next : nullptr;
 }
 
 const char* parseInt(const char* p, const char* end, long& out) {

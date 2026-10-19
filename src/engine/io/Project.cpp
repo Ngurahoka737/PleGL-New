@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cmath>
 #include <cstring>
+#include <optional>
 #include <fstream>
 #include <system_error>
 
@@ -25,6 +27,8 @@ constexpr std::uint32_t kTagMask = tag("MASK");
 constexpr std::uint8_t kMaskEncodingF32 = 0;
 constexpr std::uint32_t kTagFaceSets = tag("FSET");
 constexpr std::uint8_t kFaceSetEncodingI32 = 0;
+constexpr std::uint32_t kTagLevels = tag("MRES");
+constexpr std::uint8_t kLevelsEncoding = 0;
 constexpr std::uint32_t kTagEnd = tag("END ");
 
 class Writer {
@@ -111,7 +115,7 @@ bool setError(std::string* error, const std::string& message) {
   return false;
 }
 
-void writeObject(Writer& w, const SceneObject& obj) {
+void writeObject(Writer& w, const SceneObject& obj, const CanonicalLevel* canonical) {
   w.putString(obj.name);
   const Transform& t = obj.transform;
   w.putArray(&t.position.x, 3);
@@ -122,6 +126,14 @@ void writeObject(Writer& w, const SceneObject& obj) {
 
   const Mesh& m = obj.mesh;
   w.put(static_cast<std::uint32_t>(m.vertexCount()));
+  if (canonical) {
+    w.putArray(reinterpret_cast<const float*>(canonical->positions.data()), canonical->positions.size() * 3);
+    w.put(static_cast<std::uint32_t>(canonical->sizes.size()));
+    w.put(static_cast<std::uint32_t>(canonical->corners.size()));
+    w.putArray(canonical->sizes.data(), canonical->sizes.size());
+    w.putArray(canonical->corners.data(), canonical->corners.size());
+    return;
+  }
   w.putArray(reinterpret_cast<const float*>(m.positions.data()), m.positions.size() * 3);
   std::vector<std::uint32_t> sizes(m.faceCount());
   std::vector<std::uint32_t> indices;
@@ -175,7 +187,9 @@ bool readObject(Reader& r, ProjectObject& out, std::string* error) {
   return true;
 }
 
-void writeMasks(Writer& w, const Scene& scene) {
+using Canonicals = std::vector<std::optional<CanonicalLevel>>;
+
+void writeMasks(Writer& w, const Scene& scene, const Canonicals& canonical) {
   std::vector<std::uint32_t> masked;
   for (std::size_t i = 0; i < scene.objects().size(); ++i)
     if (scene.objects()[i]->mesh.anyMasked()) masked.push_back(static_cast<std::uint32_t>(i));
@@ -184,10 +198,11 @@ void writeMasks(Writer& w, const Scene& scene) {
   w.put(static_cast<std::uint32_t>(masked.size()));
   for (std::uint32_t i : masked) {
     const Mesh& m = scene.objects()[i]->mesh;
+    const std::vector<float>& values = canonical[i] ? canonical[i]->mask : m.mask;
     w.put(i);
-    w.put(static_cast<std::uint32_t>(m.mask.size()));
+    w.put(static_cast<std::uint32_t>(values.size()));
     w.put(kMaskEncodingF32);
-    w.putArray(m.mask.data(), m.mask.size());
+    w.putArray(values.data(), values.size());
   }
   w.endChunk(at);
 }
@@ -211,7 +226,7 @@ bool readMasks(Reader& r, std::size_t size, std::vector<ProjectObject>& objects,
   return true;
 }
 
-void writeFaceSets(Writer& w, const Scene& scene) {
+void writeFaceSets(Writer& w, const Scene& scene, const Canonicals& canonical) {
   std::vector<std::uint32_t> withSets;
   for (std::size_t i = 0; i < scene.objects().size(); ++i)
     if (scene.objects()[i]->mesh.hasFaceSetData()) withSets.push_back(static_cast<std::uint32_t>(i));
@@ -220,10 +235,11 @@ void writeFaceSets(Writer& w, const Scene& scene) {
   w.put(static_cast<std::uint32_t>(withSets.size()));
   for (std::uint32_t i : withSets) {
     const Mesh& m = scene.objects()[i]->mesh;
+    const std::vector<std::int32_t>& values = canonical[i] ? canonical[i]->faceSets : m.faceSets;
     w.put(i);
-    w.put(static_cast<std::uint32_t>(m.faceSets.size()));
+    w.put(static_cast<std::uint32_t>(values.size()));
     w.put(kFaceSetEncodingI32);
-    w.putArray(m.faceSets.data(), m.faceSets.size());
+    w.putArray(values.data(), values.size());
   }
   w.endChunk(at);
 }
@@ -245,6 +261,110 @@ bool readFaceSets(Reader& r, std::size_t size, std::vector<ProjectObject>& objec
     for (std::int32_t v : values)
       if (!validFaceSetValue(v)) return setError(error, "The face set data is damaged.");
     objects[index].mesh.faceSets = std::move(values);
+  }
+  return true;
+}
+
+template <class T>
+void putList(Writer& w, const std::vector<std::uint32_t>& index, const std::vector<T>& values) {
+  w.put(static_cast<std::uint32_t>(index.size()));
+  w.putArray(index.data(), index.size());
+  w.putArray(values.data(), values.size());
+}
+
+void writeLevels(Writer& w, const Scene& scene) {
+  std::vector<std::uint32_t> withLevels;
+  for (std::size_t i = 0; i < scene.objects().size(); ++i)
+    if (scene.objects()[i]->multires) withLevels.push_back(static_cast<std::uint32_t>(i));
+  if (withLevels.empty()) return;
+  const std::size_t at = w.beginChunk(kTagLevels);
+  w.put(static_cast<std::uint32_t>(withLevels.size()));
+  for (std::uint32_t i : withLevels) {
+    const MultiresFileData d = captureLevels(*scene.objects()[i]);
+    w.put(i);
+    w.put(kLevelsEncoding);
+    w.put(static_cast<std::uint8_t>(d.levels.size()));
+    w.put(static_cast<std::uint8_t>(d.active));
+    w.put(std::uint8_t{0});
+    w.put(d.baseVertices);
+    w.put(static_cast<std::uint32_t>(d.baseSizes.size()));
+    w.put(static_cast<std::uint32_t>(d.baseCorners.size()));
+    w.putArray(d.baseSizes.data(), d.baseSizes.size());
+    w.putArray(d.baseCorners.data(), d.baseCorners.size());
+    w.putArray(d.baseTwins.data(), d.baseTwins.size());
+    w.putArray(d.baseVertHe.data(), d.baseVertHe.size());
+    for (const MultiresFileLevel& l : d.levels) {
+      w.put(l.vertices);
+      w.put(l.faces);
+      w.put(l.channels);
+      if (l.channels & kLevelPositions) w.putArray(l.positions.data(), l.positions.size());
+      if (l.channels & kLevelMask) w.putArray(l.mask.data(), l.mask.size());
+      if (l.channels & kLevelFaceSets) w.putArray(l.faceSets.data(), l.faceSets.size());
+    }
+    putList(w, d.pendingPosIndex, d.pendingPos);
+    putList(w, d.pendingMaskIndex, d.pendingMask);
+    putList(w, d.pendingSetIndex, d.pendingSets);
+  }
+  w.endChunk(at);
+}
+
+bool finite(const Vec3& p) { return std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z); }
+
+template <class T>
+bool getList(Reader& r, std::vector<std::uint32_t>& index, std::vector<T>& values) {
+  const auto n = r.get<std::uint32_t>();
+  return r.ok() && r.getArray(index, n) && r.getArray(values, n);
+}
+
+// Attaches the level data of an MRES chunk to the parsed objects. Only the layout and the values
+// are checked here; restoreLevels() checks that the levels fit their object.
+bool readLevels(Reader& r, std::size_t size, std::vector<ProjectObject>& objects, std::string* error) {
+  const std::string damaged = "The subdivision level data is damaged.";
+  const auto count = r.get<std::uint32_t>();
+  if (!r.ok() || count > size) return setError(error, damaged);
+  std::int64_t last = -1;
+  for (std::uint32_t k = 0; k < count; ++k) {
+    const auto index = r.get<std::uint32_t>();
+    const auto encoding = r.get<std::uint8_t>();
+    const auto levelCount = r.get<std::uint8_t>();
+    const auto active = r.get<std::uint8_t>();
+    const auto reserved = r.get<std::uint8_t>();
+    if (!r.ok() || index >= objects.size() || std::int64_t(index) <= last || encoding != kLevelsEncoding ||
+        levelCount < 2 || levelCount > kMaxMultiresLevels || active >= levelCount || reserved != 0)
+      return setError(error, damaged);
+    last = index;
+    auto d = std::make_shared<MultiresFileData>();
+    d->active = active;
+    d->baseVertices = r.get<std::uint32_t>();
+    const auto faces = r.get<std::uint32_t>();
+    const auto halfEdges = r.get<std::uint32_t>();
+    if (!r.ok() || !r.getArray(d->baseSizes, faces) || !r.getArray(d->baseCorners, halfEdges) ||
+        !r.getArray(d->baseTwins, halfEdges) || !r.getArray(d->baseVertHe, d->baseVertices))
+      return setError(error, damaged);
+    d->levels.resize(levelCount);
+    for (MultiresFileLevel& l : d->levels) {
+      l.vertices = r.get<std::uint32_t>();
+      l.faces = r.get<std::uint32_t>();
+      l.channels = r.get<std::uint8_t>();
+      if (!r.ok() || (l.channels & ~(kLevelPositions | kLevelMask | kLevelFaceSets))) return setError(error, damaged);
+      if ((l.channels & kLevelPositions) && !r.getArray(l.positions, l.vertices)) return setError(error, damaged);
+      if ((l.channels & kLevelMask) && !r.getArray(l.mask, l.vertices)) return setError(error, damaged);
+      if ((l.channels & kLevelFaceSets) && !r.getArray(l.faceSets, l.faces)) return setError(error, damaged);
+      for (const Vec3& p : l.positions)
+        if (!finite(p)) return setError(error, damaged);
+      for (float& m : l.mask) m = m > 0.0f ? std::min(m, 1.0f) : 0.0f;  // Also turns NaN into 0.
+      for (std::int32_t s : l.faceSets)
+        if (!validFaceSetValue(s)) return setError(error, damaged);
+    }
+    if (!getList(r, d->pendingPosIndex, d->pendingPos) || !getList(r, d->pendingMaskIndex, d->pendingMask) ||
+        !getList(r, d->pendingSetIndex, d->pendingSets))
+      return setError(error, damaged);
+    for (const Vec3& p : d->pendingPos)
+      if (!finite(p)) return setError(error, damaged);
+    for (float& m : d->pendingMask) m = m > 0.0f ? std::min(m, 1.0f) : 0.0f;
+    for (std::int32_t s : d->pendingSets)
+      if (!validFaceSetValue(s)) return setError(error, damaged);
+    objects[index].levelData = std::move(d);
   }
   return true;
 }
@@ -272,7 +392,8 @@ std::vector<std::uint8_t> serializeProject(const Scene& scene, const std::string
   for (const auto& obj : scene.objects())
     total += 64 + obj->name.size() + obj->mesh.positions.size() * 12 + std::size_t(obj->mesh.faceCount()) * 4 +
              std::size_t(obj->mesh.halfEdgeCount()) * 4 + (obj->mesh.mask.empty() ? 0 : 9 + obj->mesh.mask.size() * 4) +
-             (obj->mesh.faceSets.empty() ? 0 : 9 + obj->mesh.faceSets.size() * 4);
+             (obj->mesh.faceSets.empty() ? 0 : 9 + obj->mesh.faceSets.size() * 4) +
+             (obj->multires ? obj->multires->bytes() / 3 : 0);
   w.bytes.reserve(total);
 
   w.putArray(kMagic, sizeof(kMagic));
@@ -280,12 +401,18 @@ std::vector<std::uint8_t> serializeProject(const Scene& scene, const std::string
   std::size_t at = w.beginChunk(kTagSettings);
   w.putArray(settings.data(), settings.size());
   w.endChunk(at);
+  // Objects with levels store their active level in canonical order.
+  Canonicals canonical(scene.objects().size());
+  for (std::size_t i = 0; i < scene.objects().size(); ++i)
+    if (scene.objects()[i]->multires) canonical[i] = canonicalActiveLevel(*scene.objects()[i]);
   at = w.beginChunk(kTagObjects);
   w.put(static_cast<std::uint32_t>(scene.objects().size()));
-  for (const auto& obj : scene.objects()) writeObject(w, *obj);
+  for (std::size_t i = 0; i < scene.objects().size(); ++i)
+    writeObject(w, *scene.objects()[i], canonical[i] ? &*canonical[i] : nullptr);
   w.endChunk(at);
-  writeMasks(w, scene);
-  writeFaceSets(w, scene);
+  writeMasks(w, scene, canonical);
+  writeFaceSets(w, scene, canonical);
+  writeLevels(w, scene);
   const std::uint32_t crc = crc32(w.bytes.data(), w.bytes.size());
   at = w.beginChunk(kTagEnd);
   w.put(crc);
@@ -311,6 +438,8 @@ std::optional<Project> parseProject(const std::uint8_t* data, std::size_t size, 
   std::size_t maskSize = 0;
   const std::uint8_t* faceSetData = nullptr;
   std::size_t faceSetSize = 0;
+  const std::uint8_t* levelData = nullptr;
+  std::size_t levelSize = 0;
   for (;;) {
     const std::uint8_t* chunkStart = r.position();
     const auto t = r.get<std::uint32_t>();
@@ -347,6 +476,9 @@ std::optional<Project> parseProject(const std::uint8_t* data, std::size_t size, 
     } else if (t == kTagFaceSets) {
       faceSetData = chunk.position();
       faceSetSize = std::size_t(chunkSize);
+    } else if (t == kTagLevels) {
+      levelData = chunk.position();
+      levelSize = std::size_t(chunkSize);
     }
     // Unknown chunks are skipped.
   }
@@ -362,7 +494,35 @@ std::optional<Project> parseProject(const std::uint8_t* data, std::size_t size, 
     Reader faceSets(faceSetData, faceSetSize);
     if (!readFaceSets(faceSets, faceSetSize, project.objects, error)) return std::nullopt;
   }
+  if (levelData) {
+    Reader levels(levelData, levelSize);
+    if (!readLevels(levels, levelSize, project.objects, error)) return std::nullopt;
+  }
   return project;
+}
+
+bool buildProject(Project& project, std::string* error) {
+  for (ProjectObject& obj : project.objects) {
+    if (obj.levelData) {
+      if (!restoreLevels(*obj.levelData, obj.mesh, obj.bvh, obj.multires, error)) return false;
+      obj.levelData.reset();
+    } else {
+      obj.bvh.build(obj.mesh);
+    }
+  }
+  return true;
+}
+
+SceneObject& addProjectObject(Scene& scene, ProjectObject& po) {
+  SceneObject& obj = scene.add(po.name, std::move(po.mesh), std::move(po.bvh));
+  obj.name = po.name;  // Keep names exactly, even duplicates.
+  obj.transform = po.transform;
+  obj.visible = po.visible;
+  if (po.multires) {
+    obj.multires = std::move(po.multires);
+    obj.topologyVersion = obj.multires->levels[static_cast<std::size_t>(obj.multires->active)].version;
+  }
+  return obj;
 }
 
 bool writeFileAtomic(const std::filesystem::path& path, const std::vector<std::uint8_t>& bytes, std::string* error) {

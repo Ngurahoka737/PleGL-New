@@ -54,8 +54,9 @@ class Bvh {
   };
 
   // Builds the hierarchy and REORDERS the mesh (faces, half-edges and vertices) so that every
-  // leaf owns contiguous index ranges. Any external index into the mesh is invalidated.
-  void build(Mesh& mesh, const Params& params);
+  // leaf owns contiguous index ranges. Any external index into the mesh is invalidated; `map`,
+  // if given, receives the old index of every new face and vertex.
+  void build(Mesh& mesh, const Params& params, ReorderMap* map = nullptr);
   void build(Mesh& mesh) { build(mesh, Params{}); }
 
   // Nearest hit along the ray (both triangle sides), or false. `visibleOnly` skips hidden faces

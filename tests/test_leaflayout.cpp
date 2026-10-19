@@ -499,7 +499,7 @@ TEST_CASE("dynamic topology undo captures the after side on the first undo only"
   const ObjectState done = stateOf(obj);
   CHECK(entry.after == nullptr);
   const std::size_t stored = entry.bytes();
-  const std::size_t whole = MeshState{start.mesh, start.bvh, start.version}.bytes();
+  const std::size_t whole = MeshState{start.mesh, start.bvh, start.version, nullptr}.bytes();
   CHECK(stored < whole / 5);
 
   UndoStack stack;
@@ -553,10 +553,10 @@ TEST_CASE("dynamic topology undo interleaves with sculpt, mask and remesh entrie
     TopologyUndo entry;
     entry.label = "Remesh";
     entry.objectId = obj.id;
-    entry.before = std::make_shared<MeshState>(MeshState{obj.mesh, obj.bvh, obj.topologyVersion});
+    entry.before = std::make_shared<MeshState>(MeshState{obj.mesh, obj.bvh, obj.topologyVersion, nullptr});
     obj.mesh = std::move(*remeshed);
     obj.rebuildSpatial();
-    entry.after = std::make_shared<MeshState>(MeshState{obj.mesh, obj.bvh, obj.topologyVersion});
+    entry.after = std::make_shared<MeshState>(MeshState{obj.mesh, obj.bvh, obj.topologyVersion, nullptr});
     stack.push(std::move(entry));
   }
   const ObjectState final = stateOf(obj);
