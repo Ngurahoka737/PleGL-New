@@ -12,7 +12,6 @@ using namespace plegl;
 
 namespace {
 
-bool sameBits(const Vec3& a, const Vec3& b) { return std::memcmp(&a, &b, sizeof(Vec3)) == 0; }
 
 Mesh makePentagonPrism() {
   std::vector<Vec3> p;

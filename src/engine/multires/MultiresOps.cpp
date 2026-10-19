@@ -184,7 +184,7 @@ std::optional<SubdivideJob> prepareSubdivide(const SceneObject& o, std::string* 
   job.plain = !o.multires;
   job.serial = o.multires ? o.multires->serial : 0;
   job.maxLeafFaces = o.bvh.maxLeafFaces();
-  job.mesh = o.mesh;
+  job.mesh = copyWithoutLayers(o.mesh);  // New levels start without sculpt layers.
   if (!job.plain) {
     const MultiresLevel& top = o.multires->levels[static_cast<std::size_t>(o.multires->active)];
     job.canon = top.canon;
@@ -452,6 +452,8 @@ ValidationResult validateMultires(const SceneObject& obj) {
     const ValidationResult layout = validateLayout(m, refit);
     if (!layout.ok) return fail(layout.message + at);
     if (layoutHash(bvhOf(k)) != l.layoutHash) return fail("leaf layout changed" + at);
+    const ValidationResult layers = validateLayers(m, true);
+    if (!layers.ok) return fail(layers.message + at);
     if (l.rule != classifyVertices(m)) return fail("vertex rules" + at);
     if (l.nonManifoldFaces != findNonManifoldFans(m)) return fail("non-manifold fans" + at);
     if (l.canon.vert.size() != m.positions.size() || l.canon.face.size() != m.faceHe.size())

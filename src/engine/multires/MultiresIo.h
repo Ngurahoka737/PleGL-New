@@ -39,6 +39,22 @@ struct MultiresFileData {
   std::vector<std::int32_t> pendingSets;
 };
 
+// Per-vertex (or per-face) values between a level's live order and its canonical order, with
+// `canon` that level's CanonicalMap::vert (or ::face): canon[live] = canonical.
+template <class T>
+std::vector<T> toCanonical(const std::vector<T>& live, const std::vector<Index>& canon) {
+  std::vector<T> out(live.size());
+  for (std::size_t i = 0; i < live.size(); ++i) out[static_cast<std::size_t>(canon[i])] = live[i];
+  return out;
+}
+
+template <class T>
+std::vector<T> toLive(const std::vector<T>& canonical, const std::vector<Index>& canon) {
+  std::vector<T> out(canonical.size());
+  for (std::size_t i = 0; i < canon.size(); ++i) out[i] = canonical[static_cast<std::size_t>(canon[i])];
+  return out;
+}
+
 // The active level of an object with levels in canonical order, as OBJS, MASK and FSET store it.
 struct CanonicalLevel {
   std::vector<Vec3> positions;

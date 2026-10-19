@@ -91,6 +91,10 @@ float DyntopoSession::effectiveDetail(float detail, float radius, float meshDiag
 
 DyntopoSession::DyntopoSession(SceneObject& object, const DyntopoOptions& options)
     : obj_(object), m_(object.mesh), bvh_(object.bvh), opt_(options), ed_(object.mesh) {
+  if (!m_.layers.empty()) {
+    refused_ = true;
+    return;
+  }
   beforeBvh_ = std::make_shared<const Bvh>(bvh_);
   beforeVersion_ = object.topologyVersion;
   const float diag = glm::length(bvh_.bounds().extent());
@@ -141,6 +145,7 @@ DyntopoSession::DyntopoSession(SceneObject& object, const DyntopoOptions& option
 }
 
 bool DyntopoSession::changedTopology() const {
+  if (refused_) return false;
   return !rec_.empty() || m_.faceCount() != bvh_.tailStartFace() || m_.vertexCount() != bvh_.tailStartVertex() ||
          m_.halfEdgeCount() != bvh_.tailStartHalfEdge();
 }
@@ -236,7 +241,7 @@ const DyntopoPass& DyntopoSession::pass(const Vec3& center, float radius, const 
   pass_.changedVerts.clear();
   pass_.refitLeaves.clear();
   pass_.topoDirtyLeaves.clear();
-  if (faulted_ || topo.detail <= 0.0f || radius <= 0.0f) return pass_;
+  if (refused_ || faulted_ || topo.detail <= 0.0f || radius <= 0.0f) return pass_;
   passTimer_.reset();
   opsSinceCheck_ = 0;
   onlySet_ = topo.onlySet;

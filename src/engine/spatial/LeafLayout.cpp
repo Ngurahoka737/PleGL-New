@@ -1,6 +1,7 @@
 #include "spatial/LeafLayout.h"
 
 #include <algorithm>
+#include <cassert>
 #include <numeric>
 #include <string>
 
@@ -563,6 +564,11 @@ std::size_t LayoutDelta::bytes() const {
 
 ConsolidateResult consolidate(Mesh& mesh, Bvh& bvh, std::span<const Index> claimedLeaves, LayoutWorkspace& ws) {
   ConsolidateResult result;
+  // Dynamic topology never runs on meshes with sculpt layers; the layout would not carry them.
+  if (!mesh.layers.empty()) {
+    result.refused = true;
+    return result;
+  }
   if (!bvh.dynamic()) return result;
   result.beforeVertexCount = bvh.tailStartVertex();
   result.beforeFaceCount = bvh.tailStartFace();
@@ -592,7 +598,10 @@ ConsolidateResult consolidate(Mesh& mesh, Bvh& bvh, std::span<const Index> claim
     copyConsolidation(mesh, bvh, claimed, plan, ws, result.delta);
     result.delta = {};
   }
+  // The layer stack (always empty here) stays with the object's mesh, never in the workspace.
+  std::swap(mesh.layers, ws.mesh.layers);
   std::swap(mesh, ws.mesh);
+  assert(mesh.layers.empty() && ws.mesh.layers.empty());
 
   for (const RegionSlot& slot : plan.slots) result.delta.regionLeaves.push_back(slot.leaf);
   parallelFor(0, plan.slots.size(), 2, [&](std::size_t b, std::size_t e) {
@@ -667,7 +676,7 @@ LayoutSide captureSide(const Mesh& mesh, const Bvh& bvh, const LayoutDelta& delt
 
 bool relayout(Mesh& mesh, Bvh& bvh, const LayoutSide& to, const LayoutDelta& delta, bool toAfter,
               LayoutWorkspace& ws) {
-  if (!to.bvh || bvh.dynamic()) return false;
+  if (!to.bvh || bvh.dynamic() || !mesh.layers.empty()) return false;
   const auto from = bvh.leaves();
   const auto dst = to.bvh->leaves();
   const Index Lf = static_cast<Index>(from.size()), Lt = static_cast<Index>(dst.size());
@@ -814,7 +823,10 @@ bool relayout(Mesh& mesh, Bvh& bvh, const LayoutSide& to, const LayoutDelta& del
     if (faceSets) std::copy(s.faceSets.begin(), s.faceSets.end(), w.faceSets.begin() + dst[s.leaf].faceBegin);
   }
 
+  // The layer stack (always empty here) stays with the object's mesh, never in the workspace.
+  std::swap(mesh.layers, ws.mesh.layers);
   std::swap(mesh, ws.mesh);
+  assert(mesh.layers.empty() && ws.mesh.layers.empty());
   bvh = *to.bvh;
   bvh.endDynamic();
   return true;

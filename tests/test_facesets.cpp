@@ -379,7 +379,7 @@ TEST_CASE("undo memory counts face sets") {
   state.mesh.ensureFaceSets();
   CHECK(state.bytes() == plain + state.mesh.faceSets.size() * sizeof(std::int32_t));
   SculptUndo e;
-  e.before.push_back({0, {}, {}, {}, std::vector<std::int32_t>(10)});
+  e.before.push_back({0, {}, {}, {}, std::vector<std::int32_t>(10), {}});
   CHECK(e.bytes() == 10 * sizeof(std::int32_t));
   Mesh m = makeIcosphere(1);
   m.ensureFaceSets();

@@ -111,6 +111,8 @@ bool App::init(std::string* error) {
   undoStack.setLayoutWorkspace(workspace);
   syncWorkspace_ = std::make_shared<SyncWorkspace>();
   undoStack.setSyncWorkspace(syncWorkspace_);
+  layerWorkspace_ = std::make_shared<LayerWorkspace>();
+  undoStack.setLayerWorkspace(layerWorkspace_);
   rendererReady_ = true;
 
   initRecovery();
@@ -161,6 +163,9 @@ void App::run() {
     ImGuizmo::BeginFrame();
 
     drawUi();  // Also lays out the viewport rectangle.
+    // A strength drag whose slider stopped being drawn (the selection changed under it) never
+    // reports deactivation; end it here so its change reaches history and autosave resumes.
+    if (strengthDrag_.active() && !ImGui::IsAnyItemActive()) finishLayerStrengthDrag();
     drawGizmo();
     updateHover();
     renderer_.sync(scene, view.wireframe);
@@ -347,6 +352,7 @@ void App::handleShortcut(const SDL_KeyboardEvent& key) {
     if (key.key == SDLK_E) requestExport();
     if (key.key == SDLK_N) requestNewScene();
     if (key.key == SDLK_R) requestRemesh();
+    if (key.key == SDLK_L) addLayer();
     if (key.key == SDLK_PAGEUP) {
       requestSubdivide();
       ImGui::SetWindowFocus(nullptr);  // Panels would also scroll on Page Up.
@@ -356,6 +362,8 @@ void App::handleShortcut(const SDL_KeyboardEvent& key) {
       statusMessage = sculpt.dyntopo ? "Dynamic topology on" : "Dynamic topology off";
       const SceneObject* obj = scene.find(selectedId);
       if (sculpt.dyntopo && obj && obj->multires) statusMessage += " (not on objects with subdivision levels)";
+      else if (sculpt.dyntopo && obj && !obj->mesh.layers.empty())
+        statusMessage += " (not on objects with sculpt layers)";
     }
     return;
   }
@@ -405,6 +413,8 @@ void App::handleShortcut(const SDL_KeyboardEvent& key) {
       case SDLK_G: sculpt.brush = BrushKind::Grab; break;
       case SDLK_I: sculpt.brush = BrushKind::Inflate; break;
       case SDLK_T: sculpt.brush = BrushKind::Flatten; break;
+      case SDLK_E: sculpt.brush = BrushKind::EraseLayer; break;
+      case SDLK_L: toggleActiveLayerVisible(); break;
       case SDLK_F: adjustingRadius_ = true; break;  // Move the mouse sideways while holding F.
       case SDLK_R: adjustingDetail_ = true; break;  // The same for the dynamic topology detail.
       case SDLK_LEFTBRACKET: sculpt.radiusPx = std::max(2.0f, sculpt.radiusPx / 1.15f); break;
@@ -487,6 +497,7 @@ void App::addPrimitive(const std::string& name, Mesh mesh) {
 
 void App::newScene() {
   if (sculptor_.active()) endStroke();  // Never act on a mesh in the middle of a stroke.
+  finishLayerStrengthDrag();
   scene.clear();
   undoStack.clear();
   releaseSyncScratch();
@@ -499,6 +510,7 @@ void App::newScene() {
 
 void App::deleteSelected() {
   if (sculptor_.active()) endStroke();  // Never act on a mesh in the middle of a stroke.
+  finishLayerStrengthDrag();
   const SceneObject* obj = scene.find(selectedId);
   const bool hadLevels = obj && obj->multires;
   if (selectedId && scene.remove(selectedId)) {
@@ -511,6 +523,7 @@ void App::deleteSelected() {
 
 void App::duplicateSelected() {
   if (sculptor_.active()) endStroke();  // Never act on a mesh in the middle of a stroke.
+  finishLayerStrengthDrag();
   if (SceneObject* copy = scene.duplicate(selectedId)) {
     selectedId = copy->id;
     statusMessage = "Duplicated as " + copy->name;
@@ -538,17 +551,24 @@ void App::bumpUnderCursor() {
     statusMessage = "Hover over a mesh, then press B";
     return;
   }
-  SceneObject* obj = editableObject(hover_->objectId, "mesh");
+  // Finishing a strength drag (in editableObject) pushes an undo step, which clears hover_.
+  const ScenePick pick = *hover_;
+  SceneObject* obj = editableObject(pick.objectId, "mesh");
   if (!obj) return;
   if (obj->multires) {
     // The bump has no undo entry, and undoing a level switch would lose it or stop it spreading.
     statusMessage = "The bump test is not available on objects with subdivision levels.";
     return;
   }
+  if (!obj->mesh.layers.empty()) {
+    // The bump writes positions directly, which would leave them out of step with the layers.
+    statusMessage = "The bump test is not available on objects with sculpt layers.";
+    return;
+  }
   Timer t;
   Mesh& m = obj->mesh;
-  const Vec3 center = hover_->localHit.position;
-  const Vec3 dir = hover_->localHit.smoothNormal;
+  const Vec3 center = pick.localHit.position;
+  const Vec3 dir = pick.localHit.smoothNormal;
   const float radius = glm::length(obj->bvh.bounds().extent()) * 0.06f;
   std::vector<Index> leaves;
   obj->bvh.querySphere(center, radius, leaves);
@@ -583,8 +603,11 @@ void App::beginStroke(float x, float y, std::uint64_t timestampNs) {
   // undo entry: end it properly first.
   if (sculptor_.active()) endStroke();
   if (!hover_ || ImGui::GetIO().WantCaptureMouse) return;
-  SceneObject* obj = scene.find(hover_->objectId);
+  // Finishing a strength drag pushes an undo step, which clears hover_.
+  const ScenePick pick = *hover_;
+  SceneObject* obj = scene.find(pick.objectId);
   if (!obj) return;
+  finishLayerStrengthDrag();
   selectedId = obj->id;
   if (waitForJob(obj->id, "sculpting this object")) return;
   const SDL_Keymod mods = SDL_GetModState();
@@ -603,6 +626,21 @@ void App::beginStroke(float x, float y, std::uint64_t timestampNs) {
   opts.lockFaceSetBoundaries = sculpt.lockFaceSetBorders;
   // The Face Set brush starts a new set per stroke; Ctrl grows the set under the cursor instead.
   opts.extendFaceSet = ctrl;
+  // Sculpting brushes write the active sculpt layer (or the base); mask and face set brushes
+  // never do.
+  opts.layerTarget = obj->mesh.layers.active;
+  opts.smoothLayerOnly = sculpt.smoothLayerOnly;
+  const Brush* brush = strokeBrush_ == BrushKind::Grab ? nullptr
+                       : masking && shift              ? &maskSmoothBrush_
+                                                       : brushFor(strokeBrush_);
+  if (std::string why = layerStrokeRefusal(*obj, brush, opts); !why.empty()) {
+    statusMessage = why;
+    return;
+  }
+  std::string label = brush ? brush->name() : "Grab";
+  if (const SculptLayer* layer = obj->mesh.layers.find(opts.layerTarget);
+      layer && strokeBrush_ != BrushKind::Mask && strokeBrush_ != BrushKind::FaceSet)
+    label += " (" + layer->name + ")";
   if (strokeBrush_ == BrushKind::Grab) {
     // Grab captures once at the press; pressure only scales the radius here.
     const float p = currentPressure();
@@ -610,18 +648,17 @@ void App::beginStroke(float x, float y, std::uint64_t timestampNs) {
     const float px = sculpt.radiusPx * (mapRadius ? std::max(p, 0.1f) : 1.0f);
     const Mat4 inv = glm::inverse(obj->transform.matrix());
     const float scale = (obj->transform.scale.x + obj->transform.scale.y + obj->transform.scale.z) / 3.0f;
-    grabStartWorld_ = hover_->worldPosition;
+    grabStartWorld_ = pick.worldPosition;
     grabPlaneNormal_ = camera.forward();
     const float radius = camera.worldPerPixel(grabStartWorld_) * px / std::max(scale, 1e-6f);
-    if (sculptor_.beginGrab(*obj, opts, Vec3(inv * Vec4(grabStartWorld_, 1.0f)), radius, "Grab")) {
+    if (sculptor_.beginGrab(*obj, opts, Vec3(inv * Vec4(grabStartWorld_, 1.0f)), radius, label)) {
       stats.dabMs = 0.0;
       if (timestampNs != 0 && (oldestInputThisFrameNs_ == 0 || timestampNs < oldestInputThisFrameNs_))
         oldestInputThisFrameNs_ = timestampNs;
     }
     return;
   }
-  const Brush& brush = masking && shift ? maskSmoothBrush_ : *brushFor(strokeBrush_);
-  sculptor_.beginStroke(*obj, brush, opts, brush.name());
+  sculptor_.beginStroke(*obj, *brush, opts, label);
   samples_.clear();
   sampler_.begin({x - vpX_, y - vpY_, currentPressure()}, std::max(1.0f, sculpt.radiusPx * sculpt.spacing), samples_);
   applySamples(timestampNs);
@@ -733,12 +770,14 @@ const Brush* App::brushFor(BrushKind kind) const {
     case BrushKind::Crease: return &creaseBrush_;
     case BrushKind::Mask: return &maskBrush_;
     case BrushKind::FaceSet: return &faceSetBrush_;
+    case BrushKind::EraseLayer: return &eraseLayerBrush_;
   }
   return nullptr;
 }
 
 void App::undo() {
   if (sculptor_.active()) return;
+  finishLayerStrengthDrag();
   // A remesh or subdivision result is built from the mesh as it was, so it would bring this change
   // back.
   if (waitForJob(0, "undoing")) return;
@@ -749,6 +788,7 @@ void App::undo() {
 
 void App::redo() {
   if (sculptor_.active()) return;
+  finishLayerStrengthDrag();
   if (waitForJob(0, "redoing")) return;
   const std::string label = undoStack.redo(scene);
   if (!label.empty()) ++editCounter_;
@@ -774,6 +814,7 @@ SceneObject* App::editableObject(std::uint32_t id, const char* what) {
     return nullptr;
   }
   if (sculptor_.active()) return nullptr;
+  finishLayerStrengthDrag();
   // The job's result is built from the mesh as it was, so this edit would be lost.
   if (waitForJob(obj->id, std::string("editing this object's ") + what)) return nullptr;
   return obj;
@@ -872,11 +913,13 @@ void App::requestRemesh() {
     return;
   }
   if (sculptor_.active() || waitForJob(0, "remeshing")) return;
+  finishLayerStrengthDrag();
   job_ = Job::Remesh;
   jobObjectId_ = obj->id;
   statusMessage = "Remeshing " + obj->name + "...";
-  // The worker gets its own copy; the scene is only touched on the main thread.
-  auto input = std::make_shared<Mesh>(obj->mesh);
+  // The worker gets its own copy; the scene is only touched on the main thread. Remeshing bakes
+  // the sculpt layers: the worker sees only the composite, and undo brings the layers back.
+  auto input = std::make_shared<Mesh>(copyWithoutLayers(obj->mesh));
   const std::uint32_t id = obj->id;
   const std::uint64_t version = obj->topologyVersion;
   const QuadRemeshParams params{.targetEdge = remesh.voxelSize, .rounds = remesh.optimizeQuads ? 3 : 0};
@@ -1037,8 +1080,9 @@ void App::deleteLowerLevels() {
 }
 
 void App::releaseSyncScratch() {
-  // The undo stack shares the workspace, so replace its contents rather than the pointer.
+  // The undo stack shares the workspaces, so replace their contents rather than the pointers.
   *syncWorkspace_ = SyncWorkspace{};
+  if (!strengthDrag_.active()) layerWorkspace_->release();
 }
 
 // ---- Files ---------------------------------------------------------------------------------

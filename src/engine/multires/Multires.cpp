@@ -11,7 +11,8 @@ std::size_t vecBytes(const std::vector<T>& v) {
 }
 std::size_t meshBytes(const Mesh& m) {
   return vecBytes(m.positions) + vecBytes(m.normals) + vecBytes(m.mask) + vecBytes(m.faceSets) + vecBytes(m.vertHe) +
-         vecBytes(m.faceHe) + vecBytes(m.heNext) + vecBytes(m.heTwin) + vecBytes(m.heVert) + vecBytes(m.heFace);
+         vecBytes(m.faceHe) + vecBytes(m.heNext) + vecBytes(m.heTwin) + vecBytes(m.heVert) + vecBytes(m.heFace) +
+         m.layers.bytes();
 }
 }  // namespace
 
@@ -28,8 +29,10 @@ std::size_t MultiresLevel::bytes() const {
 std::size_t LevelReference::bytes() const { return vecBytes(positions) + vecBytes(mask) + vecBytes(faceSets); }
 
 std::size_t LevelDelta::bytes() const {
+  std::size_t rows = vecBytes(baseBefore) + vecBytes(baseAfter);
+  for (const LayerRows& r : layerRows) rows += sizeof(LayerRows) + vecBytes(r.index) + vecBytes(r.before) + vecBytes(r.after);
   return vecBytes(posIndex) + vecBytes(posBefore) + vecBytes(posAfter) + vecBytes(maskIndex) + vecBytes(maskBefore) +
-         vecBytes(maskAfter) + vecBytes(setIndex) + vecBytes(setBefore) + vecBytes(setAfter);
+         vecBytes(maskAfter) + vecBytes(setIndex) + vecBytes(setBefore) + vecBytes(setAfter) + rows;
 }
 
 bool SyncDelta::empty() const {

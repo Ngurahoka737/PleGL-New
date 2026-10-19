@@ -2,7 +2,7 @@
 
 Software digital sculpting 3D untuk desktop yang fokus pada satu hal: sculpting yang cepat, stabil, dan mudah dipelajari.
 
-Status: **Phase 6d (Multiresolution)**. Tujuh brush (Draw, Clay, Smooth, Grab, Inflate, Flatten, Crease), empat jenis falloff, tekanan pen, undo/redo, simetri X, dan quad remesh (voxel remesh lalu optimasi valence 4 sampai sekitar 99%, relaksasi, dan proyeksi ke permukaan asli) sudah jalan di atas engine Phase 0 (mesh, BVH, renderer, import/export OBJ). Project bisa disimpan dan dibuka sebagai `.psculpt`, dengan autosave tiap 5 menit dan pemulihan setelah crash. Mask melindungi area dari semua brush, bisa dicat, dibalik, dihapus, diperhalus, dan dipertajam, lalu ikut tersimpan di project dan ikut pindah saat remesh. Dynamic topology (Ctrl+D) menambah segitiga di tempat yang sedang di-sculpt dan menggabungkannya di tempat yang tidak butuh detail, dengan ukuran detail dalam pixel layar atau satuan objek, dan tetap bisa di-undo per stroke. Face set mengelompokkan poligon dengan warna untuk membatasi brush, membuat mask, atau menyembunyikan bagian model. Multiresolution (Ctrl+Page Up) menambah level subdivisi Catmull-Clark: bentuk besar dipahat di level rendah, detail di level tinggi, dan perubahan di satu level ikut menyebar ke level lain.
+Status: **Phase 6e (Sculpt layers)**. Tujuh brush (Draw, Clay, Smooth, Grab, Inflate, Flatten, Crease), empat jenis falloff, tekanan pen, undo/redo, simetri X, dan quad remesh (voxel remesh lalu optimasi valence 4 sampai sekitar 99%, relaksasi, dan proyeksi ke permukaan asli) sudah jalan di atas engine Phase 0 (mesh, BVH, renderer, import/export OBJ). Project bisa disimpan dan dibuka sebagai `.psculpt`, dengan autosave tiap 5 menit dan pemulihan setelah crash. Mask melindungi area dari semua brush, bisa dicat, dibalik, dihapus, diperhalus, dan dipertajam, lalu ikut tersimpan di project dan ikut pindah saat remesh. Dynamic topology (Ctrl+D) menambah segitiga di tempat yang sedang di-sculpt dan menggabungkannya di tempat yang tidak butuh detail, dengan ukuran detail dalam pixel layar atau satuan objek, dan tetap bisa di-undo per stroke. Face set mengelompokkan poligon dengan warna untuk membatasi brush, membuat mask, atau menyembunyikan bagian model. Multiresolution (Ctrl+Page Up) menambah level subdivisi Catmull-Clark: bentuk besar dipahat di level rendah, detail di level tinggi, dan perubahan di satu level ikut menyebar ke level lain. Sculpt layer (Ctrl+L) menyimpan detail secara non-destruktif: setiap layer bisa dikecilkan, dibalik, disembunyikan, digabung, atau dihapus kapan saja, dan ikut tersimpan di project.
 
 ## Stack
 
@@ -81,7 +81,11 @@ cmake --build --preset engine-only
 | Dynamic topology on/off | Ctrl + D (di Sculpt mode) |
 | Ukuran detail dynamic topology | Tahan R lalu geser mouse ke samping (di Sculpt mode) |
 | Simetri X on/off | X (di Sculpt mode) |
-| Remesh objek terpilih | Ctrl + R (menghapus level subdivisi; undo mengembalikannya) |
+| Remesh objek terpilih | Ctrl + R (menghapus level subdivisi dan memanggang layer; undo mengembalikannya) |
+| Layer sculpt baru (stroke masuk ke layer aktif) | Ctrl + L |
+| Tampilkan / sembunyikan layer aktif | L (di Sculpt mode) |
+| Brush Erase Layer (menghapus detail layer aktif) | E (di Sculpt mode) |
+| Tampilkan hanya satu layer | Alt + klik ikon mata di panel layer (lagi: tampilkan semua) |
 | Subdivide (tambah level multiresolution di atas) | Ctrl + Page Up |
 | Level subdivisi naik / turun | Page Up / Page Down |
 | Level tertinggi / terendah | Shift + Page Up / Shift + Page Down |
@@ -97,11 +101,11 @@ File project (`.psculpt`) dan OBJ juga bisa dibuka dengan menaruhnya sebagai arg
 ```
 src/engine/   Library engine tanpa UI (diuji headless)
   core/       Tipe dasar, parallelFor, timer
-  mesh/       Half-edge mesh berbasis index, primitive, validator, operasi topologi
+  mesh/       Half-edge mesh berbasis index, primitive, validator, operasi topologi, data sculpt layer
   spatial/    BVH (node daun = unit kerja engine), raycast, query bola, titik terdekat
   io/         Import dan export OBJ, project file .psculpt
   scene/      Objek, transform, picking
-  sculpt/     Brush, stroke sampler, sculptor (dab, simetri), dynamic topology, operasi mask dan face set, undo per daun BVH
+  sculpt/     Brush, stroke sampler, sculptor (dab, simetri), dynamic topology, operasi mask, face set, dan layer, undo per daun BVH
   render/     Indeks gambar per daun BVH (tanpa OpenGL, diuji headless)
   remesh/     Grid voxel (SDF), Surface Nets quad, voxel remesh, quad remesh
   multires/   Level subdivisi Catmull-Clark, sinkronisasi antar level, undo, penyimpanan

@@ -604,21 +604,46 @@ void Renderer::sync(Scene& scene, bool wireframe) {
     }
     syncMask(gpu, obj);
     syncFaceSets(gpu, obj);
+    if (obj.positionsDirtyAll && m.positions.size() <= static_cast<std::size_t>(gpu.vertexCapacity)) {
+      // A layer operation moved much of the mesh: one upload each beats many small ones.
+      const auto bytes = static_cast<GLsizeiptr>(m.positions.size() * sizeof(Vec3));
+      if (bytes > 0) {
+        glNamedBufferSubData(gpu.positions, 0, bytes, m.positions.data());
+        stats_.uploadedBytes += static_cast<std::size_t>(bytes);
+        if (obj.normalsDirtyAll) {
+          glNamedBufferSubData(gpu.normals, 0, bytes, m.normals.data());
+          stats_.uploadedBytes += static_cast<std::size_t>(bytes);
+        }
+      }
+      ++stats_.fullUploads;
+    }
+    obj.positionsDirtyAll = obj.normalsDirtyAll = false;
     if (obj.dirtyLeaves.empty()) continue;
     std::sort(obj.dirtyLeaves.begin(), obj.dirtyLeaves.end());
     obj.dirtyLeaves.erase(std::unique(obj.dirtyLeaves.begin(), obj.dirtyLeaves.end()), obj.dirtyLeaves.end());
     const auto leaves = obj.bvh.leaves();
+    // Leaves own consecutive vertex ranges, so neighbouring dirty leaves go up as one range.
+    Index runBegin = 0, runEnd = 0;
+    auto flush = [&] {
+      const auto offset = static_cast<GLintptr>(runBegin * sizeof(Vec3));
+      const auto bytes = static_cast<GLsizeiptr>((runEnd - runBegin) * sizeof(Vec3));
+      if (bytes == 0) return;
+      glNamedBufferSubData(gpu.positions, offset, bytes, &m.positions[runBegin]);
+      glNamedBufferSubData(gpu.normals, offset, bytes, &m.normals[runBegin]);
+      stats_.uploadedBytes += static_cast<std::size_t>(bytes) * 2;
+      ++stats_.partialUploads;
+    };
     for (Index l : obj.dirtyLeaves) {
       if (l < 0 || static_cast<std::size_t>(l) >= leaves.size()) continue;
       const BvhLeaf& leaf = leaves[l];
-      const auto offset = static_cast<GLintptr>(leaf.vertBegin * sizeof(Vec3));
-      const auto bytes = static_cast<GLsizeiptr>((leaf.vertEnd - leaf.vertBegin) * sizeof(Vec3));
-      if (bytes == 0) continue;
-      glNamedBufferSubData(gpu.positions, offset, bytes, &m.positions[leaf.vertBegin]);
-      glNamedBufferSubData(gpu.normals, offset, bytes, &m.normals[leaf.vertBegin]);
-      stats_.uploadedBytes += static_cast<std::size_t>(bytes) * 2;
-      ++stats_.partialUploads;
+      if (leaf.vertBegin == leaf.vertEnd) continue;
+      if (leaf.vertBegin != runEnd) {
+        flush();
+        runBegin = leaf.vertBegin;
+      }
+      runEnd = leaf.vertEnd;
     }
+    flush();
     obj.dirtyLeaves.clear();
   }
   for (auto it = meshes_.begin(); it != meshes_.end();) {
