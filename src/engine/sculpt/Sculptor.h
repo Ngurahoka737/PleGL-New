@@ -38,6 +38,14 @@ class Sculptor {
   // already include pen pressure. Returns false if nothing was under the dab.
   bool dab(const Vec3& center, float radius, float strength);
 
+  // Grab stroke: captures the vertices inside the sphere (and its X mirror when symmetry is on)
+  // and then moves them rigidly with the cursor, weighted by falloff, until the stroke ends.
+  // Returns false (and starts nothing) if no vertex is inside the sphere.
+  bool beginGrab(SceneObject& object, const StrokeOptions& options, const Vec3& center, float radius,
+                 std::string label);
+  // Moves the captured vertices to their start position plus `offset` (local space).
+  void grab(const Vec3& offset);
+
   // Ends the stroke. Returns the undo entry, or nothing if the stroke changed nothing.
   std::optional<SculptUndo> endStroke();
 
@@ -45,9 +53,11 @@ class Sculptor {
   int dabCount() const { return dabCount_; }
 
  private:
+  void start(SceneObject& object, const StrokeOptions& options, std::string label);
   bool applyOne(const Dab& dab);
+  void recomputeNormals(std::span<const Index> verts);
   void snapshot(Index leaf);
-  Vec3 areaNormal(const Vec3& center, float radius, std::span<const Index> leaves) const;
+  bool computeArea(Dab& dab, std::span<const Index> leaves) const;
 
   SceneObject* object_ = nullptr;
   const Brush* brush_ = nullptr;
@@ -57,6 +67,16 @@ class Sculptor {
   std::vector<std::uint32_t> vertexStamp_;
   std::uint32_t stamp_ = 0;
   std::vector<Index> leaves_, normalVerts_, dirtyLeaves_;
+  // Grab state: captured vertices, their start positions and weights for the primary and the
+  // mirrored sphere, plus the fixed set of vertices whose normals and leaves a grab touches.
+  struct GrabVertex {
+    Index v;
+    Vec3 start;
+    float weight;
+    float mirrorWeight;
+  };
+  std::vector<GrabVertex> grabVerts_;
+  std::vector<Index> grabNormalVerts_, grabRefitLeaves_, grabDirtyLeaves_;
   DabTiming lastDab_;
   int dabCount_ = 0;
 };

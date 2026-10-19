@@ -44,16 +44,18 @@ struct PrimitiveSettings {
   int planeResolution = 64;
 };
 
-enum class BrushKind { Draw, Smooth };
+enum class BrushKind { Draw, Clay, Smooth, Grab, Inflate, Flatten, Crease };
+inline constexpr int kBrushCount = 7;
+inline constexpr const char* kBrushNames[kBrushCount] = {"Draw", "Clay", "Smooth", "Grab", "Inflate", "Flatten", "Crease"};
+inline constexpr const char* kBrushKeys[kBrushCount] = {"D", "C", "S", "G", "I", "T", "Shift+C"};
 enum class PressureMap { Strength, Radius, Both, None };
 
 struct SculptSettings {
   BrushKind brush = BrushKind::Draw;
   float radiusPx = 60.0f;      // Screen-space radius, like most sculpting tools.
-  float drawStrength = 0.5f;
-  float smoothStrength = 0.5f;
+  float strength[kBrushCount] = {0.5f, 0.5f, 0.5f, 1.0f, 0.5f, 0.5f, 0.5f};  // Per brush.
   Falloff falloff = Falloff::Smooth;
-  bool invert = false;         // Draw subtracts instead of adds (Ctrl flips it per stroke).
+  bool invert = false;         // Brushes subtract instead of add (Ctrl flips it per stroke).
   PressureMap pressure = PressureMap::Strength;
   bool symmetryX = true;       // PRD default for character sculpting.
   float spacing = 0.1f;        // Dab spacing as a fraction of the radius.
@@ -153,11 +155,19 @@ class App {
 
   // Sculpting.
   Sculptor sculptor_;
+  const Brush* brushFor(BrushKind kind) const;  // nullptr for Grab, which has its own stroke path.
   DrawBrush drawBrush_;
+  ClayBrush clayBrush_;
   SmoothBrush smoothBrush_;
+  InflateBrush inflateBrush_;
+  FlattenBrush flattenBrush_;
+  CreaseBrush creaseBrush_;
   StrokeSampler sampler_;
   std::vector<StrokeSample> samples_;
-  bool strokeSmooth_ = false;        // Shift held when the stroke began.
+  BrushKind strokeBrush_ = BrushKind::Draw;  // Brush of the running stroke (Shift turns it into Smooth).
+  // Grab drags the captured region in the plane through the grab point facing the camera.
+  Vec3 grabStartWorld_{0.0f};
+  Vec3 grabPlaneNormal_{0.0f, 0.0f, 1.0f};
   bool adjustingRadius_ = false;     // F held.
   std::uint64_t oldestInputThisFrameNs_ = 0;
   int dabsThisFrame_ = 0;

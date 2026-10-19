@@ -319,7 +319,11 @@ void App::handleShortcut(const SDL_KeyboardEvent& key) {
   if (mode == Mode::Sculpt) {
     switch (key.key) {
       case SDLK_D: sculpt.brush = BrushKind::Draw; break;
+      case SDLK_C: sculpt.brush = shift ? BrushKind::Crease : BrushKind::Clay; break;
       case SDLK_S: sculpt.brush = BrushKind::Smooth; break;
+      case SDLK_G: sculpt.brush = BrushKind::Grab; break;
+      case SDLK_I: sculpt.brush = BrushKind::Inflate; break;
+      case SDLK_T: sculpt.brush = BrushKind::Flatten; break;
       case SDLK_F: adjustingRadius_ = true; break;  // Move the mouse sideways while holding F.
       case SDLK_LEFTBRACKET: sculpt.radiusPx = std::max(2.0f, sculpt.radiusPx / 1.15f); break;
       case SDLK_RIGHTBRACKET: sculpt.radiusPx = std::min(1000.0f, sculpt.radiusPx * 1.15f); break;
@@ -477,13 +481,30 @@ void App::beginStroke(float x, float y, std::uint64_t timestampNs) {
   if (!obj) return;
   selectedId = obj->id;
   const SDL_Keymod mods = SDL_GetModState();
-  strokeSmooth_ = (mods & SDL_KMOD_SHIFT) != 0 || sculpt.brush == BrushKind::Smooth;
+  strokeBrush_ = (mods & SDL_KMOD_SHIFT) != 0 ? BrushKind::Smooth : sculpt.brush;
   StrokeOptions opts;
   opts.falloff = sculpt.falloff;
   opts.symmetryX = sculpt.symmetryX;
-  opts.strength = strokeSmooth_ ? sculpt.smoothStrength : sculpt.drawStrength;
+  opts.strength = sculpt.strength[static_cast<int>(strokeBrush_)];
   opts.invert = sculpt.invert != ((mods & SDL_KMOD_CTRL) != 0);
-  const Brush& brush = strokeSmooth_ ? static_cast<const Brush&>(smoothBrush_) : static_cast<const Brush&>(drawBrush_);
+  if (strokeBrush_ == BrushKind::Grab) {
+    // Grab captures once at the press; pressure only scales the radius here.
+    const float p = currentPressure();
+    const bool mapRadius = sculpt.pressure == PressureMap::Radius || sculpt.pressure == PressureMap::Both;
+    const float px = sculpt.radiusPx * (mapRadius ? std::max(p, 0.1f) : 1.0f);
+    const Mat4 inv = glm::inverse(obj->transform.matrix());
+    const float scale = (obj->transform.scale.x + obj->transform.scale.y + obj->transform.scale.z) / 3.0f;
+    grabStartWorld_ = hover_->worldPosition;
+    grabPlaneNormal_ = camera.forward();
+    const float radius = camera.worldPerPixel(grabStartWorld_) * px / std::max(scale, 1e-6f);
+    if (sculptor_.beginGrab(*obj, opts, Vec3(inv * Vec4(grabStartWorld_, 1.0f)), radius, "Grab")) {
+      stats.dabMs = 0.0;
+      if (timestampNs != 0 && (oldestInputThisFrameNs_ == 0 || timestampNs < oldestInputThisFrameNs_))
+        oldestInputThisFrameNs_ = timestampNs;
+    }
+    return;
+  }
+  const Brush& brush = *brushFor(strokeBrush_);
   sculptor_.beginStroke(*obj, brush, opts, brush.name());
   samples_.clear();
   sampler_.begin({x - vpX_, y - vpY_, currentPressure()}, std::max(1.0f, sculpt.radiusPx * sculpt.spacing), samples_);
@@ -491,6 +512,24 @@ void App::beginStroke(float x, float y, std::uint64_t timestampNs) {
 }
 
 void App::continueStroke(float x, float y, std::uint64_t timestampNs) {
+  if (strokeBrush_ == BrushKind::Grab) {
+    SceneObject* obj = sculptor_.object();
+    const Ray ray = camera.rayThroughPixel(x - vpX_, y - vpY_);
+    const float denom = glm::dot(ray.dir, grabPlaneNormal_);
+    if (!obj || std::abs(denom) < 1e-8f) return;
+    const float t = glm::dot(grabStartWorld_ - ray.origin, grabPlaneNormal_) / denom;
+    const Vec3 offsetWorld = ray.origin + ray.dir * t - grabStartWorld_;
+    const Mat4 inv = glm::inverse(obj->transform.matrix());
+    sculptor_.grab(Vec3(inv * Vec4(offsetWorld, 0.0f)));
+    ++dabsThisFrame_;
+    stats.dabMs = sculptor_.lastDab().totalMs;
+    if (timestampNs != 0) {
+      const double ms = static_cast<double>(SDL_GetTicksNS() - timestampNs) / 1e6;
+      stats.inputToDabMs = stats.inputToDabMs == 0.0 ? ms : stats.inputToDabMs * 0.8 + ms * 0.2;
+      if (oldestInputThisFrameNs_ == 0 || timestampNs < oldestInputThisFrameNs_) oldestInputThisFrameNs_ = timestampNs;
+    }
+    return;
+  }
   samples_.clear();
   sampler_.setSpacing(std::max(1.0f, sculpt.radiusPx * sculpt.spacing));
   sampler_.moveTo({x - vpX_, y - vpY_, currentPressure()}, samples_);
@@ -503,8 +542,7 @@ void App::applySamples(std::uint64_t timestampNs) {
   const Mat4 model = obj->transform.matrix();
   const Mat4 inv = glm::inverse(model);
   const float scale = (obj->transform.scale.x + obj->transform.scale.y + obj->transform.scale.z) / 3.0f;
-  const bool smoothStroke = strokeSmooth_;
-  const float baseStrength = smoothStroke ? sculpt.smoothStrength : sculpt.drawStrength;
+  const float baseStrength = sculpt.strength[static_cast<int>(strokeBrush_)];
   for (const StrokeSample& smp : samples_) {
     const Ray world = camera.rayThroughPixel(smp.x, smp.y);
     Ray local{Vec3(inv * Vec4(world.origin, 1.0f)), Vec3(inv * Vec4(world.dir, 0.0f))};
@@ -533,8 +571,22 @@ void App::endStroke() {
   if (auto entry = sculptor_.endStroke()) {
     const int dabs = sculptor_.dabCount();
     undoStack.push(std::move(*entry));
-    statusMessage = std::string(strokeSmooth_ ? "Smooth" : "Draw") + " stroke, " + std::to_string(dabs) + " dabs";
+    statusMessage = std::string(kBrushNames[static_cast<int>(strokeBrush_)]) + " stroke, " + std::to_string(dabs) +
+                    (strokeBrush_ == BrushKind::Grab ? " moves" : " dabs");
   }
+}
+
+const Brush* App::brushFor(BrushKind kind) const {
+  switch (kind) {
+    case BrushKind::Draw: return &drawBrush_;
+    case BrushKind::Clay: return &clayBrush_;
+    case BrushKind::Smooth: return &smoothBrush_;
+    case BrushKind::Grab: return nullptr;
+    case BrushKind::Inflate: return &inflateBrush_;
+    case BrushKind::Flatten: return &flattenBrush_;
+    case BrushKind::Crease: return &creaseBrush_;
+  }
+  return nullptr;
 }
 
 void App::undo() {

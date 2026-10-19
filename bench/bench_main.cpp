@@ -77,20 +77,33 @@ int main(int argc, char** argv) {
     if (hits == 0) std::printf("  warning: no ray hit the mesh\n");
   }
 
-  // Brush latency: one Draw stroke of 200 dabs along an arc, then the same with Smooth. A dab
-  // includes the BVH query, brush, normals, refit, undo snapshots and dirty marking; GPU upload
-  // and drawing are not included.
+  // Brush latency: one stroke of 200 dabs along an arc per brush and radius. A dab includes the
+  // BVH query, brush, normals, refit, undo snapshots and dirty marking; GPU upload and drawing
+  // are not included. Grab is measured as 200 cursor moves after one capture.
   std::printf("\nStroke benchmark (ms per dab, 200 dabs)\n\n");
   std::printf("%10s %8s %8s %10s %10s %10s %10s\n", "vertices", "radius", "brush", "verts/dab", "avg ms", "p95 ms",
               "max ms");
+  auto report = [](const SceneObject& obj, float radius, const char* name, std::vector<double>& times, double verts) {
+    std::sort(times.begin(), times.end());
+    double avg = 0;
+    for (double t : times) avg += t;
+    avg /= static_cast<double>(times.size());
+    std::printf("%10d %8.2f %8s %10.0f %10.3f %10.3f %10.3f\n", obj.mesh.vertexCount(), radius, name,
+                verts / static_cast<double>(times.size()), avg, times.at(times.size() * 95 / 100), times.back());
+  };
   std::vector<int> strokeRes = quick ? std::vector<int>{129} : std::vector<int>{289, 408};
   for (int res : strokeRes) {
-    Scene scene;
-    SceneObject& obj = scene.add("Sphere", makeQuadSphere(res));
     DrawBrush draw;
+    ClayBrush clay;
     SmoothBrush smooth;
-    for (const Brush* brush : {static_cast<const Brush*>(&draw), static_cast<const Brush*>(&smooth)}) {
+    InflateBrush inflate;
+    FlattenBrush flatten;
+    CreaseBrush crease;
+    const Brush* brushes[] = {&draw, &clay, &smooth, &inflate, &flatten, &crease};
+    for (const Brush* brush : brushes) {
       for (float radius : {0.05f, 0.15f, 0.4f}) {
+        Scene scene;  // Fresh sphere per run so earlier strokes do not change the next.
+        SceneObject& obj = scene.add("Sphere", makeQuadSphere(res));
         Sculptor sculptor;
         sculptor.beginStroke(obj, *brush, {.strength = 0.5f}, brush->name());
         std::vector<double> times;
@@ -105,14 +118,24 @@ int main(int argc, char** argv) {
           verts += sculptor.lastDab().vertices;
         }
         sculptor.endStroke();
-        obj.dirtyLeaves.clear();
-        std::sort(times.begin(), times.end());
-        double avg = 0;
-        for (double t : times) avg += t;
-        avg /= static_cast<double>(times.size());
-        std::printf("%10d %8.2f %8s %10.0f %10.3f %10.3f %10.3f\n", obj.mesh.vertexCount(), radius, brush->name(),
-                    verts / static_cast<double>(times.size()), avg, times.at(times.size() * 95 / 100), times.back());
+        report(obj, radius, brush->name(), times, verts);
       }
+    }
+    for (float radius : {0.05f, 0.15f, 0.4f}) {
+      Scene scene;
+      SceneObject& obj = scene.add("Sphere", makeQuadSphere(res));
+      Sculptor sculptor;
+      if (!sculptor.beginGrab(obj, {.strength = 1.0f}, {0.0f, 0.0f, 1.0f}, radius, "Grab")) continue;
+      std::vector<double> times;
+      double verts = 0;
+      for (int i = 0; i < 200; ++i) {
+        const float t = static_cast<float>(i) / 199.0f;
+        sculptor.grab(Vec3{0.3f * t, 0.1f * t, 0.5f * t});
+        times.push_back(sculptor.lastDab().totalMs);
+        verts += sculptor.lastDab().vertices;
+      }
+      sculptor.endStroke();
+      report(obj, radius, "Grab", times, verts);
     }
   }
   return 0;

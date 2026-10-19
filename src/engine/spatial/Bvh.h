@@ -61,6 +61,8 @@ class Bvh {
 
   // Leaf owning vertex v, or kInvalid for isolated vertices.
   Index leafOfVertex(Index v) const;
+  // Leaf owning face f, or kInvalid.
+  Index leafOfFace(Index f) const;
 
   std::span<const BvhLeaf> leaves() const { return leaves_; }
   std::span<const BvhNode> nodes() const { return nodes_; }

@@ -2,7 +2,7 @@
 
 Software digital sculpting 3D untuk desktop yang fokus pada satu hal: sculpting yang cepat, stabil, dan mudah dipelajari.
 
-Status: **Phase 1 (First Sculpt)**. Brush Draw dan Smooth, tekanan pen, undo/redo, dan simetri X sudah jalan di atas engine Phase 0 (mesh, BVH, renderer, import/export OBJ).
+Status: **Phase 2 (Sculpt Core)**. Tujuh brush (Draw, Clay, Smooth, Grab, Inflate, Flatten, Crease), empat jenis falloff, tekanan pen, undo/redo, dan simetri X sudah jalan di atas engine Phase 0 (mesh, BVH, renderer, import/export OBJ).
 
 ## Stack
 
@@ -65,8 +65,9 @@ cmake --build --preset engine-only
 | Object / Sculpt mode | Tab |
 | Sculpt (di Sculpt mode) | Drag kiri |
 | Smooth sementara | Shift + drag kiri |
-| Balik arah Draw (Add/Subtract) | Ctrl + drag kiri |
-| Pilih brush Draw / Smooth | D / S |
+| Balik arah brush (Add/Subtract) | Ctrl + drag kiri |
+| Pilih brush Draw / Clay / Smooth / Grab | D / C / S / G |
+| Pilih brush Inflate / Flatten / Crease | I / T / Shift + C |
 | Radius brush | [ dan ], atau tahan F lalu geser mouse ke samping |
 | Simetri X on/off | X (di Sculpt mode) |
 | Undo / Redo | Ctrl + Z / Ctrl + Shift + Z atau Ctrl + Y |

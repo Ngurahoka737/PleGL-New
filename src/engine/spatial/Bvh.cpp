@@ -26,7 +26,11 @@ float rayAabb(const Vec3& origin, const Vec3& invDir, const Aabb& b, float tMax)
   return enter <= exit ? enter : std::numeric_limits<float>::infinity();
 }
 
-// Möller-Trumbore, double sided. Writes t, u, v on hit.
+// Möller-Trumbore, double sided. Writes t, u, v on hit. Barycentrics get a small tolerance so a
+// ray through a shared edge or vertex cannot slip between neighbouring triangles (it would then
+// hit the far side of the mesh).
+constexpr float kBaryEps = 1e-5f;
+
 bool rayTriangle(const Ray& ray, const Vec3& a, const Vec3& b, const Vec3& c, float& t, float& u, float& v) {
   const Vec3 e1 = b - a;
   const Vec3 e2 = c - a;
@@ -36,10 +40,10 @@ bool rayTriangle(const Ray& ray, const Vec3& a, const Vec3& b, const Vec3& c, fl
   const float inv = 1.0f / det;
   const Vec3 s = ray.origin - a;
   u = glm::dot(s, p) * inv;
-  if (u < 0.0f || u > 1.0f) return false;
+  if (u < -kBaryEps || u > 1.0f + kBaryEps) return false;
   const Vec3 q = glm::cross(s, e1);
   v = glm::dot(ray.dir, q) * inv;
-  if (v < 0.0f || u + v > 1.0f) return false;
+  if (v < -kBaryEps || u + v > 1.0f + kBaryEps) return false;
   t = glm::dot(e2, q) * inv;
   return t >= 0.0f;
 }
@@ -152,6 +156,13 @@ Index Bvh::leafOfVertex(Index v) const {
   auto it = std::upper_bound(leaves_.begin(), leaves_.end(), v,
                              [](Index value, const BvhLeaf& leaf) { return value < leaf.vertEnd; });
   if (it == leaves_.end() || v < it->vertBegin) return kInvalid;
+  return static_cast<Index>(it - leaves_.begin());
+}
+
+Index Bvh::leafOfFace(Index f) const {
+  auto it = std::upper_bound(leaves_.begin(), leaves_.end(), f,
+                             [](Index value, const BvhLeaf& leaf) { return value < leaf.faceEnd; });
+  if (it == leaves_.end() || f < it->faceBegin) return kInvalid;
   return static_cast<Index>(it - leaves_.begin());
 }
 

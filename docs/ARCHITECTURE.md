@@ -43,6 +43,20 @@ Setiap dab:
 
 Radius brush ditentukan dalam pixel layar, lalu diubah ke satuan dunia di titik kena, jadi ukuran brush terasa sama di layar pada zoom berapa pun. Tekanan pen bisa memengaruhi strength, radius, keduanya, atau tidak sama sekali.
 
+Brush yang ada:
+
+| Brush | Cara kerja |
+| --- | --- |
+| Draw | Mendorong vertex sepanjang normal area. |
+| Clay | Menarik vertex di bawah bidang (sedikit di atas permukaan) ke bidang itu, jadi volume bertambah sekaligus rata. |
+| Smooth | Laplacian ke rata-rata tetangga; vertex border hanya dirata-rata dengan tetangga border. |
+| Inflate | Mendorong tiap vertex sepanjang normalnya sendiri. |
+| Flatten | Menarik vertex ke bidang yang melewati pusat area. |
+| Crease | Mendorong ke dalam seperti Draw sambil menjepit vertex ke pusat brush. |
+| Grab | Menangkap vertex di dalam radius saat klik, lalu memindahkannya mengikuti cursor pada bidang yang menghadap kamera. |
+
+Semua brush kecuali Grab lewat `Brush::apply` dan dibatasi `kMaxDabMove` (0,2 × radius per dab) supaya pencarian normal basi tetap benar. Grab punya jalur sendiri di `Sculptor::beginGrab/grab`: daftar vertex, face, dan daun yang terpengaruh dihitung sekali saat klik, lalu tiap gerakan cursor hanya menulis posisi, normal, dan refit daun itu.
+
 Undo menyimpan keadaan sebelum dan sesudah untuk daun yang berubah saja (posisi dan normal), dengan batas memori 1 GB. Entry yang topologinya sudah berubah (misalnya setelah remesh nanti) dilewati, bukan diterapkan ke mesh yang salah.
 
 ## Threading (`core/Parallel.h`)
@@ -62,9 +76,9 @@ Mesin cloud 4 thread, Release, quad sphere (`plegl_bench`):
 
 Import OBJ 1M vertex (parse + build topologi): sekitar 0,3 detik.
 
-## Hasil benchmark stroke (Phase 1)
+## Hasil benchmark stroke
 
-`plegl_bench`, mesin cloud 4 thread, Release, quad sphere radius 1, 200 dab sepanjang busur. Waktu per dab termasuk snapshot undo, brush, normal, dan refit:
+`plegl_bench`, mesin cloud 4 thread, Release, quad sphere radius 1, 200 dab sepanjang busur (Grab: 200 gerakan cursor setelah satu klik). Waktu per dab termasuk snapshot undo, brush, normal, dan refit. Angka Phase 1:
 
 | Vertex | Radius dab | Brush | Rata-rata | p95 |
 | ---: | ---: | --- | ---: | ---: |
@@ -74,5 +88,15 @@ Import OBJ 1M vertex (parse + build topologi): sekitar 0,3 detik.
 | 1M | 0,15 | Draw | 0,80 ms | 1,1 ms |
 | 1M | 0,40 | Draw | 2,9 ms | 3,9 ms |
 | 1M | 0,40 | Smooth | 2,3 ms | 4,0 ms |
+
+Phase 2, 1M vertex, p95 per dab:
+
+| Brush | Radius 0,15 | Radius 0,40 |
+| --- | ---: | ---: |
+| Clay | 1,3 ms | 6,0 ms |
+| Inflate | 1,3 ms | 4,5 ms |
+| Flatten | 1,4 ms | 7,2 ms |
+| Crease | 1,7 ms | 10,0 ms |
+| Grab | 0,4 ms | 1,8 ms |
 
 Target PRD (latensi brush di bawah 16 ms) masih terpenuhi pada 1M vertex dengan brush besar. Upload GPU belum termasuk angka ini; panel Performance di aplikasi menampilkan waktu dab dan latensi input-ke-frame secara langsung.
