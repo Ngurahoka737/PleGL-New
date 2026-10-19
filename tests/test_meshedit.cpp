@@ -193,7 +193,9 @@ void requireReported(const Mesh& before, const Mesh& after, const RecordingObser
     }
   }
   for (Index f = 0; f < before.faceCount(); ++f) {
-    if (before.faceHe[f] != after.faceHe[f] && !obs.has(obs.faces, f)) {
+    const bool changed = before.faceHe[f] != after.faceHe[f] ||
+                         (!before.faceSets.empty() && before.faceSets[f] != after.faceSets[f]);
+    if (changed && !obs.has(obs.faces, f)) {
       INFO("face " << f << " changed unreported");
       REQUIRE(false);
     }
@@ -214,6 +216,8 @@ TEST_CASE("an edit observer hears about every element an edit changes") {
   for (int shape = 0; shape < 3; ++shape) {
     Mesh m = shape == 0 ? makeIcosphere(2) : shape == 1 ? makeQuadSphere(6) : makeUvSphere(12, 8);
     m.mask.assign(m.positions.size(), 0.25f);
+    m.faceSets.resize(m.faceHe.size());
+    for (Index f = 0; f < m.faceCount(); ++f) m.faceSets[f] = f % 7 == 0 ? -(f % 3 + 1) : f % 3 + 1;
     MeshEditor ed(m);
     RecordingObserver obs;
     ed.setObserver(&obs);

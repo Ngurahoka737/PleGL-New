@@ -40,6 +40,7 @@ add_library(plegl_engine STATIC
   src/engine/sculpt/Brush.cpp
   src/engine/sculpt/Dyntopo.cpp
   src/engine/sculpt/MaskOps.cpp
+  src/engine/sculpt/FaceSetOps.cpp
   src/engine/sculpt/Sculptor.cpp
   src/engine/sculpt/StrokeSampler.cpp
   src/engine/sculpt/Undo.cpp
@@ -81,6 +82,7 @@ if(PLEGL_BUILD_TESTS)
     tests/test_primitives.cpp
     tests/test_obj.cpp
     tests/test_mask.cpp
+    tests/test_facesets.cpp
     tests/test_project.cpp
     tests/test_bvh.cpp
     tests/test_leaflayout.cpp

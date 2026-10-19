@@ -58,9 +58,10 @@ class Bvh {
   void build(Mesh& mesh, const Params& params);
   void build(Mesh& mesh) { build(mesh, Params{}); }
 
-  // Nearest hit along the ray (both triangle sides), or false.
-  bool raycast(const Mesh& mesh, const Ray& ray, RayHit& hit,
-               float tMax = std::numeric_limits<float>::infinity()) const;
+  // Nearest hit along the ray (both triangle sides), or false. `visibleOnly` skips hidden faces
+  // (see Mesh::faceSets): picking and brushes pass it, remeshing does not.
+  bool raycast(const Mesh& mesh, const Ray& ray, RayHit& hit, float tMax = std::numeric_limits<float>::infinity(),
+               bool visibleOnly = false) const;
 
   // Nearest surface point to p within maxDist. Returns false if there is none.
   struct ClosestHit {
@@ -72,7 +73,7 @@ class Bvh {
     // interpolating vertex attributes at `position`.
     Index corners[3] = {kInvalid, kInvalid, kInvalid};
   };
-  bool closestPoint(const Mesh& mesh, const Vec3& p, float maxDist, ClosestHit& out) const;
+  bool closestPoint(const Mesh& mesh, const Vec3& p, float maxDist, ClosestHit& out, bool visibleOnly = false) const;
 
   // Appends every leaf whose bounds intersect the sphere.
   void querySphere(const Vec3& center, float radius, std::vector<Index>& outLeaves) const;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <span>
 #include <string>
 #include <vector>
@@ -12,10 +13,25 @@ namespace plegl {
 // distance tests (dist2 >= r2) reject it without creating inf or NaN, but far from any surface.
 inline constexpr Vec3 kDeadPosition{1e18f, 1e18f, 1e18f};
 
+// Face sets: every face belongs to one numbered group, drawn in its own colour and used to limit
+// brushes and to hide parts of the mesh. A stored value v names set |v|; a negative value marks
+// the face hidden. 0 is never stored. Faces of a mesh without the array are in kDefaultFaceSet
+// and visible; that set is drawn without colour. Ids stay at or below kMaxFaceSetId, so a new id
+// (the largest plus one) never overflows and INT32_MAX stays free for sentinels.
+inline constexpr std::int32_t kDefaultFaceSet = 1;
+inline constexpr std::int32_t kMaxFaceSetId = INT32_MAX - 1;
+inline std::int32_t faceSetId(std::int32_t value) { return value < 0 ? -value : value; }
+inline bool faceSetHidden(std::int32_t value) { return value < 0; }
+// True for a value that may be stored: a set id in [1, kMaxFaceSetId], negated when hidden.
+inline bool validFaceSetValue(std::int32_t value) {
+  return value != 0 && value >= -kMaxFaceSetId && value <= kMaxFaceSetId;
+}
+
 // Polygon mesh stored as an index-based half-edge structure with struct-of-arrays attributes.
 //
 // Topology arrays hold 32-bit indices only, so a mesh can be copied, serialized or handed to
-// another thread cheaply. Hot sculpting paths only touch `positions`, `normals` and `mask`.
+// another thread cheaply. Hot sculpting paths only touch `positions`, `normals` and `mask`;
+// `faceSets` is read only when a stroke is limited to a face set or part of the mesh is hidden.
 //
 // Conventions:
 //  - Half-edge h starts at heVert[h] and ends at heVert[heNext[h]].
@@ -31,6 +47,9 @@ class Mesh {
   // Sculpt mask in [0, 1]; 1 means fully protected from brushes. Empty means nothing is masked,
   // otherwise it has one value per vertex. Topology builders leave it empty.
   std::vector<float> mask;
+  // Face attribute: the face set value of every face (see kDefaultFaceSet), or empty when every
+  // face is in the default set and visible. Topology builders leave it empty.
+  std::vector<std::int32_t> faceSets;
 
   // Topology.
   std::vector<Index> vertHe;  // One outgoing half-edge per vertex (kInvalid if isolated).
@@ -56,6 +75,27 @@ class Mesh {
   }
   // True if any vertex has a non-zero mask value.
   bool anyMasked() const;
+
+  // Allocates the face sets (all kDefaultFaceSet, visible) if they are empty.
+  void ensureFaceSets() {
+    if (faceSets.empty()) faceSets.assign(faceHe.size(), kDefaultFaceSet);
+  }
+  // Stored value of face f (negative when hidden).
+  std::int32_t faceSetValue(Index f) const { return faceSets.empty() ? kDefaultFaceSet : faceSets[f]; }
+  bool faceHidden(Index f) const { return !faceSets.empty() && faceSets[f] < 0; }
+  // True if any live face is in a set other than the default one.
+  bool anyFaceSet() const;
+  // True if any live face is hidden.
+  bool anyHidden() const;
+  // True if any live face has a value other than kDefaultFaceSet (a set or hidden), that is, if
+  // the face sets carry information that must be kept.
+  bool hasFaceSetData() const;
+  // Largest face set id in use (kDefaultFaceSet when there are no face sets).
+  std::int32_t maxFaceSetId() const;
+  // An id no face uses (the largest in use plus one), or 0 when the largest is kMaxFaceSetId.
+  std::int32_t newFaceSetId() const;
+  // True if at least one face around v is visible. Vertices without faces count as hidden.
+  bool vertexVisible(Index v) const;
 
   // Reserves capacity for at least this many vertices, faces and half-edges in every array, so
   // appending up to that point never reallocates (dynamic topology edits run inside a dab).

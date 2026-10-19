@@ -9,6 +9,7 @@
 #include "mesh/Primitives.h"
 #include "render/LeafIndexBlocks.h"
 #include "scene/Scene.h"
+#include "sculpt/FaceSetOps.h"
 #include "sculpt/Sculptor.h"
 
 using namespace plegl;
@@ -48,12 +49,12 @@ std::multiset<Tri> triangleSet(const std::vector<std::uint32_t>& idx) {
   return out;
 }
 
-// Every live face of a mesh that may hold removed elements, fan-triangulated.
+// Every live visible face of a mesh that may hold removed elements, fan-triangulated.
 std::multiset<Tri> liveTriangles(const Mesh& m) {
   std::vector<std::uint32_t> idx;
   for (Index f = 0; f < m.faceCount(); ++f) {
     const Index h0 = m.faceHe[f];
-    if (h0 == kInvalid) continue;
+    if (h0 == kInvalid || m.faceHidden(f)) continue;
     for (Index h = m.heNext[h0]; m.heNext[h] != h0; h = m.heNext[h])
       idx.insert(idx.end(), {static_cast<std::uint32_t>(m.heVert[h0]), static_cast<std::uint32_t>(m.heVert[h]),
                              static_cast<std::uint32_t>(m.heTarget(h))});
@@ -68,13 +69,16 @@ std::multiset<std::pair<std::uint32_t, std::uint32_t>> edgeSet(const std::vector
   return out;
 }
 
+// Every live edge with a visible face once.
 std::multiset<std::pair<std::uint32_t, std::uint32_t>> liveEdges(const Mesh& m) {
   std::multiset<std::pair<std::uint32_t, std::uint32_t>> out;
   for (Index h = 0; h < m.halfEdgeCount(); ++h) {
     if (m.heFace[h] == kInvalid) continue;
     const Index t = m.heTwin[h];
-    if (t == kInvalid || h < t) out.insert(std::minmax(static_cast<std::uint32_t>(m.heVert[h]),
-                                                       static_cast<std::uint32_t>(m.heTarget(h))));
+    const bool here = !m.faceHidden(m.heFace[h]);
+    const bool there = t != kInvalid && !m.faceHidden(m.heFace[t]);
+    if ((t == kInvalid && here) || (t != kInvalid && h < t && (here || there)))
+      out.insert(std::minmax(static_cast<std::uint32_t>(m.heVert[h]), static_cast<std::uint32_t>(m.heTarget(h))));
   }
   return out;
 }
@@ -98,22 +102,78 @@ Index faceNear(const SceneObject& obj, const Vec3& p, float radius) {
   return obj.bvh.closestPoint(obj.mesh, p, radius, hit) ? hit.face : kInvalid;
 }
 
-// The renderer's index buffer on the CPU: packed on upload, then rewritten leaf by leaf.
+// The renderer's index buffer on the CPU: packed on upload, then rewritten leaf by leaf. Triangle
+// buffers also keep the face set of every triangle slot (index / 3), as the renderer does.
 struct CpuIndexBuffer {
   LeafIndexBlocks blocks;
   std::vector<std::uint32_t> data;
+  std::vector<std::int32_t> slots;
 
-  void upload(LeafIndexKind kind, const SceneObject& obj) { data = buildLeafIndices(kind, obj.mesh, obj.bvh, blocks); }
+  CpuIndexBuffer() = default;
+  explicit CpuIndexBuffer(std::uint32_t granularity) : blocks(granularity) {}
+
+  void upload(LeafIndexKind kind, const SceneObject& obj) {
+    data = buildLeafIndices(kind, obj.mesh, obj.bvh, blocks);
+    if (kind == LeafIndexKind::Triangles) slots = buildTriangleFaceSets(obj.mesh, obj.bvh, blocks);
+  }
 
   void sync(LeafIndexKind kind, const SceneObject& obj, std::span<const Index> leaves) {
     std::vector<std::uint32_t> scratch;
+    std::vector<std::int32_t> sets;
     for (Index l : leaves) {
       scratch.clear();
       appendLeafIndices(kind, obj.mesh, obj.bvh.leaves()[l], scratch);
       blocks.place(l, static_cast<std::uint32_t>(scratch.size()));
       if (data.size() < blocks.size()) data.resize(blocks.size(), 0xFFFFFFFFu);  // Growth keeps the old data.
       std::copy(scratch.begin(), scratch.end(), data.begin() + blocks.block(l).first);
+      if (kind != LeafIndexKind::Triangles) continue;
+      sets.clear();
+      appendLeafTriangleFaceSets(obj.mesh, obj.bvh.leaves()[l], sets);
+      REQUIRE(sets.size() * 3 == scratch.size());
+      if (slots.size() < (data.size() + 2) / 3) slots.resize((data.size() + 2) / 3, -999);
+      std::copy(sets.begin(), sets.end(), slots.begin() + blocks.block(l).first / 3);
     }
+  }
+
+  // Face sets rewritten for the leaves whose sets (not their triangles) changed.
+  void syncFaceSets(const SceneObject& obj, std::span<const Index> leaves) {
+    std::vector<std::int32_t> sets;
+    for (Index l : leaves) {
+      sets.clear();
+      appendLeafTriangleFaceSets(obj.mesh, obj.bvh.leaves()[l], sets);
+      REQUIRE(sets.size() * 3 == blocks.block(l).count);
+      std::copy(sets.begin(), sets.end(), slots.begin() + blocks.block(l).first / 3);
+    }
+  }
+
+  // Every drawn triangle must find its own face set in its slot: a run's k-th triangle reads slot
+  // first / 3 + k, as the shader does with gl_PrimitiveID.
+  void requireSlotsMatch(const Mesh& m) const {
+    std::map<Tri, std::int32_t> setOf;
+    for (Index f = 0; f < m.faceCount(); ++f) {
+      const Index h0 = m.faceHe[f];
+      if (h0 == kInvalid || m.faceHidden(f)) continue;
+      for (Index h = m.heNext[h0]; m.heNext[h] != h0; h = m.heNext[h]) {
+        Tri t{static_cast<std::uint32_t>(m.heVert[h0]), static_cast<std::uint32_t>(m.heVert[h]),
+              static_cast<std::uint32_t>(m.heTarget(h))};
+        std::rotate(t.begin(), std::min_element(t.begin(), t.end()), t.end());
+        setOf[t] = m.faceSetValue(f);
+      }
+    }
+    std::vector<std::uint32_t> first, count;
+    blocks.runs(first, count);
+    int wrong = 0;
+    for (std::size_t r = 0; r < first.size(); ++r) {
+      REQUIRE(first[r] % 3 == 0);
+      for (std::uint32_t k = 0; k < count[r] / 3; ++k) {
+        const std::uint32_t at = first[r] + 3 * k;
+        Tri t{data[at], data[at + 1], data[at + 2]};
+        std::rotate(t.begin(), std::min_element(t.begin(), t.end()), t.end());
+        const auto it = setOf.find(t);
+        wrong += it == setOf.end() || slots[first[r] / 3 + k] != it->second;
+      }
+    }
+    CHECK(wrong == 0);
   }
 
   // What a multi-draw over the runs reads.
@@ -332,4 +392,114 @@ TEST_CASE("refining and then merging under a moving brush keeps every drawn edge
     sculptor.endStroke();
   }
   CHECK(topoDabs > 300);
+}
+
+TEST_CASE("triangle blocks start on whole triangles, and every drawn triangle's slot holds its face set") {
+  Scene scene;
+  Mesh mesh = makeQuadSphere(20);
+  mesh.faceSets.resize(mesh.faceHe.size());
+  for (Index f = 0; f < mesh.faceCount(); ++f) {
+    const Vec3 c = mesh.faceCentroid(f);
+    mesh.faceSets[f] = 1 + static_cast<std::int32_t>((c.x > 0.0f) + 2 * (c.z > 0.3f));
+  }
+  SceneObject& obj = scene.add("A", std::move(mesh));
+  DrawBrush draw;
+  Sculptor sculptor;
+  StrokeOptions options;
+  options.dyntopo = true;
+  options.dyntopoOptions.timeBudgetMs = 0.0;
+  options.symmetryX = true;
+  CpuIndexBuffer tris(3);
+  tris.upload(LeafIndexKind::Triangles, obj);
+  tris.requireSlotsMatch(obj.mesh);
+  sculptor.beginStroke(obj, draw, options, "Draw");
+  int moved = 0;
+  for (int i = 0; i < 40; ++i) {
+    INFO("dab " << i);
+    obj.clearDirty();
+    const Vec3 c = surfacePoint(obj, {-0.4f + 0.03f * static_cast<float>(i), 1.0f, 0.1f * static_cast<float>(i % 5)});
+    sculptor.dab(c, 0.3f, 0.5f, DabTopology{i % 4 == 3 ? 0.3f : 0.03f, faceNear(obj, c, 0.3f)});
+    for (Index l : obj.topoDirtyLeaves) {
+      const auto before = l < static_cast<Index>(tris.blocks.leafCount()) ? tris.blocks.block(l).first : 0u;
+      tris.sync(LeafIndexKind::Triangles, obj, std::span<const Index>(&l, 1));
+      moved += tris.blocks.block(l).first != before;
+    }
+    for (std::size_t l = 0; l < tris.blocks.leafCount(); ++l) {
+      REQUIRE(tris.blocks.block(static_cast<Index>(l)).first % 3 == 0);
+      REQUIRE(tris.blocks.block(static_cast<Index>(l)).capacity % 3 == 0);
+    }
+    tris.requireSlotsMatch(obj.mesh);
+  }
+  CHECK(moved > 10);  // Blocks did move, which is where misaligned starts would show.
+  sculptor.endStroke();
+  // A full rebuild from the blocks gives the same slots as the leaf-by-leaf updates.
+  CpuIndexBuffer fresh(3);
+  fresh.upload(LeafIndexKind::Triangles, obj);
+  fresh.requireSlotsMatch(obj.mesh);
+}
+
+TEST_CASE("hidden faces are not drawn, and the marked leaves keep the buffers current") {
+  Scene scene;
+  Mesh mesh = makeQuadSphere(20);
+  mesh.faceSets.resize(mesh.faceHe.size());
+  for (Index f = 0; f < mesh.faceCount(); ++f) {
+    const Vec3 c = mesh.faceCentroid(f);
+    mesh.faceSets[f] = 1 + static_cast<std::int32_t>((c.x > 0.1f) + 2 * (c.y > 0.2f) + 4 * (c.z > -0.3f));
+  }
+  SceneObject& obj = scene.add("A", std::move(mesh));
+  obj.bvh.build(obj.mesh, {.maxLeafFaces = 16});  // Small leaves: set borders cross many of them.
+  obj.topologyVersion = nextTopologyVersion();
+  CpuIndexBuffer tris(3), edges;
+  tris.upload(LeafIndexKind::Triangles, obj);
+  edges.upload(LeafIndexKind::Edges, obj);
+  UndoStack stack;
+  std::mt19937 rng(11);
+  auto check = [&](const char* what) {
+    INFO(what);
+    std::sort(obj.topoDirtyLeaves.begin(), obj.topoDirtyLeaves.end());
+    obj.topoDirtyLeaves.erase(std::unique(obj.topoDirtyLeaves.begin(), obj.topoDirtyLeaves.end()),
+                              obj.topoDirtyLeaves.end());
+    tris.sync(LeafIndexKind::Triangles, obj, obj.topoDirtyLeaves);
+    edges.sync(LeafIndexKind::Edges, obj, obj.topoDirtyLeaves);
+    tris.syncFaceSets(obj, obj.faceSetDirtyLeaves);
+    REQUIRE(triangleSet(tris.drawn()) == liveTriangles(obj.mesh));
+    REQUIRE(edgeSet(edges.drawn()) == liveEdges(obj.mesh));
+    tris.requireSlotsMatch(obj.mesh);
+    obj.clearDirty();
+  };
+  const FaceSetOp ops[] = {FaceSetOp::Hide, FaceSetOp::Isolate, FaceSetOp::RevealAll, FaceSetOp::InvertVisibility};
+  int hidden = 0;
+  for (int step = 0; step < 60; ++step) {
+    const float roll = static_cast<float>(rng() % 100) / 100.0f;
+    if (roll < 0.2f && stack.canUndo()) {
+      stack.undo(scene);
+      check("undo");
+      continue;
+    }
+    if (roll < 0.3f && stack.canRedo()) {
+      stack.redo(scene);
+      check("redo");
+      continue;
+    }
+    if (roll < 0.4f) {  // Repaint some faces: colours change, triangles do not.
+      FaceSetBrush brush;
+      Sculptor s;
+      s.beginStroke(obj, brush, {}, "Face Set");
+      const Vec3 dir{static_cast<float>(rng() % 200) / 100.0f - 1.0f, 1.0f, static_cast<float>(rng() % 200) / 100.0f - 1.0f};
+      RayHit hit;
+      if (obj.bvh.raycast(obj.mesh, Ray{glm::normalize(dir) * 4.0f, -glm::normalize(dir)}, hit,
+                          std::numeric_limits<float>::infinity(), true))
+        s.dab(hit.position, 0.4f, 1.0f);
+      if (auto e = s.endStroke()) stack.push(std::move(*e));
+      CHECK(obj.topoDirtyLeaves.empty());
+      check("paint");
+      continue;
+    }
+    const FaceSetOp op = ops[rng() % 4];
+    const std::int32_t id = 1 + static_cast<std::int32_t>(rng() % 8);
+    if (auto e = applyFaceSetOp(obj, op, id)) stack.push(std::move(*e));
+    hidden += obj.mesh.anyHidden();
+    check(faceSetOpName(op));
+  }
+  CHECK(hidden > 10);
 }

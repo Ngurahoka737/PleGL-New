@@ -13,14 +13,16 @@
 
 namespace plegl {
 
-// Vertex data owned by one BVH leaf at one moment. Each channel is either empty (not recorded,
-// so applying the state leaves it alone) or holds one value per vertex of the leaf. Sculpt strokes
-// record positions and normals; mask strokes and mask operations record the mask only.
+// Attribute data owned by one BVH leaf at one moment. Each channel is either empty (not recorded,
+// so applying the state leaves it alone) or holds one value per vertex of the leaf (per face for
+// face sets). Sculpt strokes record positions and normals; mask strokes and mask operations record
+// the mask only; face set strokes and operations (hide and reveal too) the face sets only.
 struct LeafState {
   Index leaf = kInvalid;
   std::vector<Vec3> positions;
   std::vector<Vec3> normals;
   std::vector<float> mask;
+  std::vector<std::int32_t> faceSets;
 };
 
 // Everything one BVH leaf owns at one moment: its ranges and a raw slice of every mesh array over
@@ -32,6 +34,7 @@ struct TopoLeafState {
   std::vector<Vec3> positions;
   std::vector<Vec3> normals;  // Empty when the mesh had no normals.
   std::vector<float> mask;    // Empty when the mesh had no mask.
+  std::vector<std::int32_t> faceSets;  // Empty when the mesh had no face sets.
   std::vector<Index> vertHe, faceHe, heNext, heTwin, heVert, heFace;
   std::size_t bytes() const;
 };

@@ -177,14 +177,15 @@ Index Bvh::leafOfVertex(Index v) const {
   return static_cast<Index>(it - leaves_.begin());
 }
 
-bool Bvh::closestPoint(const Mesh& mesh, const Vec3& p, float maxDist, ClosestHit& out) const {
+bool Bvh::closestPoint(const Mesh& mesh, const Vec3& p, float maxDist, ClosestHit& out, bool visibleOnly) const {
   float best = maxDist * maxDist;
   bool found = false;
+  const std::int32_t* sets = visibleOnly && !mesh.faceSets.empty() ? mesh.faceSets.data() : nullptr;
   auto visitLeaf = [&](const BvhLeaf& leaf) {
     const bool mayHaveDead = (leaf.flags & kLeafMayHaveDead) != 0;
     for (Index f = leaf.faceBegin; f < leaf.faceEnd; ++f) {
       const Index h0 = mesh.faceHe[f];
-      if (mayHaveDead && h0 == kInvalid) continue;
+      if ((mayHaveDead && h0 == kInvalid) || (sets && sets[f] < 0)) continue;
       const Vec3& a = mesh.positions[mesh.heVert[h0]];
       Index h = mesh.heNext[h0];
       for (Index hn = mesh.heNext[h]; hn != h0; h = hn, hn = mesh.heNext[hn]) {
@@ -256,7 +257,7 @@ Index Bvh::leafOfFace(Index f) const {
   return static_cast<Index>(it - leaves_.begin());
 }
 
-bool Bvh::raycast(const Mesh& mesh, const Ray& ray, RayHit& hit, float tMax) const {
+bool Bvh::raycast(const Mesh& mesh, const Ray& ray, RayHit& hit, float tMax, bool visibleOnly) const {
   if (nodes_.empty() && !dynamic_) return false;
   // Avoid 0 * inf = NaN in the slab test for axis-aligned rays starting on a box plane.
   Vec3 safeDir = ray.dir;
@@ -272,12 +273,13 @@ bool Bvh::raycast(const Mesh& mesh, const Ray& ray, RayHit& hit, float tMax) con
     Index node;
     float tEnter;
   };
+  const std::int32_t* sets = visibleOnly && !mesh.faceSets.empty() ? mesh.faceSets.data() : nullptr;
   auto visitLeaf = [&](Index leafIndex) {
     const BvhLeaf& leaf = leaves_[leafIndex];
     const bool mayHaveDead = (leaf.flags & kLeafMayHaveDead) != 0;
     for (Index f = leaf.faceBegin; f < leaf.faceEnd; ++f) {
       const Index h0 = mesh.faceHe[f];
-      if (mayHaveDead && h0 == kInvalid) continue;
+      if ((mayHaveDead && h0 == kInvalid) || (sets && sets[f] < 0)) continue;
       const Index a = mesh.heVert[h0];
       Index h = mesh.heNext[h0];
       Index b = mesh.heVert[h];

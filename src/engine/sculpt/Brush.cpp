@@ -25,8 +25,11 @@ constexpr float kFlattenRate = 0.35f;
 constexpr float kCreaseDepth = 0.03f;
 constexpr float kCreasePinch = 0.15f;
 
-// Share of each vertex's movement that the mask lets through.
-inline float unmasked(const float* mask, Index v) { return mask ? 1.0f - mask[v] : 1.0f; }
+// Share of each vertex's movement that the mask and the face set filter let through.
+inline float unmasked(const BrushContext& ctx, const float* mask, Index v) {
+  if (ctx.filter.faceSets && !ctx.filter.allows(ctx.mesh, v)) return 0.0f;
+  return mask ? 1.0f - mask[v] : 1.0f;
+}
 
 // Runs `displace(v, p, weight)` for every vertex owned by the dab's leaves that lies inside the
 // sphere, in parallel per leaf, and adds the returned offset clamped to kMaxDabMove * radius.
@@ -49,7 +52,7 @@ void displaceInside(BrushContext& ctx, F&& displace) {
         const Vec3 delta = p - d.center;
         const float dist2 = glm::dot(delta, delta);
         if (dist2 >= r2) continue;
-        const float w = d.strength * falloffWeight(d.falloff, std::sqrt(dist2) * invR) * unmasked(mask, v);
+        const float w = d.strength * falloffWeight(d.falloff, std::sqrt(dist2) * invR) * unmasked(ctx, mask, v);
         if (w <= 0.0f) continue;
         Vec3 move = displace(v, p, w);
         const float len2 = glm::dot(move, move);
@@ -75,7 +78,7 @@ void DrawBrush::apply(BrushContext& ctx) const {
         const Vec3 delta = m.positions[v] - d.center;
         const float dist2 = glm::dot(delta, delta);
         if (dist2 >= r2) continue;
-        const float w = falloffWeight(d.falloff, std::sqrt(dist2) * invR) * unmasked(mask, v);
+        const float w = falloffWeight(d.falloff, std::sqrt(dist2) * invR) * unmasked(ctx, mask, v);
         if (w <= 0.0f) continue;
         m.positions[v] += offset * w;
       }
@@ -100,7 +103,7 @@ void SmoothBrush::apply(BrushContext& ctx) const {
         const Vec3 delta = p - d.center;
         const float dist2 = glm::dot(delta, delta);
         if (dist2 >= r2) continue;
-        const float w = d.strength * falloffWeight(d.falloff, std::sqrt(dist2) * invR) * unmasked(mask, v);
+        const float w = d.strength * falloffWeight(d.falloff, std::sqrt(dist2) * invR) * unmasked(ctx, mask, v);
         if (w <= 0.0f) continue;
         neighbourMean<Vec3>(
             m, v, [&](Index u) { return m.positions[u]; },
@@ -166,7 +169,7 @@ void MaskBrush::apply(BrushContext& ctx) const {
         const float dist2 = glm::dot(delta, delta);
         if (dist2 >= r2) continue;
         const float w = d.strength * falloffWeight(d.falloff, std::sqrt(dist2) * invR);
-        if (w <= 0.0f) continue;
+        if (w <= 0.0f || !ctx.filter.allows(m, v)) continue;
         float& value = m.mask[v];
         value = w >= 1.0f ? target : std::clamp(value + (target - value) * w, 0.0f, 1.0f);
       }
@@ -189,7 +192,7 @@ void MaskSmoothBrush::apply(BrushContext& ctx) const {
         const float dist2 = glm::dot(delta, delta);
         if (dist2 >= r2) continue;
         const float w = d.strength * falloffWeight(d.falloff, std::sqrt(dist2) * invR);
-        if (w <= 0.0f) continue;
+        if (w <= 0.0f || !ctx.filter.allows(m, v)) continue;
         neighbourMeanAll<float>(
             m, v, [&](Index u) { return m.mask[u]; },
             [&](float target) { out.emplace_back(v, std::clamp(m.mask[v] + (target - m.mask[v]) * w, 0.0f, 1.0f)); });
@@ -199,6 +202,41 @@ void MaskSmoothBrush::apply(BrushContext& ctx) const {
   parallelFor(0, results.size(), 1, [&](std::size_t b, std::size_t e) {
     for (std::size_t i = b; i < e; ++i)
       for (const auto& [v, value] : results[i]) m.mask[v] = value;
+  });
+}
+
+void FaceSetBrush::apply(BrushContext& ctx) const {
+  const Dab& d = ctx.dab;
+  Mesh& m = ctx.mesh;
+  const float r2 = d.radius * d.radius;
+  const float invR = 1.0f / d.radius;
+  const float minWeight = 1.0f - d.strength;
+  const float* mask = m.mask.empty() ? nullptr : m.mask.data();
+  const std::int32_t paint = ctx.paintFaceSet;
+  // Every face belongs to exactly one leaf, so leaves can be painted in parallel.
+  parallelFor(0, ctx.leaves.size(), 1, [&](std::size_t b, std::size_t e) {
+    for (std::size_t i = b; i < e; ++i) {
+      const BvhLeaf& leaf = ctx.bvh.leaves()[ctx.leaves[i]];
+      for (Index f = leaf.faceBegin; f < leaf.faceEnd; ++f) {
+        std::int32_t& value = m.faceSets[f];
+        if (value == paint || value < 0 || m.faceHe[f] == kInvalid || !ctx.filter.allowsFace(f)) continue;
+        Vec3 c{0.0f};
+        float masked = 0.0f;
+        int n = 0;
+        m.forEachFaceVertex(f, [&](Index v) {
+          c += m.positions[v];
+          if (mask) masked += mask[v];
+          ++n;
+        });
+        c /= static_cast<float>(n);
+        const Vec3 delta = c - d.center;
+        const float dist2 = glm::dot(delta, delta);
+        if (dist2 >= r2) continue;
+        const float w = falloffWeight(d.falloff, std::sqrt(dist2) * invR);
+        if (w <= 0.0f || w < minWeight || masked >= 0.5f * static_cast<float>(n)) continue;
+        value = paint;
+      }
+    }
   });
 }
 

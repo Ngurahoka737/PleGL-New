@@ -114,6 +114,7 @@ void requireSameMesh(const Mesh& a, const Mesh& b) {
   CHECK(a.positions == b.positions);
   CHECK(a.normals == b.normals);
   CHECK(a.mask == b.mask);
+  CHECK(a.faceSets == b.faceSets);
   CHECK(a.vertHe == b.vertHe);
   CHECK(a.faceHe == b.faceHe);
   CHECK(a.heNext == b.heNext);
@@ -470,13 +471,17 @@ struct ObjectState {
 
 ObjectState stateOf(const SceneObject& obj) { return {obj.mesh, obj.bvh, obj.topologyVersion}; }
 
-// Same mesh, BVH and version; an empty mask counts as all zeros.
+// Same mesh, BVH and version; an empty mask counts as all zeros, empty face sets as all default.
 void requireState(const SceneObject& obj, const ObjectState& want) {
   CHECK(obj.topologyVersion == want.version);
   Mesh a = obj.mesh, b = want.mesh;
   if (a.mask.empty() != b.mask.empty()) {
     a.ensureMask();
     b.ensureMask();
+  }
+  if (a.faceSets.empty() != b.faceSets.empty()) {
+    a.ensureFaceSets();
+    b.ensureFaceSets();
   }
   requireSameMesh(a, b);
   requireSameBvh(obj.bvh, want.bvh);

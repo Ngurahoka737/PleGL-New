@@ -16,15 +16,18 @@ const char* kMeshVs = R"(#version 450 core
 layout(location = 0) in vec3 aPosition;
 layout(location = 1) in vec3 aNormal;
 layout(location = 3) in float aMask;  // Location 2 is the line shader's vertex colour.
+layout(location = 4) in uint aFirstIndex;  // Per draw command: where its run of triangles starts.
 uniform mat4 uModel;
 uniform mat4 uView;
 uniform mat4 uProj;
 uniform mat3 uNormalMat;  // view * model, inverse-transposed
 out vec3 vNormalView;
 out float vMask;
+flat out uint vFirstSlot;
 void main() {
   vNormalView = uNormalMat * aNormal;
   vMask = aMask;
+  vFirstSlot = aFirstIndex / 3u;
   gl_Position = uProj * uView * uModel * vec4(aPosition, 1.0);
 }
 )";
@@ -32,14 +35,28 @@ void main() {
 const char* kMeshFs = R"(#version 450 core
 in vec3 vNormalView;
 in float vMask;
+flat in uint vFirstSlot;
+layout(std430, binding = 0) readonly buffer FaceSets { int faceSet[]; };  // Per triangle slot.
 uniform sampler2D uMatcap;
 uniform float uSelected;
 uniform float uMaskOpacity;
+uniform float uFaceSetOpacity;  // 0 when face sets are off or the mesh has none.
 out vec4 fragColor;
+// A distinct pastel per set: consecutive ids step around the hue circle by the golden ratio.
+vec3 faceSetColor(int id) {
+  float hue = fract(float(id) * 0.618034 + 0.12);
+  float sat = 0.45 + 0.3 * fract(float(id) * 0.381966);
+  vec3 rgb = clamp(abs(mod(hue * 6.0 + vec3(0.0, 4.0, 2.0), 6.0) - 3.0) - 1.0, 0.0, 1.0);
+  return mix(vec3(1.0), rgb, sat);
+}
 void main() {
   vec3 n = normalize(vNormalView);
   if (!gl_FrontFacing) n = -n;  // Open meshes: shade the inside too.
   vec3 color = texture(uMatcap, n.xy * 0.49 + 0.5).rgb;
+  if (uFaceSetOpacity > 0.0) {
+    int id = abs(faceSet[vFirstSlot + uint(gl_PrimitiveID)]);
+    if (id > 1) color *= mix(vec3(1.0), faceSetColor(id), uFaceSetOpacity);  // Set 1 is the default.
+  }
   color *= 1.0 - uMaskOpacity * clamp(vMask, 0.0, 1.0);  // Masked areas read as darker.
   // Selected objects get a soft rim so they read without an outline pass.
   float rim = pow(1.0 - clamp(n.z, 0.0, 1.0), 3.0);
@@ -252,8 +269,9 @@ void Renderer::shutdown() {
 }
 
 void Renderer::destroy(GpuMesh& gpu) {
-  const GLuint buffers[] = {gpu.positions, gpu.normals, gpu.mask, gpu.triangles.buffer, gpu.edges.buffer};
-  glDeleteBuffers(5, buffers);
+  const GLuint buffers[] = {gpu.positions,     gpu.normals,  gpu.mask,    gpu.triangles.buffer,
+                            gpu.edges.buffer, gpu.commands, gpu.faceSets};
+  glDeleteBuffers(static_cast<GLsizei>(std::size(buffers)), buffers);
   glDeleteVertexArrays(1, &gpu.vao);
   gpu = {};
 }
@@ -274,6 +292,9 @@ GLuint regrow(GLuint old, std::size_t keepBytes, std::size_t newBytes) {
 std::uint32_t vertexRoom(std::size_t vertices) {
   return static_cast<std::uint32_t>(vertices + std::max<std::size_t>(65536, vertices / 4));
 }
+
+// Triangle slots (index / 3) an index buffer of `indices` can hold.
+std::uint32_t slotsFor(std::uint32_t indices) { return (indices + 2) / 3; }
 
 }  // namespace
 
@@ -321,6 +342,30 @@ void Renderer::upload(GpuMesh& gpu, const SceneObject& object, bool wireframe) {
   gpu.edgesValid = wireframe;
   if (wireframe) uploadIndices(gpu.edges, LeafIndexKind::Edges, object);
 
+  // Draw commands, also read per command as the first index of its run (see GpuMesh). The
+  // attribute is enabled for every draw with this VAO, so the buffer always holds a command.
+  gpu.commandCapacity = 16;
+  glCreateBuffers(1, &gpu.commands);
+  glNamedBufferStorage(gpu.commands, gpu.commandCapacity * sizeof(DrawCommand), nullptr, GL_DYNAMIC_STORAGE_BIT);
+  glClearNamedBufferData(gpu.commands, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, nullptr);
+  glVertexArrayVertexBuffer(gpu.vao, 3, gpu.commands, offsetof(DrawCommand, firstIndex), sizeof(DrawCommand));
+  glVertexArrayBindingDivisor(gpu.vao, 3, 1);
+  glEnableVertexArrayAttrib(gpu.vao, 4);
+  glVertexArrayAttribIFormat(gpu.vao, 4, 1, GL_UNSIGNED_INT, 0);
+  glVertexArrayAttribBinding(gpu.vao, 4, 3);
+  gpu.triangles.runsStale = true;
+
+  // Face sets: the real buffer only for meshes that have some; others get a one-slot stand-in
+  // that the shader never reads.
+  if (m.hasFaceSetData()) {
+    uploadFaceSets(gpu, object);
+  } else {
+    gpu.faceSetSlots = 1;
+    glCreateBuffers(1, &gpu.faceSets);
+    glNamedBufferStorage(gpu.faceSets, 4, nullptr, GL_DYNAMIC_STORAGE_BIT);
+    gpu.faceSetsOnGpu = false;
+  }
+
   gpu.topologyVersion = object.topologyVersion;
   stats_.uploadedBytes += vbytes * 2 + m.mask.size() * sizeof(float);
   ++stats_.fullUploads;
@@ -330,7 +375,8 @@ void Renderer::uploadIndices(IndexBuffer& ib, LeafIndexKind kind, const SceneObj
   glDeleteBuffers(1, &ib.buffer);
   const std::vector<std::uint32_t> indices = buildLeafIndices(kind, object.mesh, object.bvh, ib.blocks);
   // Some slack for the blocks a stroke moves or appends; running out grows the buffer on the GPU.
-  ib.capacity = static_cast<std::uint32_t>(indices.size() + indices.size() / 8 + 4096);
+  // Whole triangles, so the face set buffer covers every slot.
+  ib.capacity = static_cast<std::uint32_t>((indices.size() + indices.size() / 8 + 4096 + 2) / 3 * 3);
   glCreateBuffers(1, &ib.buffer);
   glNamedBufferStorage(ib.buffer, static_cast<GLsizeiptr>(ib.capacity) * 4, nullptr, GL_DYNAMIC_STORAGE_BIT);
   if (!indices.empty())
@@ -358,10 +404,17 @@ void Renderer::ensureVertexCapacity(GpuMesh& gpu, std::uint32_t vertices) {
 
 void Renderer::growIndexBuffer(GpuMesh& gpu, IndexBuffer& ib, std::uint32_t indices) {
   if (indices <= ib.capacity) return;
-  const std::uint32_t cap = std::max(indices, ib.capacity + ib.capacity / 2);
+  const std::uint32_t cap = (std::max(indices, ib.capacity + ib.capacity / 2) + 2) / 3 * 3;
   ib.buffer = regrow(ib.buffer, static_cast<std::size_t>(ib.capacity) * 4, static_cast<std::size_t>(cap) * 4);
   ib.capacity = cap;
-  if (&ib == &gpu.triangles) glVertexArrayElementBuffer(gpu.vao, ib.buffer);
+  if (&ib == &gpu.triangles) {
+    glVertexArrayElementBuffer(gpu.vao, ib.buffer);
+    if (gpu.faceSetsOnGpu) {
+      const std::uint32_t slots = slotsFor(cap);
+      gpu.faceSets = regrow(gpu.faceSets, static_cast<std::size_t>(gpu.faceSetSlots) * 4, static_cast<std::size_t>(slots) * 4);
+      gpu.faceSetSlots = slots;
+    }
+  }
   ++stats_.bufferGrowths;
 }
 
@@ -379,9 +432,83 @@ void Renderer::syncLeaves(GpuMesh& gpu, IndexBuffer& ib, LeafIndexKind kind, con
       glNamedBufferSubData(ib.buffer, static_cast<GLintptr>(ib.blocks.block(l).first) * 4, bytes, scratch_.data());
       stats_.uploadedBytes += static_cast<std::size_t>(bytes);
     }
+    if (kind == LeafIndexKind::Triangles && gpu.faceSetsOnGpu) {
+      faceSetScratch_.clear();
+      appendLeafTriangleFaceSets(object.mesh, all[l], faceSetScratch_);
+      if (!faceSetScratch_.empty()) {
+        const auto bytes = static_cast<GLsizeiptr>(faceSetScratch_.size() * 4);
+        glNamedBufferSubData(gpu.faceSets, static_cast<GLintptr>(ib.blocks.block(l).first / 3) * 4, bytes,
+                             faceSetScratch_.data());
+        stats_.uploadedBytes += static_cast<std::size_t>(bytes);
+      }
+    }
     ++stats_.indexBlockUploads;
   }
   ib.runsStale = true;
+}
+
+void Renderer::uploadFaceSets(GpuMesh& gpu, const SceneObject& object) {
+  glDeleteBuffers(1, &gpu.faceSets);
+  gpu.faceSetSlots = std::max<std::uint32_t>(slotsFor(gpu.triangles.capacity), 1);
+  glCreateBuffers(1, &gpu.faceSets);
+  glNamedBufferStorage(gpu.faceSets, static_cast<GLsizeiptr>(gpu.faceSetSlots) * 4, nullptr, GL_DYNAMIC_STORAGE_BIT);
+  const std::vector<std::int32_t> slots = buildTriangleFaceSets(object.mesh, object.bvh, gpu.triangles.blocks);
+  if (!slots.empty())
+    glNamedBufferSubData(gpu.faceSets, 0, static_cast<GLsizeiptr>(slots.size() * 4), slots.data());
+  gpu.faceSetsOnGpu = true;
+  stats_.uploadedBytes += slots.size() * 4;
+  ++stats_.faceSetUploads;
+}
+
+void Renderer::syncFaceSets(GpuMesh& gpu, SceneObject& obj) {
+  const Mesh& m = obj.mesh;
+  if ((obj.faceSetDirtyAll || !obj.faceSetDirtyLeaves.empty()) && !m.faceSets.empty()) {
+    if (!gpu.faceSetsOnGpu || obj.faceSetDirtyAll) {
+      uploadFaceSets(gpu, obj);
+    } else {
+      std::sort(obj.faceSetDirtyLeaves.begin(), obj.faceSetDirtyLeaves.end());
+      obj.faceSetDirtyLeaves.erase(std::unique(obj.faceSetDirtyLeaves.begin(), obj.faceSetDirtyLeaves.end()),
+                                   obj.faceSetDirtyLeaves.end());
+      const auto leaves = obj.bvh.leaves();
+      for (Index l : obj.faceSetDirtyLeaves) {
+        if (l < 0 || static_cast<std::size_t>(l) >= leaves.size() ||
+            static_cast<std::size_t>(l) >= gpu.triangles.blocks.leafCount())
+          continue;
+        faceSetScratch_.clear();
+        appendLeafTriangleFaceSets(m, leaves[l], faceSetScratch_);
+        const auto& block = gpu.triangles.blocks.block(l);
+        // A paint stroke never changes which triangles a leaf draws; hiding does, and rewrites the
+        // leaf's slots along with its indices.
+        if (faceSetScratch_.empty() || faceSetScratch_.size() * 3 != block.count) continue;
+        const auto bytes = static_cast<GLsizeiptr>(faceSetScratch_.size() * 4);
+        glNamedBufferSubData(gpu.faceSets, static_cast<GLintptr>(block.first / 3) * 4, bytes, faceSetScratch_.data());
+        stats_.uploadedBytes += static_cast<std::size_t>(bytes);
+        ++stats_.faceSetUploads;
+      }
+    }
+  }
+  obj.faceSetDirtyLeaves.clear();
+  obj.faceSetDirtyAll = false;
+}
+
+void Renderer::uploadCommands(GpuMesh& gpu) {
+  const IndexBuffer& ib = gpu.triangles;
+  commandScratch_.clear();
+  for (std::size_t i = 0; i < ib.counts.size(); ++i) {
+    const auto first = static_cast<GLuint>(reinterpret_cast<std::uintptr_t>(ib.offsets[i]) / 4);
+    commandScratch_.push_back({static_cast<GLuint>(ib.counts[i]), 1, first, 0, static_cast<GLuint>(i)});
+  }
+  if (commandScratch_.size() > gpu.commandCapacity) {
+    gpu.commandCapacity = static_cast<std::uint32_t>(std::max(commandScratch_.size(), std::size_t{gpu.commandCapacity} * 2));
+    glDeleteBuffers(1, &gpu.commands);
+    glCreateBuffers(1, &gpu.commands);
+    glNamedBufferStorage(gpu.commands, gpu.commandCapacity * sizeof(DrawCommand), nullptr, GL_DYNAMIC_STORAGE_BIT);
+    glClearNamedBufferData(gpu.commands, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, nullptr);
+    glVertexArrayVertexBuffer(gpu.vao, 3, gpu.commands, offsetof(DrawCommand, firstIndex), sizeof(DrawCommand));
+  }
+  if (!commandScratch_.empty())
+    glNamedBufferSubData(gpu.commands, 0, static_cast<GLsizeiptr>(commandScratch_.size() * sizeof(DrawCommand)),
+                         commandScratch_.data());
 }
 
 void Renderer::syncMask(GpuMesh& gpu, SceneObject& obj) {
@@ -439,11 +566,21 @@ void Renderer::sync(Scene& scene, bool wireframe) {
       std::sort(obj.topoDirtyLeaves.begin(), obj.topoDirtyLeaves.end());
       obj.topoDirtyLeaves.erase(std::unique(obj.topoDirtyLeaves.begin(), obj.topoDirtyLeaves.end()),
                                 obj.topoDirtyLeaves.end());
-      syncLeaves(gpu, gpu.triangles, LeafIndexKind::Triangles, obj, obj.topoDirtyLeaves);
-      if (gpu.edgesValid && wireframe) {
-        syncLeaves(gpu, gpu.edges, LeafIndexKind::Edges, obj, obj.topoDirtyLeaves);
+      if (obj.topoDirtyLeaves.size() > 16 && obj.topoDirtyLeaves.size() * 2 > leafCount) {
+        // Most leaves changed (revealing everything, say): one packed rebuild beats moving each
+        // block to the end of a growing buffer.
+        uploadIndices(gpu.triangles, LeafIndexKind::Triangles, obj);
+        glVertexArrayElementBuffer(gpu.vao, gpu.triangles.buffer);
+        if (gpu.faceSetsOnGpu) uploadFaceSets(gpu, obj);
+        gpu.edgesValid = false;  // Rebuilt below when the wireframe is shown.
+        ++stats_.fullUploads;
       } else {
-        gpu.edgesValid = false;  // Rebuilt in one go when the wireframe is turned on.
+        syncLeaves(gpu, gpu.triangles, LeafIndexKind::Triangles, obj, obj.topoDirtyLeaves);
+        if (gpu.edgesValid && wireframe) {
+          syncLeaves(gpu, gpu.edges, LeafIndexKind::Edges, obj, obj.topoDirtyLeaves);
+        } else {
+          gpu.edgesValid = false;  // Rebuilt in one go when the wireframe is turned on.
+        }
       }
       // New vertices carry interpolated mask values that no mask stroke announced.
       if (!m.mask.empty()) {
@@ -466,6 +603,7 @@ void Renderer::sync(Scene& scene, bool wireframe) {
       gpu.edgesValid = true;
     }
     syncMask(gpu, obj);
+    syncFaceSets(gpu, obj);
     if (obj.dirtyLeaves.empty()) continue;
     std::sort(obj.dirtyLeaves.begin(), obj.dirtyLeaves.end());
     obj.dirtyLeaves.erase(std::unique(obj.dirtyLeaves.begin(), obj.dirtyLeaves.end()), obj.dirtyLeaves.end());
@@ -502,6 +640,7 @@ void Renderer::sync(Scene& scene, bool wireframe) {
       for (std::size_t i = 0; i < first.size(); ++i)
         ib->offsets[i] = reinterpret_cast<const void*>(static_cast<std::uintptr_t>(first[i]) * 4);
       ib->runsStale = false;
+      if (ib == &gpu.triangles) uploadCommands(gpu);
     }
     stats_.drawRuns += static_cast<int>(gpu.triangles.counts.size());
   }
@@ -514,6 +653,15 @@ void Renderer::draw(const IndexBuffer& ib, GLenum mode) {
     glMultiDrawElements(mode, ib.counts.data(), GL_UNSIGNED_INT, ib.offsets.data(),
                         static_cast<GLsizei>(ib.counts.size()));
   }
+}
+
+void Renderer::drawTriangles(const GpuMesh& gpu) {
+  if (gpu.triangles.counts.empty()) return;
+  // GL_DRAW_INDIRECT_BUFFER is context state, not VAO state: bind it for this call only.
+  glBindBuffer(GL_DRAW_INDIRECT_BUFFER, gpu.commands);
+  glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, nullptr, static_cast<GLsizei>(gpu.triangles.counts.size()),
+                              sizeof(DrawCommand));
+  glBindBuffer(GL_DRAW_INDIRECT_BUFFER, 0);
 }
 
 void Renderer::render(const Scene& scene, const Camera& camera, const ViewportRect& rect,
@@ -547,6 +695,8 @@ void Renderer::render(const Scene& scene, const Camera& camera, const ViewportRe
   glUniformMatrix4fv(loc(meshProgram_, "uProj"), 1, GL_FALSE, glm::value_ptr(proj));
   glUniform1i(loc(meshProgram_, "uMatcap"), 0);
   glUniform1f(loc(meshProgram_, "uMaskOpacity"), settings.showMask ? std::clamp(settings.maskOpacity, 0.0f, 1.0f) : 0.0f);
+  const float faceSetOpacity = settings.showFaceSets ? std::clamp(settings.faceSetOpacity, 0.0f, 1.0f) : 0.0f;
+  const GLint faceSetOpacityLoc = loc(meshProgram_, "uFaceSetOpacity");
   glBindTextureUnit(0, matcaps_[std::clamp(settings.matcap, 0, kMatcapCount - 1)]);
   for (const auto& obj : scene.objects()) {
     if (!obj->visible) continue;
@@ -557,8 +707,10 @@ void Renderer::render(const Scene& scene, const Camera& camera, const ViewportRe
     glUniformMatrix4fv(loc(meshProgram_, "uModel"), 1, GL_FALSE, glm::value_ptr(model));
     glUniformMatrix3fv(loc(meshProgram_, "uNormalMat"), 1, GL_FALSE, glm::value_ptr(normalMat));
     glUniform1f(loc(meshProgram_, "uSelected"), obj->id == selectedId ? 1.0f : 0.0f);
+    glUniform1f(faceSetOpacityLoc, it->second.faceSetsOnGpu ? faceSetOpacity : 0.0f);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, it->second.faceSets);
     glBindVertexArray(it->second.vao);
-    draw(it->second.triangles, GL_TRIANGLES);
+    drawTriangles(it->second);
   }
   glDisable(GL_POLYGON_OFFSET_FILL);
 

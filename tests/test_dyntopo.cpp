@@ -11,6 +11,7 @@
 #include "mesh/Primitives.h"
 #include "remesh/QuadRemesh.h"
 #include "scene/Scene.h"
+#include "sculpt/FaceSetOps.h"
 #include "sculpt/Sculptor.h"
 #include "sculpt/Undo.h"
 #include "spatial/LeafLayout.h"
@@ -84,12 +85,21 @@ bool sameLeaves(std::span<const BvhLeaf> a, std::span<const BvhLeaf> b) {
   return true;
 }
 
+// Equal face sets, where an empty array means every face in the default set.
+bool sameFaceSets(const Mesh& a, const Mesh& b) {
+  if (a.faceSets.empty() == b.faceSets.empty()) return a.faceSets == b.faceSets;
+  const Mesh& full = a.faceSets.empty() ? b : a;
+  return static_cast<Index>(full.faceSets.size()) == full.faceCount() &&
+         std::all_of(full.faceSets.begin(), full.faceSets.end(), [](std::int32_t v) { return v == kDefaultFaceSet; });
+}
+
 void requireState(const SceneObject& obj, const State& s) {
   const Mesh &a = obj.mesh, &b = s.mesh;
   CHECK(obj.topologyVersion == s.version);
   CHECK(a.positions == b.positions);
   CHECK(a.normals == b.normals);
   CHECK(a.mask == b.mask);
+  CHECK(sameFaceSets(a, b));
   CHECK(a.vertHe == b.vertHe);
   CHECK(a.faceHe == b.faceHe);
   CHECK(a.heNext == b.heNext);
@@ -897,6 +907,7 @@ TEST_CASE("random strokes, masks and undo keep the mesh valid and history exact"
   FlattenBrush flatten;
   CreaseBrush crease;
   MaskBrush mask;
+  FaceSetBrush faceSet;
   const std::vector<const Brush*> brushes{&draw, &clay, &smooth, &inflate, &flatten, &crease};
   const DyntopoRefine refines[] = {DyntopoRefine::SplitCollapse, DyntopoRefine::SplitOnly, DyntopoRefine::CollapseOnly};
   for (unsigned seed = 1; seed <= 20; ++seed) {
@@ -906,6 +917,10 @@ TEST_CASE("random strokes, masks and undo keep the mesh valid and history exact"
     Scene scene;
     Mesh mesh = makeIcosphere(3);
     mesh.ensureMask();  // So undoing the first mask stroke has a mask to return to.
+    if (seed % 2 == 0) {  // Face sets must travel through every split, collapse and relayout.
+      mesh.faceSets.resize(mesh.faceHe.size());
+      for (Index f = 0; f < mesh.faceCount(); ++f) mesh.faceSets[f] = 1 + static_cast<std::int32_t>(rng() % 4);
+    }
     SceneObject& obj = scene.add("A", std::move(mesh));
     auto workspace = std::make_shared<LayoutWorkspace>();
     UndoStack stack;
@@ -927,11 +942,31 @@ TEST_CASE("random strokes, masks and undo keep the mesh valid and history exact"
         requireState(obj, history[++cursor]);
         continue;
       }
-      const bool maskStroke = uni(rng) < 0.15f;
-      const Brush& brush = maskStroke ? static_cast<const Brush&>(mask) : *brushes[rng() % brushes.size()];
+      if (roll < 0.36f) {  // Hide or show a face set: hidden faces must stay frozen and come back.
+        const Index f = static_cast<Index>(rng() % static_cast<unsigned>(obj.mesh.faceCount()));
+        const FaceSetOp op = uni(rng) < 0.6f ? FaceSetOp::Hide : FaceSetOp::RevealAll;
+        auto undo = applyFaceSetOp(obj, op, obj.mesh.faceSetValue(f));
+        if (!undo) {
+          requireState(obj, history[cursor]);
+          continue;
+        }
+        stack.push(std::move(*undo));
+        history.resize(cursor + 1);
+        history.push_back(capture(obj));
+        ++cursor;
+        continue;
+      }
+      const float kind = uni(rng);
+      const bool maskStroke = kind < 0.15f, faceSetStroke = kind >= 0.15f && kind < 0.25f;
+      const Brush& brush = maskStroke      ? static_cast<const Brush&>(mask)
+                           : faceSetStroke ? static_cast<const Brush&>(faceSet)
+                                           : *brushes[rng() % brushes.size()];
       StrokeOptions options = uni(rng) < 0.15f ? StrokeOptions{} : dyntopoStroke(refines[rng() % 3]);
       options.symmetryX = uni(rng) < 0.5f;
       options.invert = uni(rng) < 0.3f;
+      options.faceSetAutoMask = uni(rng) < 0.2f;
+      options.lockFaceSetBoundaries = uni(rng) < 0.2f;
+      options.extendFaceSet = uni(rng) < 0.3f;
       const float r = 0.1f + 0.4f * uni(rng);
       const float detail = 0.03f + 0.37f * uni(rng);
       const float strength = uni(rng);

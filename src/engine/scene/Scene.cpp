@@ -34,6 +34,20 @@ void SceneObject::rebuildSpatial() {
   topologyVersion = nextTopologyVersion();
 }
 
+void SceneObject::markVisibilityDirty(Index leaf) {
+  topoDirtyLeaves.push_back(leaf);
+  const BvhLeaf& l = bvh.leaves()[leaf];
+  Index last = leaf;
+  for (Index h = l.heBegin; h < l.heEnd; ++h) {
+    const Index t = mesh.heTwin[h];
+    if (t == kInvalid || (t >= l.heBegin && t < l.heEnd)) continue;
+    const Index other = bvh.leafOfHalfEdge(t);
+    if (other == last || other == kInvalid) continue;
+    topoDirtyLeaves.push_back(other);
+    last = other;
+  }
+}
+
 SceneObject& Scene::add(std::string name, Mesh mesh) {
   auto obj = std::make_unique<SceneObject>();
   obj->id = nextId_++;
@@ -100,7 +114,7 @@ std::optional<ScenePick> Scene::pick(const Ray& worldRay) const {
     local.dir = Vec3(inv * Vec4(worldRay.dir, 0.0f));
     RayHit hit;
     const float tMax = best ? best->t : std::numeric_limits<float>::infinity();
-    if (!o->bvh.raycast(o->mesh, local, hit, tMax)) continue;
+    if (!o->bvh.raycast(o->mesh, local, hit, tMax, true)) continue;
     ScenePick p;
     p.objectId = o->id;
     p.localHit = hit;

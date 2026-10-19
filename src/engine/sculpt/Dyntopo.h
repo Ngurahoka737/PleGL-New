@@ -26,6 +26,11 @@ struct DabTopology {
   float detail = 0.0f;        // Target edge length in object space. 0 leaves topology alone.
   Index hintFace = kInvalid;  // Face under the cursor: its long edges are split even when the
                               // brush is too small to reach any of them.
+  // The stroke's face set limits on this side (the sculptor fills them from StrokeOptions): with
+  // onlySet > 0 faces of other sets are left alone, and with lockFaceSetBorders no vertex where
+  // sets meet moves or merges away.
+  std::int32_t onlySet = 0;
+  bool lockFaceSetBorders = false;
 };
 
 // What one topology pass changed.
@@ -47,7 +52,9 @@ struct DyntopoPass {
 //
 // Splits follow longest-edge bisection: a triangle is only ever cut across its longest edge, so
 // repeated refinement cannot produce slivers. Untouchable: vertices with mask >= 0.5, non-manifold
-// vertices, every face that has one of those as a corner, and faces with more than 4 corners.
+// vertices, every face that has one of those as a corner, faces with more than 4 corners, hidden
+// faces and faces outside the dab's face set limit. Vertices on face set boundaries keep their
+// place.
 // Open borders keep their shape: border edges are split at their midpoint, but border vertices
 // never merge. Quads are cut into triangles only where an edit needs it, along their shorter
 // diagonal that does not fold.
@@ -124,6 +131,8 @@ class DyntopoSession {
 
   // Per pass.
   DyntopoPass pass_;
+  std::int32_t onlySet_ = 0;  // DabTopology::onlySet.
+  bool lockBorders_ = false;  // DabTopology::lockFaceSetBorders.
   std::vector<Index> leaves_;
   std::vector<std::vector<Edge>> perLeafSplits_, perLeafCollapses_;
   std::vector<Edge> splits_, collapses_;

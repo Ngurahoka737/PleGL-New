@@ -8,9 +8,10 @@
 namespace plegl {
 
 void appendLeafTriangles(const Mesh& m, const BvhLeaf& leaf, std::vector<std::uint32_t>& out) {
+  const std::int32_t* sets = m.faceSets.empty() ? nullptr : m.faceSets.data();
   for (Index f = leaf.faceBegin; f < leaf.faceEnd; ++f) {
     const Index h0 = m.faceHe[f];
-    if (h0 == kInvalid) continue;
+    if (h0 == kInvalid || (sets && sets[f] < 0)) continue;
     const auto a = static_cast<std::uint32_t>(m.heVert[h0]);
     for (Index h = m.heNext[h0]; m.heNext[h] != h0; h = m.heNext[h]) {
       out.push_back(a);
@@ -20,11 +21,23 @@ void appendLeafTriangles(const Mesh& m, const BvhLeaf& leaf, std::vector<std::ui
   }
 }
 
+void appendLeafTriangleFaceSets(const Mesh& m, const BvhLeaf& leaf, std::vector<std::int32_t>& out) {
+  for (Index f = leaf.faceBegin; f < leaf.faceEnd; ++f) {
+    const Index h0 = m.faceHe[f];
+    const std::int32_t value = m.faceSetValue(f);
+    if (h0 == kInvalid || value < 0) continue;
+    for (Index h = m.heNext[h0]; m.heNext[h] != h0; h = m.heNext[h]) out.push_back(value);
+  }
+}
+
 void appendLeafEdges(const Mesh& m, const BvhLeaf& leaf, std::vector<std::uint32_t>& out) {
+  const std::int32_t* sets = m.faceSets.empty() ? nullptr : m.faceSets.data();
   for (Index h = leaf.heBegin; h < leaf.heEnd; ++h) {
-    if (m.heFace[h] == kInvalid) continue;
+    const Index f = m.heFace[h];
+    if (f == kInvalid || (sets && sets[f] < 0)) continue;
     const Index t = m.heTwin[h];
-    if (t != kInvalid && t < h) continue;
+    // Of two visible faces the lower half-edge draws the line; next to a hidden face, the visible one.
+    if (t != kInvalid && t < h && !(sets && sets[m.heFace[t]] < 0)) continue;
     out.push_back(static_cast<std::uint32_t>(m.heVert[h]));
     out.push_back(static_cast<std::uint32_t>(m.heTarget(h)));
   }
@@ -57,13 +70,30 @@ std::vector<std::uint32_t> buildLeafIndices(LeafIndexKind kind, const Mesh& m, c
   return out;
 }
 
+std::vector<std::int32_t> buildTriangleFaceSets(const Mesh& m, const Bvh& bvh, const LeafIndexBlocks& blocks) {
+  std::vector<std::int32_t> out((static_cast<std::size_t>(blocks.size()) + 2) / 3, kDefaultFaceSet);
+  const auto leaves = bvh.leaves();
+  const std::size_t n = std::min(leaves.size(), blocks.leafCount());
+  parallelFor(0, n, 8, [&](std::size_t b, std::size_t e) {
+    std::vector<std::int32_t> sets;
+    for (std::size_t l = b; l < e; ++l) {
+      sets.clear();
+      appendLeafTriangleFaceSets(m, leaves[l], sets);
+      const std::size_t slot = blocks.block(static_cast<Index>(l)).first / 3;
+      std::copy(sets.begin(), sets.end(), out.begin() + static_cast<std::ptrdiff_t>(slot));
+    }
+  });
+  return out;
+}
+
 void LeafIndexBlocks::pack(std::span<const std::uint32_t> counts) {
   blocks_.resize(counts.size());
   free_.clear();
   std::uint32_t at = 0;
   for (std::size_t i = 0; i < counts.size(); ++i) {
-    blocks_[i] = {at, counts[i], counts[i]};
-    at += counts[i];
+    const std::uint32_t room = (counts[i] + granularity_ - 1) / granularity_ * granularity_;
+    blocks_[i] = {at, room, counts[i]};
+    at += room;
   }
   end_ = at;
 }
@@ -82,7 +112,8 @@ bool LeafIndexBlocks::place(Index leaf, std::uint32_t count) {
   }
   release(b.first, b.capacity);
   // Half again as much room, so a leaf that keeps growing moves only now and then.
-  const std::uint32_t room = count + count / 2 + 16;
+  std::uint32_t room = count + count / 2 + 16;
+  room = (room + granularity_ - 1) / granularity_ * granularity_;
   b = {allocate(room), room, count};
   return true;
 }

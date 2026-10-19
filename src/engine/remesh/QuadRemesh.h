@@ -52,7 +52,8 @@ struct QuadRemeshStats {
 //  5. Vertices are relaxed along the surface and projected back onto the input mesh, which
 //     evens out edge lengths and removes the voxel staircase.
 //  6. The mesh is subdivided down to the target edge and relaxed again.
-//  7. If the input has a mask, it is transferred to the result by closest point.
+//  7. If the input has a mask, it is transferred to the result by closest point, and so are face
+//     sets (each new face takes the set of the input face closest to its centre).
 // The result stays closed, manifold and all quads.
 std::optional<Mesh> quadRemesh(const Mesh& input, const QuadRemeshParams& params, QuadRemeshStats* stats = nullptr,
                                std::string* error = nullptr);
@@ -64,5 +65,10 @@ MeshQuality measureQuality(const Mesh& mesh, const Mesh* reference = nullptr, co
 // across that triangle). Leaves target.mask empty when nothing in `source` is masked. quadRemesh
 // calls this itself, so a remesh keeps the mask.
 void transferMask(const Mesh& source, const Bvh& sourceBvh, Mesh& target);
+
+// Gives every face of `target` the face set value (hidden faces stay hidden) of the `source` face
+// closest to its centre, preferring a source face on the same side of thin parts. Leaves
+// target.faceSets empty when `source` has no face set data. quadRemesh calls this itself.
+void transferFaceSets(const Mesh& source, const Bvh& sourceBvh, Mesh& target);
 
 }  // namespace plegl

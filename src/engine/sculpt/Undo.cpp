@@ -8,13 +8,15 @@ std::size_t SculptUndo::bytes() const {
   std::size_t n = 0;
   for (const auto* list : {&before, &after})
     for (const LeafState& s : *list)
-      n += (s.positions.size() + s.normals.size()) * sizeof(Vec3) + s.mask.size() * sizeof(float);
+      n += (s.positions.size() + s.normals.size()) * sizeof(Vec3) + s.mask.size() * sizeof(float) +
+           s.faceSets.size() * sizeof(std::int32_t);
   return n + refit.size() * sizeof(Index);
 }
 
 std::size_t MeshState::bytes() const {
   const Mesh& m = mesh;
   return (m.positions.size() + m.normals.size()) * sizeof(Vec3) + m.mask.size() * sizeof(float) +
+         m.faceSets.size() * sizeof(std::int32_t) +
          (m.heNext.size() + m.heTwin.size() + m.heVert.size() + m.heFace.size() + m.vertHe.size() +
           m.faceHe.size()) * sizeof(Index) +
          bvh.memoryBytes();
@@ -71,11 +73,16 @@ bool UndoStack::apply(Scene& scene, const SculptUndo& entry, const std::vector<L
   Mesh& m = obj->mesh;
   std::vector<Index> leaves;
   leaves.reserve(states.size() + entry.refit.size());
-  std::size_t maskLeaves = 0;
-  for (const LeafState& s : states) maskLeaves += s.mask.empty() ? 0 : 1;
+  std::size_t maskLeaves = 0, faceSetLeaves = 0;
+  for (const LeafState& s : states) {
+    maskLeaves += s.mask.empty() ? 0 : 1;
+    faceSetLeaves += s.faceSets.empty() ? 0 : 1;
+  }
   // A mask operation can touch every leaf; one full mask upload is cheaper than many small ones.
   const bool maskAll = maskLeaves > kMaskDirtyAllLeaves;
+  const bool faceSetAll = faceSetLeaves > kMaskDirtyAllLeaves;
   if (maskLeaves > 0) m.ensureMask();  // The mask may have been dropped by a redone remesh.
+  if (faceSetLeaves > 0) m.ensureFaceSets();
   for (const LeafState& s : states) {
     const BvhLeaf& leaf = obj->bvh.leaves()[s.leaf];
     std::copy(s.positions.begin(), s.positions.end(), m.positions.begin() + leaf.vertBegin);
@@ -86,8 +93,19 @@ bool UndoStack::apply(Scene& scene, const SculptUndo& entry, const std::vector<L
       leaves.push_back(s.leaf);
     }
     if (!s.mask.empty() && !maskAll) obj->markMaskDirty(s.leaf);
+    if (!s.faceSets.empty()) {
+      const auto dst = m.faceSets.begin() + leaf.faceBegin;
+      // Hiding or revealing changes which triangles the leaf draws.
+      bool visibility = false;
+      for (std::size_t i = 0; i < s.faceSets.size() && !visibility; ++i)
+        visibility = (dst[static_cast<std::ptrdiff_t>(i)] < 0) != (s.faceSets[i] < 0);
+      std::copy(s.faceSets.begin(), s.faceSets.end(), dst);
+      if (visibility) obj->markVisibilityDirty(s.leaf);
+      if (!faceSetAll) obj->markFaceSetDirty(s.leaf);
+    }
   }
   if (maskAll) obj->markMaskDirtyAll();
+  if (faceSetAll) obj->markFaceSetDirtyAll();
   if (!leaves.empty()) {
     for (Index l : entry.refit) leaves.push_back(l);
     obj->bvh.refitLeaves(m, leaves);

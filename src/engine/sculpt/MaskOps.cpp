@@ -68,6 +68,13 @@ std::optional<SculptUndo> applyMaskOp(SceneObject& object, MaskOp op, int iterat
     }
   }
 
+  // Hidden parts keep their mask: only vertices of a visible face change.
+  if (m.anyHidden()) {
+    forEachLeafVertex(bvh, [&](Index v) {
+      if (!m.vertexVisible(v)) m.mask[v] = old[v];
+    });
+  }
+
   // Record only the leaves whose values changed.
   const auto& leaves = bvh.leaves();
   std::vector<char> changed(leaves.size(), 0);

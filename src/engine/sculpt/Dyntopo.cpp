@@ -197,7 +197,9 @@ bool DyntopoSession::frozen(Index f, int& size) const {
     if (++size > 4 || locked(m_.heVert[h])) return true;
     h = m_.heNext[h];
   } while (h != start);
-  return size < 3;
+  if (size < 3) return true;
+  const std::int32_t value = m_.faceSetValue(f);
+  return value < 0 || (onlySet_ > 0 && value != onlySet_);  // Hidden faces and other sets are left alone.
 }
 
 bool DyntopoSession::pickDiagonal(Index f, Index& ha, Index& hb) const {
@@ -237,6 +239,8 @@ const DyntopoPass& DyntopoSession::pass(const Vec3& center, float radius, const 
   if (faulted_ || topo.detail <= 0.0f || radius <= 0.0f) return pass_;
   passTimer_.reset();
   opsSinceCheck_ = 0;
+  onlySet_ = topo.onlySet;
+  lockBorders_ = topo.lockFaceSetBorders;
   faceLeaf_ = heLeaf_ = kInvalid;
   leavesBefore_ = bvh_.leaves().size();
   openTailBefore_ = leavesBefore_ > static_cast<std::size_t>(bvh_.firstTailLeaf()) ? bvh_.leaves().back() : BvhLeaf{};
@@ -458,17 +462,33 @@ bool DyntopoSession::collapseOne(const Edge& e, float lmax2, float lmin2) {
   const Vec3 pa = m_.positions[a], pb = m_.positions[b];
   if (t == kInvalid || dist2(pa, pb) >= lmin2) return false;
 
-  // Every face around both ends must be editable.
+  // Every face around both ends must be editable. An end where face sets meet is on a face set
+  // boundary; seen from both ends, the faces tell which ends are.
   ring_.clear();
   bool ok = true;
   int valA = 0, valB = 0;
+  const std::int32_t* sets = m_.faceSets.empty() ? nullptr : m_.faceSets.data();
+  std::int32_t firstA = 0, firstB = 0;
+  bool borderA = false, borderB = false;
   ok &= walkFan(m_, a, [&](Index o) {
-    ring_.push_back(m_.heFace[o]);
+    const Index f = m_.heFace[o];
+    ring_.push_back(f);
     ++valA;
+    if (sets) {
+      const std::int32_t id = faceSetId(sets[f]);
+      borderA |= firstA != 0 && id != firstA;
+      if (firstA == 0) firstA = id;
+    }
   });
   ok &= walkFan(m_, b, [&](Index o) {
-    ring_.push_back(m_.heFace[o]);
+    const Index f = m_.heFace[o];
+    ring_.push_back(f);
     ++valB;
+    if (sets) {
+      const std::int32_t id = faceSetId(sets[f]);
+      borderB |= firstB != 0 && id != firstB;
+      if (firstB == 0) firstB = id;
+    }
   });
   if (!ok) {
     faulted_ = true;
@@ -494,6 +514,18 @@ bool DyntopoSession::collapseOne(const Edge& e, float lmax2, float lmin2) {
     keep = b;
     gone = a;
     p = pb;
+  }
+  // Face set boundaries stay where they are: an end on one keeps its place, and two ends on one
+  // only merge along it (the edge itself separates two sets), so the line just loses a point.
+  // Locked boundaries keep every point.
+  if (borderA != borderB) {
+    const Index border = borderA ? a : b;
+    if ((border == a && mb > ma) || (border == b && ma > mb)) return false;  // The mask wants the other end.
+    keep = border;
+    gone = border == a ? b : a;
+    p = m_.positions[border];
+  } else if (borderA && (lockBorders_ || faceSetId(sets[m_.heFace[h]]) == faceSetId(sets[m_.heFace[t]]))) {
+    return false;
   }
 
   // No edge at the merged vertex may come out long enough to be split again.

@@ -128,6 +128,7 @@ Index MeshEditor::splitFace(Index ha, Index hb) {
   }
   const Index g = static_cast<Index>(m_.faceHe.size());
   m_.faceHe.push_back(hb);
+  if (!m_.faceSets.empty()) m_.faceSets.push_back(m_.faceSets[f]);  // Both halves stay in f's set.
   const Index d1 = static_cast<Index>(m_.heNext.size());  // u -> w, closes the new face g.
   const Index d2 = d1 + 1;                                // w -> u, closes f.
   m_.heNext.insert(m_.heNext.end(), {hb, ha});
@@ -288,8 +289,12 @@ void MeshEditor::compact() {
     out.vertHe[vmap[v]] = remap(m_.vertHe[v], hmap);
   }
   out.faceHe.resize(cf);
-  for (Index f = 0; f < nf; ++f)
-    if (fmap[f] != kInvalid) out.faceHe[fmap[f]] = hmap[m_.faceHe[f]];
+  if (!m_.faceSets.empty()) out.faceSets.resize(cf);
+  for (Index f = 0; f < nf; ++f) {
+    if (fmap[f] == kInvalid) continue;
+    out.faceHe[fmap[f]] = hmap[m_.faceHe[f]];
+    if (!out.faceSets.empty()) out.faceSets[fmap[f]] = m_.faceSets[f];
+  }
   out.heNext.resize(ch);
   out.heTwin.resize(ch);
   out.heVert.resize(ch);

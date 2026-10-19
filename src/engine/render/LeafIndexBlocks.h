@@ -11,12 +11,15 @@
 namespace plegl {
 
 // Draw indices of one BVH leaf, appended to `out`. Both skip faces and half-edges removed by a
-// dynamic topology stroke, so they work on a mesh in the middle of one.
+// dynamic topology stroke, so they work on a mesh in the middle of one, and hidden faces.
 //
-// Triangles: every face of the leaf, fan-triangulated from its first corner.
+// Triangles: every visible face of the leaf, fan-triangulated from its first corner.
 void appendLeafTriangles(const Mesh& mesh, const BvhLeaf& leaf, std::vector<std::uint32_t>& out);
-// Edges: every half-edge of the leaf that is the lower of its pair, or on an open border, as a
-// line. Quads draw as quads. Every edge of the mesh appears in exactly one leaf.
+// The face set value of every triangle appendLeafTriangles() emits, in the same order.
+void appendLeafTriangleFaceSets(const Mesh& mesh, const BvhLeaf& leaf, std::vector<std::int32_t>& out);
+// Edges: every half-edge of the leaf with a visible face that is the lower of its pair, on an
+// open border, or next to a hidden face, as a line. Quads draw as quads. Every edge of the mesh
+// with a visible face appears in exactly one leaf.
 void appendLeafEdges(const Mesh& mesh, const BvhLeaf& leaf, std::vector<std::uint32_t>& out);
 
 enum class LeafIndexKind : std::uint8_t { Triangles, Edges };
@@ -31,6 +34,11 @@ class LeafIndexBlocks;
 std::vector<std::uint32_t> buildLeafIndices(LeafIndexKind kind, const Mesh& mesh, const Bvh& bvh,
                                             LeafIndexBlocks& blocks);
 
+// The face set of every triangle slot (index / 3) of a triangle buffer laid out by `blocks`, which
+// must match the mesh (as buildLeafIndices() left them, or kept current with place()). Slots no
+// leaf uses hold kDefaultFaceSet.
+std::vector<std::int32_t> buildTriangleFaceSets(const Mesh& mesh, const Bvh& bvh, const LeafIndexBlocks& blocks);
+
 // Where each leaf's indices live inside one index buffer. After pack() the blocks sit back to
 // back in leaf order, exactly like one plain upload of the whole mesh. While a dynamic topology
 // stroke runs, place() updates single leaves: a block that still fits stays where it is, a block
@@ -38,13 +46,18 @@ std::vector<std::uint32_t> buildLeafIndices(LeafIndexKind kind, const Mesh& mesh
 // not move on every dab. The buffer itself is the caller's; this class only does the arithmetic.
 class LeafIndexBlocks {
  public:
+  // Every block starts at, and reserves room in, multiples of `granularity` indices. Triangle
+  // blocks use 3, so index / 3 numbers a triangle slot that stays put while its block does.
+  LeafIndexBlocks() = default;
+  explicit LeafIndexBlocks(std::uint32_t granularity) : granularity_(granularity) {}
+
   struct Block {
     std::uint32_t first = 0;     // In indices, not bytes.
     std::uint32_t capacity = 0;  // Room reserved for the leaf.
     std::uint32_t count = 0;     // Indices in use.
   };
 
-  // One block per leaf, sized exactly, in leaf order with no gaps.
+  // One block per leaf, sized exactly (rounded up to the granularity), in leaf order.
   void pack(std::span<const std::uint32_t> counts);
   // Gives `leaf` room for `count` indices; leaves past the current count are added empty.
   // Returns true if the block moved (or is new), false if it kept its place. Either way the
@@ -74,6 +87,7 @@ class LeafIndexBlocks {
   std::vector<Block> blocks_;
   std::vector<std::pair<std::uint32_t, std::uint32_t>> free_;  // (first, size), sorted, coalesced.
   std::uint32_t end_ = 0;
+  std::uint32_t granularity_ = 1;
 };
 
 }  // namespace plegl

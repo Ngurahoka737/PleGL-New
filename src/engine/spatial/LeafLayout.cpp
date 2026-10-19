@@ -49,7 +49,7 @@ void fit(std::vector<T>& w, const std::vector<T>& like, Index n) {
   w.resize(static_cast<std::size_t>(n));
 }
 
-void fitMesh(const Mesh& like, Mesh& w, Index nv, Index nf, Index nh, bool normals, bool mask) {
+void fitMesh(const Mesh& like, Mesh& w, Index nv, Index nf, Index nh, bool normals, bool mask, bool faceSets) {
   fit(w.positions, like.positions, nv);
   fit(w.vertHe, like.vertHe, nv);
   if (normals) {
@@ -63,6 +63,11 @@ void fitMesh(const Mesh& like, Mesh& w, Index nv, Index nf, Index nh, bool norma
     w.mask.clear();
   }
   fit(w.faceHe, like.faceHe, nf);
+  if (faceSets) {
+    fit(w.faceSets, like.faceSets, nf);
+  } else {
+    w.faceSets.clear();
+  }
   fit(w.heNext, like.heNext, nh);
   fit(w.heTwin, like.heTwin, nh);
   fit(w.heVert, like.heVert, nh);
@@ -76,9 +81,11 @@ struct CopyTarget {
   const Index* hmap;
   const Vec3* normalsIn;  // nullptr when the source mesh has no normals.
   const float* maskIn;    // nullptr: the source has no mask, write zeros.
+  const std::int32_t* faceSetsIn;  // nullptr: the source has no face sets, write the default.
   Mesh* out;
   bool normalsOut;
   bool maskOut;
+  bool faceSetsOut;
 };
 
 // Where a consolidation's appended and isolated elements start.
@@ -109,6 +116,7 @@ void copyLeaf(const Mesh& m, const BvhLeaf& src, const CopyTarget& t, const RefC
       continue;
     }
     w.faceHe[nf] = he;
+    if (t.faceSetsOut) w.faceSets[nf] = t.faceSetsIn ? t.faceSetsIn[f] : kDefaultFaceSet;
   }
   for (Index h = src.heBegin; h < src.heEnd; ++h) {
     if (m.heFace[h] == kInvalid) {
@@ -403,11 +411,19 @@ bool copyConsolidation(const Mesh& m, const Bvh& bvh, const std::vector<char>& c
   const Index isoBegin = T > 0 ? old[T - 1].vertEnd : 0;
   const bool normals = m.normals.size() == m.positions.size();
   const bool mask = !m.mask.empty();
-  fitMesh(m, ws.mesh, plan.vertexCount, plan.faceCount, plan.halfEdgeCount, normals, mask);
+  const bool faceSets = !m.faceSets.empty();
+  fitMesh(m, ws.mesh, plan.vertexCount, plan.faceCount, plan.halfEdgeCount, normals, mask, faceSets);
 
-  const CopyTarget target{ws.vmap.data(), ws.fmap.data(), ws.hmap.data(), normals ? m.normals.data() : nullptr,
-                          mask ? m.mask.data() : nullptr,   &ws.mesh,       normals,
-                          mask};
+  const CopyTarget target{ws.vmap.data(),
+                          ws.fmap.data(),
+                          ws.hmap.data(),
+                          normals ? m.normals.data() : nullptr,
+                          mask ? m.mask.data() : nullptr,
+                          faceSets ? m.faceSets.data() : nullptr,
+                          &ws.mesh,
+                          normals,
+                          mask,
+                          faceSets};
   const RefContext ctx{isoBegin, bvh.tailStartVertex(), bvh.tailStartHalfEdge()};
   std::vector<LeafCopy> copies(static_cast<std::size_t>(L));
   parallelFor(0, static_cast<std::size_t>(L), 2, [&](std::size_t b, std::size_t e) {
@@ -440,8 +456,8 @@ Aabb regionBounds(const Mesh& m, const BvhLeaf& leaf) {
 // --- Leaf snapshots ----------------------------------------------------------------------------
 
 std::size_t TopoLeafState::bytes() const {
-  return sliceBytes(positions) + sliceBytes(normals) + sliceBytes(mask) + sliceBytes(vertHe) + sliceBytes(faceHe) +
-         sliceBytes(heNext) + sliceBytes(heTwin) + sliceBytes(heVert) + sliceBytes(heFace);
+  return sliceBytes(positions) + sliceBytes(normals) + sliceBytes(mask) + sliceBytes(faceSets) + sliceBytes(vertHe) +
+         sliceBytes(faceHe) + sliceBytes(heNext) + sliceBytes(heTwin) + sliceBytes(heVert) + sliceBytes(heFace);
 }
 
 TopoLeafState captureLeaf(const Mesh& m, const Bvh& bvh, Index leaf) {
@@ -452,6 +468,7 @@ TopoLeafState captureLeaf(const Mesh& m, const Bvh& bvh, Index leaf) {
   copySlice(m.positions, r.vertBegin, r.vertEnd, s.positions);
   if (m.normals.size() == m.positions.size()) copySlice(m.normals, r.vertBegin, r.vertEnd, s.normals);
   if (!m.mask.empty()) copySlice(m.mask, r.vertBegin, r.vertEnd, s.mask);
+  if (!m.faceSets.empty()) copySlice(m.faceSets, r.faceBegin, r.faceEnd, s.faceSets);
   copySlice(m.vertHe, r.vertBegin, r.vertEnd, s.vertHe);
   copySlice(m.faceHe, r.faceBegin, r.faceEnd, s.faceHe);
   copySlice(m.heNext, r.heBegin, r.heEnd, s.heNext);
@@ -535,9 +552,9 @@ std::vector<TopoLeafState> ClaimRecorder::takeClaims() {
 // --- Consolidation -----------------------------------------------------------------------------
 
 std::size_t LayoutWorkspace::bytes() const {
-  return sliceBytes(mesh.positions) + sliceBytes(mesh.normals) + sliceBytes(mesh.mask) + sliceBytes(mesh.vertHe) +
-         sliceBytes(mesh.faceHe) + sliceBytes(mesh.heNext) + sliceBytes(mesh.heTwin) + sliceBytes(mesh.heVert) +
-         sliceBytes(mesh.heFace) + sliceBytes(vmap) + sliceBytes(fmap) + sliceBytes(hmap);
+  return sliceBytes(mesh.positions) + sliceBytes(mesh.normals) + sliceBytes(mesh.mask) + sliceBytes(mesh.faceSets) +
+         sliceBytes(mesh.vertHe) + sliceBytes(mesh.faceHe) + sliceBytes(mesh.heNext) + sliceBytes(mesh.heTwin) +
+         sliceBytes(mesh.heVert) + sliceBytes(mesh.heFace) + sliceBytes(vmap) + sliceBytes(fmap) + sliceBytes(hmap);
 }
 
 std::size_t LayoutDelta::bytes() const {
@@ -594,7 +611,8 @@ ConsolidateResult consolidate(Mesh& mesh, Bvh& bvh, std::span<const Index> claim
 std::size_t LayoutSide::bytes() const {
   std::size_t n = bvh ? bvh->memoryBytes() : 0;
   for (const TopoLeafState& s : region) n += s.bytes();
-  for (const LeafState& s : posOnly) n += sliceBytes(s.positions) + sliceBytes(s.normals) + sliceBytes(s.mask);
+  for (const LeafState& s : posOnly)
+    n += sliceBytes(s.positions) + sliceBytes(s.normals) + sliceBytes(s.mask) + sliceBytes(s.faceSets);
   return n;
 }
 
@@ -679,6 +697,7 @@ bool relayout(Mesh& mesh, Bvh& bvh, const LayoutSide& to, const LayoutDelta& del
     slices[s.leaf] = &s;
   }
   bool mask = !mesh.mask.empty();
+  bool faceSets = !mesh.faceSets.empty();
   for (Index l = 0; l < Lt; ++l) {
     if (!region[l]) continue;
     const TopoLeafState* s = slices[l];
@@ -687,17 +706,20 @@ bool relayout(Mesh& mesh, Bvh& bvh, const LayoutSide& to, const LayoutDelta& del
     if (!s || s->faceHe.size() != static_cast<std::size_t>(faceSpan(r)) || s->positions.size() != verts ||
         s->vertHe.size() != verts || s->heNext.size() != hes || s->heTwin.size() != hes || s->heVert.size() != hes ||
         s->heFace.size() != hes || (!s->mask.empty() && s->mask.size() != verts) ||
-        (normals && s->normals.size() != verts))
+        (!s->faceSets.empty() && s->faceSets.size() != s->faceHe.size()) || (normals && s->normals.size() != verts))
       return false;
     mask |= !s->mask.empty();
+    faceSets |= !s->faceSets.empty();
   }
   for (const LeafState& s : to.posOnly) {
     if (s.leaf < 0 || s.leaf >= Lt || region[s.leaf]) return false;
     const auto verts = static_cast<std::size_t>(vertSpan(dst[s.leaf]));
     if ((!s.positions.empty() && s.positions.size() != verts) || (!s.normals.empty() && s.normals.size() != verts) ||
-        (!s.mask.empty() && s.mask.size() != verts))
+        (!s.mask.empty() && s.mask.size() != verts) ||
+        (!s.faceSets.empty() && s.faceSets.size() != static_cast<std::size_t>(faceSpan(dst[s.leaf]))))
       return false;
     mask |= !s.mask.empty();
+    faceSets |= !s.faceSets.empty();
   }
 
   // Maps from the current numbering: untouched elements shift, region elements are only reached
@@ -735,9 +757,17 @@ bool relayout(Mesh& mesh, Bvh& bvh, const LayoutSide& to, const LayoutDelta& del
     hmap[src] = out;
   }
 
-  fitMesh(mesh, ws.mesh, to.vertexCount, to.faceCount, to.halfEdgeCount, normals, mask);
-  const CopyTarget target{vmap.data(), fmap.data(), hmap.data(), normals ? mesh.normals.data() : nullptr,
-                          mesh.mask.empty() ? nullptr : mesh.mask.data(), &ws.mesh, normals, mask};
+  fitMesh(mesh, ws.mesh, to.vertexCount, to.faceCount, to.halfEdgeCount, normals, mask, faceSets);
+  const CopyTarget target{vmap.data(),
+                          fmap.data(),
+                          hmap.data(),
+                          normals ? mesh.normals.data() : nullptr,
+                          mesh.mask.empty() ? nullptr : mesh.mask.data(),
+                          mesh.faceSets.empty() ? nullptr : mesh.faceSets.data(),
+                          &ws.mesh,
+                          normals,
+                          mask,
+                          faceSets};
   std::vector<LeafCopy> copies(static_cast<std::size_t>(Lf));
   parallelFor(0, static_cast<std::size_t>(Lf), 2, [&](std::size_t b, std::size_t e) {
     for (std::size_t l = b; l < e; ++l)
@@ -761,6 +791,13 @@ bool relayout(Mesh& mesh, Bvh& bvh, const LayoutSide& to, const LayoutDelta& del
           std::copy(s.mask.begin(), s.mask.end(), w.mask.begin() + r.vertBegin);
         }
       }
+      if (faceSets) {
+        if (s.faceSets.empty()) {
+          std::fill(w.faceSets.begin() + r.faceBegin, w.faceSets.begin() + r.faceEnd, kDefaultFaceSet);
+        } else {
+          std::copy(s.faceSets.begin(), s.faceSets.end(), w.faceSets.begin() + r.faceBegin);
+        }
+      }
       std::copy(s.vertHe.begin(), s.vertHe.end(), w.vertHe.begin() + r.vertBegin);
       std::copy(s.faceHe.begin(), s.faceHe.end(), w.faceHe.begin() + r.faceBegin);
       std::copy(s.heNext.begin(), s.heNext.end(), w.heNext.begin() + r.heBegin);
@@ -774,6 +811,7 @@ bool relayout(Mesh& mesh, Bvh& bvh, const LayoutSide& to, const LayoutDelta& del
     std::copy(s.positions.begin(), s.positions.end(), w.positions.begin() + begin);
     if (normals) std::copy(s.normals.begin(), s.normals.end(), w.normals.begin() + begin);
     if (mask) std::copy(s.mask.begin(), s.mask.end(), w.mask.begin() + begin);
+    if (faceSets) std::copy(s.faceSets.begin(), s.faceSets.end(), w.faceSets.begin() + dst[s.leaf].faceBegin);
   }
 
   std::swap(mesh, ws.mesh);
