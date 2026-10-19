@@ -3,11 +3,13 @@
 
 #include "TestUtil.h"
 #include "mesh/Primitives.h"
+#include "remesh/QuadRemesh.h"
 #include "remesh/VoxelGrid.h"
 #include "remesh/VoxelRemesh.h"
 #include "scene/Scene.h"
 #include "sculpt/Sculptor.h"
 #include "sculpt/Undo.h"
+#include "spatial/Bvh.h"
 
 using namespace plegl;
 
@@ -180,4 +182,82 @@ TEST_CASE("undoing a remesh restores the mesh and earlier sculpt undo still appl
   CHECK(obj.mesh.vertexCount() == remeshedVerts);
   RayHit after;
   CHECK(obj.bvh.raycast(obj.mesh, Ray{{0, 3, 0}, {0, -1, 0}}, after));
+}
+
+namespace {
+
+void requireQuadRemeshOk(const Mesh& out) {
+  test::requireValid(out);
+  for (Index h = 0; h < out.halfEdgeCount(); ++h) REQUIRE(out.heTwin[h] != kInvalid);
+  for (Index f = 0; f < out.faceCount(); ++f) REQUIRE(out.faceSize(f) == 4);
+  for (Index v = 0; v < out.vertexCount(); ++v) REQUIRE(out.valence(v) >= 3);
+}
+
+void printQuality(const std::string& name, const MeshQuality& voxel, const QuadRemeshStats& st) {
+  MESSAGE(name << ": voxel v4 " << voxel.valence4Ratio << " cv " << voxel.edgeLengthCv << " err " << voxel.meanError
+               << " -> quad v4 " << st.optimized.valence4Ratio << " cv " << st.optimized.edgeLengthCv << " err "
+               << st.optimized.meanError << "/" << st.optimized.maxError << " edge " << st.optimized.meanEdge
+               << " collapsed " << st.collapsed << " rotated " << st.rotated << " ms " << st.optimizeMs);
+}
+
+}  // namespace
+
+TEST_CASE("quad remesh reaches 98% valence 4 and fits the surface better than the voxel remesh") {
+  struct Case {
+    const char* name;
+    Mesh mesh;
+    float h;
+    bool sharp;  // Has sharp edges, which the coarse layout rounds a little more.
+  };
+  Soup two;
+  two.add(makeQuadSphere(48), {-0.5f, 0.0f, 0.0f});
+  two.add(makeQuadSphere(48), {0.5f, 0.0f, 0.0f});
+  std::vector<Case> cases;
+  cases.push_back({"sphere", makeQuadSphere(48), 0.04f, false});
+  cases.push_back({"uv sphere", makeUvSphere(64, 32), 0.05f, false});
+  cases.push_back({"cube", makeCube(16), 0.06f, true});
+  cases.push_back({"two spheres", two.build(), 0.04f, false});
+  for (const Case& c : cases) {
+    INFO(c.name);
+    Mesh ref = c.mesh;
+    Bvh refBvh;
+    refBvh.build(ref);
+    const Mesh voxel = *voxelRemesh(c.mesh, {.voxelSize = c.h});
+    const MeshQuality vq = measureQuality(voxel, &ref, &refBvh);
+
+    QuadRemeshStats st;
+    std::string error;
+    auto out = quadRemesh(c.mesh, {.targetEdge = c.h, .measureError = true}, &st, &error);
+    INFO(error);
+    REQUIRE(out);
+    printQuality(c.name, vq, st);
+    requireQuadRemeshOk(*out);
+    CHECK(test::eulerCharacteristic(*out) == 2);
+    test::requireOutward(*out);
+    // Against the voxel result: the input of "two spheres" counts the overlap twice.
+    const double v0 = meshVolume(voxel), v1 = meshVolume(*out);
+    CHECK(std::abs(v1 - v0) / v0 < 0.01);
+    CHECK(st.optimized.valence4Ratio >= 0.98);
+    CHECK(st.optimized.edgeLengthCv < vq.edgeLengthCv);
+    CHECK(st.optimized.meanEdge == doctest::Approx(c.h).epsilon(0.15));
+    if (c.sharp) {
+      CHECK(st.optimized.meanError < 2.0 * vq.meanError);
+    } else {
+      CHECK(st.optimized.meanError < vq.meanError);
+    }
+  }
+}
+
+TEST_CASE("quad remesh without subdivision still improves valence") {
+  const Mesh in = makeQuadSphere(48);
+  QuadRemeshStats st;
+  auto out = quadRemesh(in, {.targetEdge = 0.04f, .subdivisions = 0}, &st);
+  REQUIRE(out);
+  requireQuadRemeshOk(*out);
+  CHECK(st.raw.valence4Ratio < 0.6);
+  CHECK(st.optimized.valence4Ratio > 0.95);
+  QuadRemeshStats plain;
+  auto voxelOnly = quadRemesh(in, {.targetEdge = 0.04f, .rounds = 0}, &plain);
+  REQUIRE(voxelOnly);
+  CHECK(plain.optimized.valence4Ratio < 0.6);  // rounds = 0 is the plain voxel remesh.
 }

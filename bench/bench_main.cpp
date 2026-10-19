@@ -12,6 +12,7 @@
 #include "io/Obj.h"
 #include "mesh/Primitives.h"
 #include "scene/Scene.h"
+#include "remesh/QuadRemesh.h"
 #include "remesh/VoxelRemesh.h"
 #include "sculpt/Sculptor.h"
 #include "spatial/Bvh.h"
@@ -162,6 +163,28 @@ int main(int argc, char** argv) {
       std::printf("%10d %8.3f %12s %10d %10.0f %10.0f %10.0f %10.0f %8.0f\n", in.vertexCount(), voxel, grid,
                   out->vertexCount(), st.gridMs, st.extractMs, st.buildMs, total,
                   static_cast<double>(st.gridBytes) / (1024.0 * 1024.0));
+    }
+  }
+  // Quad remesh: voxel remesh plus valence optimisation and relaxation onto the input. Same
+  // PRD targets as the voxel remesh.
+  std::printf("\nQuad remesh benchmark\n\n");
+  std::printf("%10s %8s %10s %10s %10s %10s %8s %8s\n", "in verts", "edge", "out verts", "voxel ms", "optim ms",
+              "total ms", "val4 %", "edge cv");
+  for (int res : remeshRes) {
+    const Mesh in = makeQuadSphere(res);
+    for (float edge : {0.01f, 0.005f}) {
+      QuadRemeshStats st;
+      std::string error;
+      Timer t;
+      auto out = quadRemesh(in, {.targetEdge = edge}, &st, &error);
+      const double total = t.ms();
+      if (!out) {
+        std::printf("  remesh failed: %s\n", error.c_str());
+        continue;
+      }
+      std::printf("%10d %8.3f %10d %10.0f %10.0f %10.0f %8.1f %8.3f\n", in.vertexCount(), edge,
+                  out->vertexCount(), st.voxel.gridMs + st.voxel.extractMs + st.voxel.buildMs, st.optimizeMs, total,
+                  100.0 * st.optimized.valence4Ratio, st.optimized.edgeLengthCv);
     }
   }
   return 0;

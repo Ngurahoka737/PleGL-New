@@ -1,6 +1,6 @@
 #include "App.h"
 
-#include "remesh/VoxelRemesh.h"
+#include "remesh/QuadRemesh.h"
 
 #include <glad/gl.h>
 #include <imgui.h>
@@ -621,12 +621,12 @@ void App::requestRemesh() {
   auto input = std::make_shared<Mesh>(obj->mesh);
   const std::uint32_t id = obj->id;
   const std::uint64_t version = obj->topologyVersion;
-  const VoxelRemeshParams params{.voxelSize = remesh.voxelSize};
+  const QuadRemeshParams params{.targetEdge = remesh.voxelSize, .rounds = remesh.optimizeQuads ? 3 : 0};
   workers_.emplace_back([this, input, id, version, params] {
     Timer t;
-    auto remeshStats = std::make_shared<VoxelRemeshStats>();
+    auto remeshStats = std::make_shared<QuadRemeshStats>();
     auto error = std::make_shared<std::string>();
-    auto result = std::make_shared<std::optional<Mesh>>(voxelRemesh(*input, params, remeshStats.get(), error.get()));
+    auto result = std::make_shared<std::optional<Mesh>>(quadRemesh(*input, params, remeshStats.get(), error.get()));
     auto bvh = std::make_shared<Bvh>();
     if (*result) bvh->build(**result);
     const double ms = t.ms();
@@ -653,9 +653,11 @@ void App::requestRemesh() {
       target->dirtyLeaves.clear();
       entry.after = std::make_shared<MeshState>(MeshState{target->mesh, target->bvh, target->topologyVersion});
       undoStack.push(std::move(entry));
+      const int* res = remeshStats->voxel.resolution;
       char buf[256];
-      std::snprintf(buf, sizeof(buf), "%d vertices, %d quads, grid %dx%dx%d, %.0f ms", target->mesh.vertexCount(),
-                    target->mesh.faceCount(), remeshStats->resolution[0], remeshStats->resolution[1], remeshStats->resolution[2], ms);
+      std::snprintf(buf, sizeof(buf), "%d vertices, %d quads, %.0f%% valence 4, grid %dx%dx%d, %.0f ms",
+                    target->mesh.vertexCount(), target->mesh.faceCount(), 100.0 * remeshStats->optimized.valence4Ratio,
+                    res[0], res[1], res[2], ms);
       lastRemeshInfo = buf;
       statusMessage = "Remeshed " + target->name + ": " + lastRemeshInfo;
     });

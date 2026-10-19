@@ -1,5 +1,7 @@
 #include "spatial/Bvh.h"
 
+#include "core/Geometry.h"
+
 #include <algorithm>
 #include <cmath>
 #include <numeric>
@@ -157,6 +159,56 @@ Index Bvh::leafOfVertex(Index v) const {
                              [](Index value, const BvhLeaf& leaf) { return value < leaf.vertEnd; });
   if (it == leaves_.end() || v < it->vertBegin) return kInvalid;
   return static_cast<Index>(it - leaves_.begin());
+}
+
+bool Bvh::closestPoint(const Mesh& mesh, const Vec3& p, float maxDist, ClosestHit& out) const {
+  if (nodes_.empty()) return false;
+  float best = maxDist * maxDist;
+  bool found = false;
+  Index stack[128];
+  int sp = 0;
+  stack[sp++] = 0;
+  while (sp > 0) {
+    const BvhNode& node = nodes_[stack[--sp]];
+    if (distanceSq(node.bounds, p) > best) continue;
+    if (node.isLeaf()) {
+      const BvhLeaf& leaf = leaves_[node.leaf];
+      for (Index f = leaf.faceBegin; f < leaf.faceEnd; ++f) {
+        const Index h0 = mesh.faceHe[f];
+        const Vec3& a = mesh.positions[mesh.heVert[h0]];
+        Index h = mesh.heNext[h0];
+        for (Index hn = mesh.heNext[h]; hn != h0; h = hn, hn = mesh.heNext[hn]) {
+          const Vec3& b = mesh.positions[mesh.heVert[h]];
+          const Vec3& c = mesh.positions[mesh.heVert[hn]];
+          const Vec3 q = closestPointOnTriangle(p, a, b, c);
+          const float d = glm::dot(q - p, q - p);
+          if (d <= best) {
+            best = d;
+            found = true;
+            out.position = q;
+            out.face = f;
+            out.distSq = d;
+            const Vec3 n = glm::cross(b - a, c - a);
+            const float len = glm::length(n);
+            out.faceNormal = len > 0.0f ? n / len : Vec3{0.0f};
+          }
+        }
+      }
+      continue;
+    }
+    // Visit the nearer child first so `best` shrinks early.
+    const float dl = distanceSq(nodes_[node.left].bounds, p);
+    const float dr = distanceSq(nodes_[node.right].bounds, p);
+    if (sp + 2 > 128) continue;
+    if (dl <= dr) {
+      stack[sp++] = node.right;
+      stack[sp++] = node.left;
+    } else {
+      stack[sp++] = node.left;
+      stack[sp++] = node.right;
+    }
+  }
+  return found;
 }
 
 std::size_t Bvh::memoryBytes() const {
