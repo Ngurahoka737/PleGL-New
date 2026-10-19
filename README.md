@@ -1,0 +1,86 @@
+# PleGL Sculpt
+
+Software digital sculpting 3D untuk desktop yang fokus pada satu hal: sculpting yang cepat, stabil, dan mudah dipelajari.
+
+Status: **Phase 0 (Engine Foundation)**. Mesh bisa dibuat, diimpor, dirender, dipilih dengan raycast, dan ditransformasi. Brush pertama (Draw dan Smooth) datang di Phase 1.
+
+## Stack
+
+| Lapisan | Pilihan |
+| --- | --- |
+| Bahasa | C++20, CMake 3.24+ |
+| Window dan input (termasuk pressure pen) | SDL3 |
+| Rendering | OpenGL 4.5+ (direct state access), loader glad |
+| UI | Dear ImGui (docking) + ImGuizmo |
+| Matematika | glm |
+| Test | doctest |
+
+Semua dependensi diunduh otomatis oleh CMake (`cmake/Dependencies.cmake`) dan dikunci ke versi tertentu.
+
+## Build
+
+### Windows (Visual Studio 2022 atau lebih baru)
+
+```bat
+cmake --preset msvc
+cmake --build --preset msvc
+ctest --preset msvc
+build\msvc\Release\PleGLSculpt.exe
+```
+
+Atau buka folder repo langsung di Visual Studio; preset akan terdeteksi otomatis.
+
+### Linux
+
+```bash
+sudo apt-get install ninja-build libx11-dev libxext-dev libxcursor-dev libxi-dev libxrandr-dev \
+  libxss-dev libxtst-dev libxfixes-dev libxinerama-dev libxkbcommon-dev libwayland-dev \
+  wayland-protocols libdecor-0-dev libgl-dev libegl-dev
+cmake --preset release
+cmake --build --preset release
+ctest --preset release
+./build/release/PleGLSculpt
+```
+
+### Hanya engine (tanpa window, untuk test dan benchmark)
+
+```bash
+cmake --preset engine-only
+cmake --build --preset engine-only
+./build/engine/plegl_bench
+```
+
+## Kontrol
+
+| Aksi | Input |
+| --- | --- |
+| Orbit (berputar di sekitar permukaan di bawah cursor) | Alt + drag kiri |
+| Pan | Alt + drag tengah |
+| Zoom | Alt + drag kanan, atau scroll |
+| Pilih objek | Klik kiri |
+| Move / Rotate / Scale | G / R / S |
+| Duplicate | Shift + D |
+| Delete | X atau Delete |
+| Frame objek terpilih | Home |
+| Object / Sculpt mode | Tab |
+| Import / Export OBJ | Ctrl + O / Ctrl + E |
+| Uji update GPU parsial | B (menonjolkan permukaan di bawah cursor) |
+
+File OBJ juga bisa dibuka dengan menaruhnya sebagai argumen: `PleGLSculpt model.obj`.
+
+## Struktur
+
+```
+src/engine/   Library engine tanpa UI (diuji headless)
+  core/       Tipe dasar, parallelFor, timer
+  mesh/       Half-edge mesh berbasis index, primitive, validator
+  spatial/    BVH (node daun = unit kerja engine), raycast, query bola
+  io/         Import dan export OBJ
+  scene/      Objek, transform, picking
+src/app/      Aplikasi: SDL3, renderer OpenGL, kamera, UI
+tests/        Unit test (doctest)
+bench/        Benchmark engine pada mesh 50K sampai 1M vertex
+docs/         Catatan arsitektur
+```
+
+Lihat [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) untuk keputusan desain utama.

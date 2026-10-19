@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            preset: msvc
+          - os: ubuntu-24.04
+            preset: release
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libx11-dev libxext-dev libxcursor-dev libxi-dev \
+            libxrandr-dev libxss-dev libxtst-dev libxfixes-dev libxinerama-dev libxkbcommon-dev \
+            libwayland-dev wayland-protocols libdecor-0-dev libgl-dev libegl-dev libdrm-dev libgbm-dev
+
+      - name: Cache fetched dependencies
+        uses: actions/cache@v4
+        with:
+          path: build/${{ matrix.preset }}/_deps
+          key: deps-${{ matrix.os }}-${{ hashFiles('cmake/Dependencies.cmake') }}
+
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }}
+
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }} --parallel
+
+      - name: Test
+        run: ctest --preset ${{ matrix.preset }}
+
+      - name: Benchmark (quick)
+        shell: bash
+        run: |
+          bench=$(find build/${{ matrix.preset }} -name 'plegl_bench' -o -name 'plegl_bench.exe' | head -n 1)
+          "$bench" --quick
