@@ -15,6 +15,9 @@
 #include "Camera.h"
 #include "Renderer.h"
 #include "scene/Scene.h"
+#include "sculpt/Sculptor.h"
+#include "sculpt/StrokeSampler.h"
+#include "sculpt/Undo.h"
 
 namespace plegl {
 
@@ -41,11 +44,30 @@ struct PrimitiveSettings {
   int planeResolution = 64;
 };
 
+enum class BrushKind { Draw, Smooth };
+enum class PressureMap { Strength, Radius, Both, None };
+
+struct SculptSettings {
+  BrushKind brush = BrushKind::Draw;
+  float radiusPx = 60.0f;      // Screen-space radius, like most sculpting tools.
+  float drawStrength = 0.5f;
+  float smoothStrength = 0.5f;
+  Falloff falloff = Falloff::Smooth;
+  bool invert = false;         // Draw subtracts instead of adds (Ctrl flips it per stroke).
+  PressureMap pressure = PressureMap::Strength;
+  bool symmetryX = true;       // PRD default for character sculpting.
+  float spacing = 0.1f;        // Dab spacing as a fraction of the radius.
+};
+
 struct FrameStats {
   double frameMs = 0.0;
   double fps = 0.0;
   double raycastUs = 0.0;
   double partialTestMs = 0.0;
+  double dabMs = 0.0;           // Last dab, CPU.
+  double inputToDabMs = 0.0;    // OS input timestamp to dab applied.
+  double inputToFrameMs = 0.0;  // OS input timestamp to the frame showing it being swapped.
+  int dabsLastFrame = 0;
 };
 
 class App {
@@ -59,6 +81,8 @@ class App {
   Camera camera;
   ViewSettings view;
   PrimitiveSettings primitives;
+  SculptSettings sculpt;
+  UndoStack undoStack;
   Mode mode = Mode::Object;
   GizmoOp gizmo = GizmoOp::Translate;
   std::uint32_t selectedId = 0;
@@ -78,6 +102,9 @@ class App {
   void frameScene();
   void setVsync(bool on);
   void bumpUnderCursor();  // Debug path for per-leaf GPU updates.
+  void undo();
+  void redo();
+  bool strokeActive() const { return sculptor_.active(); }
   void importFile(const std::filesystem::path& path);
   void quit() { running_ = false; }
   const RenderStats& renderStats() const { return renderer_.stats(); }
@@ -91,6 +118,11 @@ class App {
   void drawUi();
   void drawGizmo();
   void processAsyncResults();
+  void beginStroke(float x, float y, std::uint64_t timestampNs);
+  void continueStroke(float x, float y, std::uint64_t timestampNs);
+  void endStroke();
+  void applySamples(std::uint64_t timestampNs);
+  float currentPressure() const;
   void exportFile(const std::filesystem::path& path);
 
   SDL_Window* window_ = nullptr;
@@ -118,6 +150,17 @@ class App {
   int pendingImports_ = 0;
 
   std::uint64_t lastFrameNs_ = 0;
+
+  // Sculpting.
+  Sculptor sculptor_;
+  DrawBrush drawBrush_;
+  SmoothBrush smoothBrush_;
+  StrokeSampler sampler_;
+  std::vector<StrokeSample> samples_;
+  bool strokeSmooth_ = false;        // Shift held when the stroke began.
+  bool adjustingRadius_ = false;     // F held.
+  std::uint64_t oldestInputThisFrameNs_ = 0;
+  int dabsThisFrame_ = 0;
 };
 
 }  // namespace plegl

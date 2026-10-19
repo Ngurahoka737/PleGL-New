@@ -2,6 +2,7 @@
 // commits and machines. Usage: plegl_bench [--quick]
 #include <cmath>
 #include <cstdio>
+#include <algorithm>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -10,6 +11,8 @@
 #include "core/Timer.h"
 #include "io/Obj.h"
 #include "mesh/Primitives.h"
+#include "scene/Scene.h"
+#include "sculpt/Sculptor.h"
 #include "spatial/Bvh.h"
 
 using namespace plegl;
@@ -72,6 +75,45 @@ int main(int argc, char** argv) {
     std::printf("%10d %10.1f %10.1f %10.1f %10zu %11.2f %11.2f %10.2f %10.1f\n", mesh.vertexCount(), buildMs,
                 normalsMs, bvhMs, bvh.leaves().size(), rayUs, queryUs, refitMs, objMs);
     if (hits == 0) std::printf("  warning: no ray hit the mesh\n");
+  }
+
+  // Brush latency: one Draw stroke of 200 dabs along an arc, then the same with Smooth. A dab
+  // includes the BVH query, brush, normals, refit, undo snapshots and dirty marking; GPU upload
+  // and drawing are not included.
+  std::printf("\nStroke benchmark (ms per dab, 200 dabs)\n\n");
+  std::printf("%10s %8s %8s %10s %10s %10s %10s\n", "vertices", "radius", "brush", "verts/dab", "avg ms", "p95 ms",
+              "max ms");
+  std::vector<int> strokeRes = quick ? std::vector<int>{129} : std::vector<int>{289, 408};
+  for (int res : strokeRes) {
+    Scene scene;
+    SceneObject& obj = scene.add("Sphere", makeQuadSphere(res));
+    DrawBrush draw;
+    SmoothBrush smooth;
+    for (const Brush* brush : {static_cast<const Brush*>(&draw), static_cast<const Brush*>(&smooth)}) {
+      for (float radius : {0.05f, 0.15f, 0.4f}) {
+        Sculptor sculptor;
+        sculptor.beginStroke(obj, *brush, {.strength = 0.5f}, brush->name());
+        std::vector<double> times;
+        double verts = 0;
+        for (int i = 0; i < 200; ++i) {
+          const float a = -0.8f + 1.6f * static_cast<float>(i) / 199.0f;
+          const Vec3 dir = glm::normalize(Vec3{std::sin(a), 0.3f, std::cos(a)});
+          RayHit hit;
+          if (!obj.bvh.raycast(obj.mesh, Ray{dir * 3.0f, -dir}, hit)) continue;
+          sculptor.dab(hit.position, radius, 0.5f);
+          times.push_back(sculptor.lastDab().totalMs);
+          verts += sculptor.lastDab().vertices;
+        }
+        sculptor.endStroke();
+        obj.dirtyLeaves.clear();
+        std::sort(times.begin(), times.end());
+        double avg = 0;
+        for (double t : times) avg += t;
+        avg /= static_cast<double>(times.size());
+        std::printf("%10d %8.2f %8s %10.0f %10.3f %10.3f %10.3f\n", obj.mesh.vertexCount(), radius, brush->name(),
+                    verts / static_cast<double>(times.size()), avg, times.at(times.size() * 95 / 100), times.back());
+      }
+    }
   }
   return 0;
 }

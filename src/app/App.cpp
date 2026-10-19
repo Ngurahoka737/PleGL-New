@@ -7,6 +7,7 @@
 #include <ImGuizmo.h>
 
 #include <algorithm>
+#include <cmath>
 #include <glm/gtc/type_ptr.hpp>
 
 #include "core/Timer.h"
@@ -162,15 +163,23 @@ void App::run() {
     rect.y = fbh - static_cast<int>((vpY_ + vpH_) * pixelScale_);
 
     CursorMarker cursor;
-    if (hover_ && drag_ == Drag::None) {
+    if (hover_ && (drag_ == Drag::None || drag_ == Drag::Pan)) {
       cursor.visible = true;
       cursor.position = hover_->worldPosition;
       cursor.normal = hover_->worldNormal;
-      cursor.radius = camera.worldPerPixel(cursor.position) * 14.0f;
+      const float px = mode == Mode::Sculpt ? sculpt.radiusPx : 14.0f;
+      cursor.radius = camera.worldPerPixel(cursor.position) * px;
     }
     renderer_.render(scene, camera, rect, view, selectedId, cursor);
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
     SDL_GL_SwapWindow(window_);
+    if (oldestInputThisFrameNs_ != 0) {
+      const double ms = static_cast<double>(SDL_GetTicksNS() - oldestInputThisFrameNs_) / 1e6;
+      stats.inputToFrameMs = stats.inputToFrameMs == 0.0 ? ms : stats.inputToFrameMs * 0.8 + ms * 0.2;
+      oldestInputThisFrameNs_ = 0;
+    }
+    stats.dabsLastFrame = dabsThisFrame_;
+    dabsThisFrame_ = 0;
 
     const std::uint64_t now = SDL_GetTicksNS();
     const double ms = static_cast<double>(now - lastFrameNs_) / 1e6;
@@ -203,6 +212,14 @@ void App::handleEvent(const SDL_Event& e) {
       mouseY_ = e.motion.y;
       mouseInViewport_ = mouseX_ >= vpX_ && mouseX_ < vpX_ + vpW_ && mouseY_ >= vpY_ && mouseY_ < vpY_ + vpH_;
       const float dx = e.motion.xrel, dy = e.motion.yrel;
+      if (adjustingRadius_) {
+        sculpt.radiusPx = std::clamp(sculpt.radiusPx * std::exp(dx * 0.01f), 2.0f, 1000.0f);
+        break;
+      }
+      if (sculptor_.active()) {
+        continueStroke(mouseX_, mouseY_, e.motion.timestamp);
+        break;
+      }
       switch (drag_) {
         case Drag::Orbit: camera.orbit(dx, dy, orbitPivot_); break;
         case Drag::Pan: camera.pan(dx, dy); break;
@@ -224,6 +241,8 @@ void App::handleEvent(const SDL_Event& e) {
         } else if (e.button.button == SDL_BUTTON_RIGHT) {
           drag_ = Drag::Zoom;
         }
+      } else if (e.button.button == SDL_BUTTON_LEFT && mode == Mode::Sculpt) {
+        beginStroke(e.button.x, e.button.y, e.button.timestamp);
       } else if (e.button.button == SDL_BUTTON_LEFT && mode == Mode::Object && !ImGuizmo::IsUsing() &&
                  !(scene.find(selectedId) && ImGuizmo::IsOver())) {
         selectedId = hover_ ? hover_->objectId : 0;
@@ -231,6 +250,7 @@ void App::handleEvent(const SDL_Event& e) {
       break;
     }
     case SDL_EVENT_MOUSE_BUTTON_UP:
+      if (e.button.button == SDL_BUTTON_LEFT && sculptor_.active()) endStroke();
       drag_ = Drag::None;
       break;
     case SDL_EVENT_MOUSE_WHEEL:
@@ -239,6 +259,9 @@ void App::handleEvent(const SDL_Event& e) {
 
     case SDL_EVENT_KEY_DOWN:
       if (!io.WantCaptureKeyboard && !e.key.repeat) handleShortcut(e.key);
+      break;
+    case SDL_EVENT_KEY_UP:
+      if (e.key.key == SDLK_F) adjustingRadius_ = false;
       break;
 
     // Pen tablets. SDL also turns pen input into mouse events, so navigation works with a pen;
@@ -275,6 +298,8 @@ void App::handleShortcut(const SDL_KeyboardEvent& key) {
   const bool ctrl = (key.mod & SDL_KMOD_CTRL) != 0;
   const bool shift = (key.mod & SDL_KMOD_SHIFT) != 0;
   if (ctrl) {
+    if (key.key == SDLK_Z && !shift) undo();
+    if ((key.key == SDLK_Z && shift) || key.key == SDLK_Y) redo();
     if (key.key == SDLK_O) requestImport();
     if (key.key == SDLK_E) requestExport();
     if (key.key == SDLK_N) newScene();
@@ -282,7 +307,7 @@ void App::handleShortcut(const SDL_KeyboardEvent& key) {
   }
   switch (key.key) {
     case SDLK_TAB:
-      mode = mode == Mode::Object ? Mode::Sculpt : Mode::Object;
+      if (!sculptor_.active()) mode = mode == Mode::Object ? Mode::Sculpt : Mode::Object;
       break;
     case SDLK_HOME:
     case SDLK_KP_PERIOD:
@@ -291,7 +316,18 @@ void App::handleShortcut(const SDL_KeyboardEvent& key) {
     default:
       break;
   }
-  if (mode != Mode::Object) return;
+  if (mode == Mode::Sculpt) {
+    switch (key.key) {
+      case SDLK_D: sculpt.brush = BrushKind::Draw; break;
+      case SDLK_S: sculpt.brush = BrushKind::Smooth; break;
+      case SDLK_F: adjustingRadius_ = true; break;  // Move the mouse sideways while holding F.
+      case SDLK_LEFTBRACKET: sculpt.radiusPx = std::max(2.0f, sculpt.radiusPx / 1.15f); break;
+      case SDLK_RIGHTBRACKET: sculpt.radiusPx = std::min(1000.0f, sculpt.radiusPx * 1.15f); break;
+      case SDLK_X: sculpt.symmetryX = !sculpt.symmetryX; break;
+      default: break;
+    }
+    return;
+  }
   switch (key.key) {
     case SDLK_G: gizmo = GizmoOp::Translate; break;
     case SDLK_R: gizmo = GizmoOp::Rotate; break;
@@ -358,6 +394,7 @@ void App::addPrimitive(const std::string& name, Mesh mesh) {
 
 void App::newScene() {
   scene.clear();
+  undoStack.clear();
   selectedId = 0;
   hover_.reset();
   statusMessage = "New scene";
@@ -425,6 +462,91 @@ void App::bumpUnderCursor() {
   obj->bvh.refitLeaves(m, leaves);
   stats.partialTestMs = t.ms();
   statusMessage = "Bumped " + std::to_string(leaves.size()) + " leaves";
+}
+
+// ---- Sculpting -----------------------------------------------------------------------------
+
+float App::currentPressure() const {
+  // SDL turns pen input into mouse events too; while the pen touches, use its pressure.
+  return pen.down ? std::clamp(pen.pressure, 0.0f, 1.0f) : 1.0f;
+}
+
+void App::beginStroke(float x, float y, std::uint64_t timestampNs) {
+  if (!hover_ || ImGui::GetIO().WantCaptureMouse) return;
+  SceneObject* obj = scene.find(hover_->objectId);
+  if (!obj) return;
+  selectedId = obj->id;
+  const SDL_Keymod mods = SDL_GetModState();
+  strokeSmooth_ = (mods & SDL_KMOD_SHIFT) != 0 || sculpt.brush == BrushKind::Smooth;
+  StrokeOptions opts;
+  opts.falloff = sculpt.falloff;
+  opts.symmetryX = sculpt.symmetryX;
+  opts.strength = strokeSmooth_ ? sculpt.smoothStrength : sculpt.drawStrength;
+  opts.invert = sculpt.invert != ((mods & SDL_KMOD_CTRL) != 0);
+  const Brush& brush = strokeSmooth_ ? static_cast<const Brush&>(smoothBrush_) : static_cast<const Brush&>(drawBrush_);
+  sculptor_.beginStroke(*obj, brush, opts, brush.name());
+  samples_.clear();
+  sampler_.begin({x - vpX_, y - vpY_, currentPressure()}, std::max(1.0f, sculpt.radiusPx * sculpt.spacing), samples_);
+  applySamples(timestampNs);
+}
+
+void App::continueStroke(float x, float y, std::uint64_t timestampNs) {
+  samples_.clear();
+  sampler_.setSpacing(std::max(1.0f, sculpt.radiusPx * sculpt.spacing));
+  sampler_.moveTo({x - vpX_, y - vpY_, currentPressure()}, samples_);
+  applySamples(timestampNs);
+}
+
+void App::applySamples(std::uint64_t timestampNs) {
+  SceneObject* obj = sculptor_.object();
+  if (!obj || samples_.empty()) return;
+  const Mat4 model = obj->transform.matrix();
+  const Mat4 inv = glm::inverse(model);
+  const float scale = (obj->transform.scale.x + obj->transform.scale.y + obj->transform.scale.z) / 3.0f;
+  const bool smoothStroke = strokeSmooth_;
+  const float baseStrength = smoothStroke ? sculpt.smoothStrength : sculpt.drawStrength;
+  for (const StrokeSample& smp : samples_) {
+    const Ray world = camera.rayThroughPixel(smp.x, smp.y);
+    Ray local{Vec3(inv * Vec4(world.origin, 1.0f)), Vec3(inv * Vec4(world.dir, 0.0f))};
+    RayHit hit;
+    if (!obj->bvh.raycast(obj->mesh, local, hit)) continue;  // Off the mesh: no dab.
+    const Vec3 worldHit = world.origin + world.dir * hit.t;
+    const float p = smp.pressure;
+    const bool mapRadius = sculpt.pressure == PressureMap::Radius || sculpt.pressure == PressureMap::Both;
+    const bool mapStrength = sculpt.pressure == PressureMap::Strength || sculpt.pressure == PressureMap::Both;
+    const float px = sculpt.radiusPx * (mapRadius ? std::max(p, 0.1f) : 1.0f);
+    const float radius = camera.worldPerPixel(worldHit) * px / std::max(scale, 1e-6f);
+    const float strength = baseStrength * (mapStrength ? p : 1.0f);
+    if (sculptor_.dab(hit.position, radius, strength)) {
+      ++dabsThisFrame_;
+      stats.dabMs = sculptor_.lastDab().totalMs;
+    }
+  }
+  if (timestampNs != 0) {
+    const double ms = static_cast<double>(SDL_GetTicksNS() - timestampNs) / 1e6;
+    stats.inputToDabMs = stats.inputToDabMs == 0.0 ? ms : stats.inputToDabMs * 0.8 + ms * 0.2;
+    if (oldestInputThisFrameNs_ == 0 || timestampNs < oldestInputThisFrameNs_) oldestInputThisFrameNs_ = timestampNs;
+  }
+}
+
+void App::endStroke() {
+  if (auto entry = sculptor_.endStroke()) {
+    const int dabs = sculptor_.dabCount();
+    undoStack.push(std::move(*entry));
+    statusMessage = std::string(strokeSmooth_ ? "Smooth" : "Draw") + " stroke, " + std::to_string(dabs) + " dabs";
+  }
+}
+
+void App::undo() {
+  if (sculptor_.active()) return;
+  const std::string label = undoStack.undo(scene);
+  statusMessage = label.empty() ? "Nothing to undo" : "Undo " + label;
+}
+
+void App::redo() {
+  if (sculptor_.active()) return;
+  const std::string label = undoStack.redo(scene);
+  statusMessage = label.empty() ? "Nothing to redo" : "Redo " + label;
 }
 
 // ---- Files ---------------------------------------------------------------------------------

@@ -10,7 +10,11 @@
 namespace plegl {
 namespace {
 
-// A minimal fork-join pool: one job at a time, workers pull chunk indices from an atomic counter.
+// A minimal fork-join pool: one job at a time, threads pull chunk indices from an atomic counter.
+//
+// The caller only waits for workers that actually joined the job. A worker that wakes late (for
+// example because the OS descheduled it) finds the job already finished and goes back to sleep,
+// so one slow thread can never stall a brush dab.
 class Pool {
  public:
   Pool() {
@@ -31,44 +35,50 @@ class Pool {
   std::size_t size() const { return threads_.size() + 1; }
 
   void run(std::size_t chunks, const std::function<void(std::size_t)>& chunkFn) {
-    std::lock_guard jobLock(jobMutex_);  // Nested or concurrent calls serialize here.
+    std::lock_guard jobLock(jobMutex_);  // Concurrent callers from different threads serialize here.
     {
       std::lock_guard lock(mutex_);
       job_ = &chunkFn;
       chunkCount_ = chunks;
       nextChunk_.store(0, std::memory_order_relaxed);
-      pending_ = threads_.size();
       ++generation_;
     }
     wake_.notify_all();
-    drain();
+    drain(chunkFn, chunks);
     std::unique_lock lock(mutex_);
-    done_.wait(lock, [this] { return pending_ == 0; });
+    // All chunks are claimed once drain returns; wait only for workers still running one.
+    done_.wait(lock, [this] { return activeWorkers_ == 0; });
     job_ = nullptr;
   }
 
  private:
-  void drain() {
+  void drain(const std::function<void(std::size_t)>& fn, std::size_t count) {
     for (;;) {
       const std::size_t c = nextChunk_.fetch_add(1, std::memory_order_relaxed);
-      if (c >= chunkCount_) break;
-      (*job_)(c);
+      if (c >= count) break;
+      fn(c);
     }
   }
 
   void workerLoop() {
     std::uint64_t seen = 0;
     for (;;) {
+      const std::function<void(std::size_t)>* job = nullptr;
+      std::size_t count = 0;
       {
         std::unique_lock lock(mutex_);
         wake_.wait(lock, [&] { return generation_ != seen; });
         seen = generation_;
         if (stop_) return;
+        if (!job_) continue;  // Woke after the job finished.
+        job = job_;
+        count = chunkCount_;
+        ++activeWorkers_;
       }
-      drain();
+      drain(*job, count);
       {
         std::lock_guard lock(mutex_);
-        if (--pending_ == 0) done_.notify_one();
+        if (--activeWorkers_ == 0) done_.notify_one();
       }
     }
   }
@@ -81,7 +91,7 @@ class Pool {
   const std::function<void(std::size_t)>* job_ = nullptr;
   std::size_t chunkCount_ = 0;
   std::atomic<std::size_t> nextChunk_{0};
-  std::size_t pending_ = 0;
+  std::size_t activeWorkers_ = 0;
   std::uint64_t generation_ = 0;
   bool stop_ = false;
 };

@@ -157,7 +157,11 @@ Index Bvh::leafOfVertex(Index v) const {
 
 bool Bvh::raycast(const Mesh& mesh, const Ray& ray, RayHit& hit, float tMax) const {
   if (nodes_.empty()) return false;
-  const Vec3 invDir = 1.0f / ray.dir;
+  // Avoid 0 * inf = NaN in the slab test for axis-aligned rays starting on a box plane.
+  Vec3 safeDir = ray.dir;
+  for (int a = 0; a < 3; ++a)
+    if (std::abs(safeDir[a]) < 1e-20f) safeDir[a] = std::copysign(1e-20f, safeDir[a]);
+  const Vec3 invDir = 1.0f / safeDir;
   float best = tMax;
   Index bestFace = kInvalid, bestLeaf = kInvalid;
   Index bestA = 0, bestB = 0, bestC = 0;
