@@ -91,6 +91,19 @@ Valence disimpan di cache dan diperbarui per operasi, sehingga pass topologi tet
 
 Di aplikasi, toggle **Optimize quads** (default aktif) memilih antara quad remesh dan voxel remesh biasa.
 
+## Project file (`io/Project.h`)
+
+Format `.psculpt` adalah container biner kecil: magic `PSCULPT\x1A`, versi, lalu chunk bertag (`u32 tag`, `u64 ukuran`, isi) dan chunk `END ` berisi CRC-32 dari semua byte sebelumnya.
+
+- `OBJS` menyimpan tiap objek: nama, transform, visibilitas, posisi vertex (float, bit-exact), ukuran face, dan index face. Topologi half-edge dibangun ulang saat dibuka, dan BVH dibangun di worker thread.
+- `SETT` menyimpan setelan aplikasi sebagai baris `key value`: brush, radius, strength per brush, falloff, tekanan pen, simetri, kamera, viewport, remesh, mode, dan objek terpilih. Engine menyimpannya apa adanya, jadi setelan baru tidak perlu mengubah format. Kunci yang tidak ada memakai nilai default.
+- Pembaca melewati chunk yang tidak dikenal (kompatibel ke depan) dan menolak file yang terpotong, rusak (checksum salah), atau dari versi format yang lebih baru, dengan pesan yang jelas. Setiap jumlah dan index diperiksa sebelum dipakai.
+- Penyimpanan bersifat atomik: data ditulis ke `<nama>.tmp` lalu di-rename, jadi crash saat menyimpan tidak merusak project yang ada. Serialisasi berjalan di thread utama (cepat, cuma salin memori), penulisan file di worker.
+
+**Autosave dan pemulihan.** Setiap 5 menit (bisa diubah di menu File, 0 = mati), kalau scene berubah sejak penyimpanan atau autosave terakhir, aplikasi menulis `autosave.psculpt` ke folder data pengguna (`SDL_GetPrefPath`). File `session.lock` dibuat saat start dan dihapus bersama autosave saat aplikasi ditutup normal. Kalau saat start lock masih ada, sesi sebelumnya berakhir tidak normal, dan aplikasi menawarkan **Recover Previous Session?**. Hasil pemulihan kembali ke path project aslinya tetapi ditandai belum disimpan.
+
+**Perubahan yang belum disimpan** dilacak dengan sidik jari murah dari daftar objek (id, nama, visibilitas, transform, `topologyVersion`) ditambah penghitung edit (stroke, undo, redo), tanpa meng-hash data vertex. Judul jendela menampilkan `*`, dan New, Open, serta Quit menanyakan **Save changes?** dulu.
+
 ## Threading (`core/Parallel.h`)
 
 Engine hanya memakai satu primitif paralel, `parallelFor`. Implementasinya sekarang thread pool kecil sendiri; bisa diganti oneTBB tanpa mengubah pemanggil. Import OBJ dan build BVH berjalan di thread latar, lalu hasilnya ditambahkan ke scene di thread utama.

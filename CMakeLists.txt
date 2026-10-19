@@ -32,6 +32,7 @@ add_library(plegl_engine STATIC
   src/engine/mesh/MeshEdit.cpp
   src/engine/mesh/Primitives.cpp
   src/engine/io/Obj.cpp
+  src/engine/io/Project.cpp
   src/engine/spatial/Bvh.cpp
   src/engine/scene/Scene.cpp
   src/engine/sculpt/Brush.cpp
@@ -57,6 +58,7 @@ if(PLEGL_BUILD_APP)
   add_executable(plegl_sculpt WIN32
     src/app/main.cpp
     src/app/App.cpp
+    src/app/AppProject.cpp
     src/app/Camera.cpp
     src/app/Renderer.cpp
     src/app/Ui.cpp
@@ -74,6 +76,7 @@ if(PLEGL_BUILD_TESTS)
     tests/test_meshedit.cpp
     tests/test_primitives.cpp
     tests/test_obj.cpp
+    tests/test_project.cpp
     tests/test_bvh.cpp
     tests/test_scene.cpp
     tests/test_sculpt.cpp
