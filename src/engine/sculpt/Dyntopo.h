@@ -8,17 +8,29 @@
 #include "core/Timer.h"
 #include "mesh/MeshEdit.h"
 #include "scene/Scene.h"
+#include "sculpt/Symmetry.h"
 #include "spatial/LeafLayout.h"
 
 namespace plegl {
 
 enum class DyntopoRefine : std::uint8_t { SplitCollapse, SplitOnly, CollapseOnly };
 
+// Symmetry planes and axes that topology edits keep vertices on: a vertex within eps of a mirror
+// plane (or of a rotation axis) never merges off it, and split midpoints between two such
+// vertices land exactly on it. Bits as in SymmetryGroup::mirrorPlanes / rotationAxes.
+struct DyntopoPins {
+  std::uint8_t planes = 0;
+  std::uint8_t axes = 0;
+  float eps = 0.0f;
+};
+
 struct DyntopoOptions {
   DyntopoRefine refine = DyntopoRefine::SplitCollapse;
   int maxSplits = 1024;       // Per pass.
   int maxCollapses = 1024;    // Per pass.
   double timeBudgetMs = 3.0;  // Per pass, on top of the counts. 0 turns it off (deterministic).
+  DyntopoPins pins{};         // Set by the sculptor for symmetric strokes.
+  int copies = 1;             // Symmetric passes per dab; two or more reserve twice the headroom.
 };
 
 // Topology request for one dab.
@@ -31,6 +43,11 @@ struct DabTopology {
   // sets meet moves or merges away.
   std::int32_t onlySet = 0;
   bool lockFaceSetBorders = false;
+  // Time budget for this pass in ms. Negative uses DyntopoOptions::timeBudgetMs; otherwise the
+  // smaller of the two applies (0 in the options still means no time limit).
+  double timeBudgetMs = -1.0;
+  // A vertex that must survive the pass: collapses keep it in place or leave the edge alone.
+  Index keepVertex = kInvalid;
 };
 
 // What one topology pass changed.
@@ -102,6 +119,9 @@ class DyntopoSession {
     Index h, a, b;
   };
 
+  std::uint8_t pinBits(const Vec3& p) const {
+    return (opt_.pins.planes | opt_.pins.axes) ? pinnedAxes(opt_.pins.planes, opt_.pins.axes, p, opt_.pins.eps) : 0;
+  }
   bool locked(Index v) const {
     return (v < static_cast<Index>(lock_.size()) && lock_[v]) || (!m_.mask.empty() && m_.mask[v] >= 0.5f);
   }
@@ -137,6 +157,8 @@ class DyntopoSession {
   DyntopoPass pass_;
   std::int32_t onlySet_ = 0;  // DabTopology::onlySet.
   bool lockBorders_ = false;  // DabTopology::lockFaceSetBorders.
+  double budgetMs_ = 0.0;     // Effective time budget, 0 = none.
+  Index keepVertex_ = kInvalid;  // DabTopology::keepVertex.
   std::vector<Index> leaves_;
   std::vector<std::vector<Edge>> perLeafSplits_, perLeafCollapses_;
   std::vector<Edge> splits_, collapses_;

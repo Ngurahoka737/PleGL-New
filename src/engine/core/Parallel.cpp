@@ -102,10 +102,13 @@ Pool& pool() {
 }
 
 thread_local bool tInsideParallel = false;
+std::atomic<bool> gSerial{false};
 
 }  // namespace
 
 std::size_t workerCount() { return pool().size(); }
+
+void setSerialForTesting(bool serial) { gSerial.store(serial, std::memory_order_relaxed); }
 
 void parallelFor(std::size_t begin, std::size_t end, std::size_t grain,
                  const std::function<void(std::size_t, std::size_t)>& fn) {
@@ -113,7 +116,7 @@ void parallelFor(std::size_t begin, std::size_t end, std::size_t grain,
   const std::size_t n = end - begin;
   grain = std::max<std::size_t>(grain, 1);
   // Run inline when the range is small or we are already inside a parallel region.
-  if (n <= grain || tInsideParallel || pool().size() == 1) {
+  if (n <= grain || tInsideParallel || gSerial.load(std::memory_order_relaxed) || pool().size() == 1) {
     fn(begin, end);
     return;
   }

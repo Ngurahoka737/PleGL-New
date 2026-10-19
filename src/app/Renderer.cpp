@@ -207,6 +207,7 @@ GLuint makeLineVao(GLuint vbo) {
 }
 
 constexpr int kCursorSegments = 48;
+constexpr int kOverlayVertices = Renderer::kMaxOverlayVertices;
 
 }  // namespace
 
@@ -248,9 +249,14 @@ bool Renderer::init(std::string* error) {
   glNamedBufferStorage(gridVbo_, static_cast<GLsizeiptr>(grid.size() * sizeof(LineVertex)), grid.data(), 0);
   gridVao_ = makeLineVao(gridVbo_);
 
+  // One ring per symmetric copy of the brush, all rewritten each frame.
   glCreateBuffers(1, &cursorVbo_);
-  glNamedBufferStorage(cursorVbo_, (kCursorSegments + 2) * sizeof(LineVertex), nullptr, GL_DYNAMIC_STORAGE_BIT);
+  glNamedBufferStorage(cursorVbo_, kMaxCursors * (kCursorSegments + 2) * sizeof(LineVertex), nullptr,
+                       GL_DYNAMIC_STORAGE_BIT);
   cursorVao_ = makeLineVao(cursorVbo_);
+  glCreateBuffers(1, &overlayVbo_);
+  glNamedBufferStorage(overlayVbo_, kOverlayVertices * sizeof(LineVertex), nullptr, GL_DYNAMIC_STORAGE_BIT);
+  overlayVao_ = makeLineVao(overlayVbo_);
   return true;
 }
 
@@ -260,8 +266,10 @@ void Renderer::shutdown() {
   glDeleteTextures(kMatcapCount, matcaps_);
   glDeleteBuffers(1, &gridVbo_);
   glDeleteBuffers(1, &cursorVbo_);
+  glDeleteBuffers(1, &overlayVbo_);
   glDeleteVertexArrays(1, &gridVao_);
   glDeleteVertexArrays(1, &cursorVao_);
+  glDeleteVertexArrays(1, &overlayVao_);
   glDeleteVertexArrays(1, &emptyVao_);
   glDeleteProgram(meshProgram_);
   glDeleteProgram(lineProgram_);
@@ -690,7 +698,8 @@ void Renderer::drawTriangles(const GpuMesh& gpu) {
 }
 
 void Renderer::render(const Scene& scene, const Camera& camera, const ViewportRect& rect,
-                      const ViewSettings& settings, std::uint32_t selectedId, const CursorMarker& cursor) {
+                      const ViewSettings& settings, std::uint32_t selectedId, std::span<const CursorMarker> cursors,
+                      const SculptOverlay& overlay) {
   glViewport(rect.x, rect.y, rect.width, rect.height);
   glEnable(GL_SCISSOR_TEST);
   glScissor(rect.x, rect.y, rect.width, rect.height);
@@ -773,26 +782,91 @@ void Renderer::render(const Scene& scene, const Camera& camera, const ViewportRe
     glVertexArrayElementBuffer(it->second.vao, it->second.triangles.buffer);
   }
 
-  if (cursor.visible) {
-    LineVertex pts[kCursorSegments + 2];
+  // Sculpt guides: mirror plane outlines (hidden behind the surface), then the radial axis and
+  // brush guides on top.
+  {
+    std::vector<LineVertex> planes, onTop;
+    const Vec3 pad = (overlay.boundsMax - overlay.boundsMin) * 0.05f + Vec3{1e-3f};
+    const Vec3 lo = overlay.boundsMin - pad, hi = overlay.boundsMax + pad;
+    auto world = [&](const Vec3& p) { return Vec3(overlay.model * Vec4(p, 1.0f)); };
+    static const Vec4 kAxisColor[3] = {{0.95f, 0.35f, 0.35f, 0.7f}, {0.4f, 0.9f, 0.4f, 0.7f}, {0.4f, 0.6f, 1.0f, 0.7f}};
+    if (overlay.planes) {
+      for (int a = 0; a < 3; ++a) {
+        if (!(overlay.mirrorBits >> a & 1)) continue;
+        const int b = (a + 1) % 3, c = (a + 2) % 3;
+        Vec3 corner[4];
+        for (int k = 0; k < 4; ++k) {
+          corner[k][a] = 0.0f;
+          corner[k][b] = (k == 0 || k == 3) ? lo[b] : hi[b];
+          corner[k][c] = (k < 2) ? lo[c] : hi[c];
+        }
+        for (int k = 0; k < 4; ++k) {
+          planes.push_back({world(corner[k]), kAxisColor[a]});
+          planes.push_back({world(corner[(k + 1) % 4]), kAxisColor[a]});
+        }
+      }
+      if (overlay.radialAxis >= 0 && overlay.radialAxis < 3) {
+        const int a = overlay.radialAxis;
+        Vec3 from{0.0f}, to{0.0f};
+        from[a] = lo[a];
+        to[a] = hi[a];
+        onTop.push_back({world(from), kAxisColor[a]});
+        onTop.push_back({world(to), kAxisColor[a]});
+      }
+    }
+    for (std::size_t i = 0; i + 1 < overlay.points.size(); i += 2) {
+      onTop.push_back({overlay.points[i], overlay.pointColor});
+      onTop.push_back({overlay.points[i + 1], overlay.pointColor});
+    }
+    const std::size_t total = std::min<std::size_t>(planes.size() + onTop.size(), kOverlayVertices);
+    if (total > 0) {
+      std::vector<LineVertex> all = planes;
+      all.insert(all.end(), onTop.begin(), onTop.end());
+      all.resize(total);
+      glNamedBufferSubData(overlayVbo_, 0, static_cast<GLsizeiptr>(total * sizeof(LineVertex)), all.data());
+      const Mat4 mvp = proj * view;
+      glUniformMatrix4fv(mvpLoc, 1, GL_FALSE, glm::value_ptr(mvp));
+      glUniform1f(useVcLoc, 1.0f);
+      glBindVertexArray(overlayVao_);
+      const GLsizei first = static_cast<GLsizei>(std::min(planes.size(), total));
+      if (first > 0) glDrawArrays(GL_LINES, 0, first);
+      if (static_cast<GLsizei>(total) > first) {
+        glDisable(GL_DEPTH_TEST);
+        glDrawArrays(GL_LINES, first, static_cast<GLsizei>(total) - first);
+        glEnable(GL_DEPTH_TEST);
+      }
+    }
+  }
+
+  // Cursor rings, one per symmetric copy, in one buffer update.
+  std::vector<LineVertex> pts;
+  int rings = 0;
+  for (const CursorMarker& cursor : cursors) {
+    if (!cursor.visible || rings >= kMaxCursors) continue;
     const Vec3 n = glm::normalize(cursor.normal);
     const Vec3 t = glm::normalize(std::abs(n.y) < 0.9f ? glm::cross(n, Vec3{0, 1, 0}) : glm::cross(n, Vec3{1, 0, 0}));
     const Vec3 b = glm::cross(n, t);
-    const Vec4 c{1.0f, 1.0f, 1.0f, 0.9f};
+    const Vec4 c{1.0f, 1.0f, 1.0f, cursor.alpha};
     for (int i = 0; i < kCursorSegments; ++i) {
       const float a = 6.2831853f * static_cast<float>(i) / kCursorSegments;
-      pts[i] = {cursor.position + (t * std::cos(a) + b * std::sin(a)) * cursor.radius, c};
+      pts.push_back({cursor.position + (t * std::cos(a) + b * std::sin(a)) * cursor.radius, c});
     }
-    pts[kCursorSegments] = {cursor.position, c};
-    pts[kCursorSegments + 1] = {cursor.position + n * cursor.radius, c};
-    glNamedBufferSubData(cursorVbo_, 0, sizeof(pts), pts);
+    pts.push_back({cursor.position, c});
+    pts.push_back({cursor.position + n * cursor.radius, c});
+    ++rings;
+  }
+  if (rings > 0) {
+    glNamedBufferSubData(cursorVbo_, 0, static_cast<GLsizeiptr>(pts.size() * sizeof(LineVertex)), pts.data());
     const Mat4 mvp = proj * view;
     glUniformMatrix4fv(mvpLoc, 1, GL_FALSE, glm::value_ptr(mvp));
     glUniform1f(useVcLoc, 1.0f);
     glDisable(GL_DEPTH_TEST);  // The cursor must stay visible over the surface it sits on.
     glBindVertexArray(cursorVao_);
-    glDrawArrays(GL_LINE_LOOP, 0, kCursorSegments);
-    glDrawArrays(GL_LINES, kCursorSegments, 2);
+    for (int r = 0; r < rings; ++r) {
+      const GLint first = r * (kCursorSegments + 2);
+      glDrawArrays(GL_LINE_LOOP, first, kCursorSegments);
+      glDrawArrays(GL_LINES, first + kCursorSegments, 2);
+    }
     glEnable(GL_DEPTH_TEST);
   }
 
